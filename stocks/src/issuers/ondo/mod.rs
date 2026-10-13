@@ -1,0 +1,521 @@
+//! Ondo Global Markets stock tokens (AAPLon, ...): Ondo's adapters to the ports, and the two
+//! kinds built from them.
+//!
+//! - **`ondo`**, the stock pricer ([`crate::stock::pricer`]) over Ondo's adapters: the price
+//!   from Ondo's own API ([`api::OndoPrices`]), the price Ondo itself mints and redeems
+//!   around; the share multiplier and its corporate-action pause from the chain's
+//!   `SyntheticSharesOracle` ([`oracle::OndoOracle`]); and Ondo's market session and asset
+//!   events ([`status::OndoStatus`]), which withdraw on any session but `regular`, on an
+//!   active pause or size limit under the token's symbol or the stock's ticker, and on an
+//!   upcoming event that will move the share multiplier.
+//! - **`ondo_token`**, the restriction guard ([`crate::stock::guard`]) over Ondo's pause
+//!   manager, blocklist and sanctions list ([`compliance::OndoCompliance`]).
+//!
+//! ```toml
+//! [[pairs]]
+//! tokens  = ["0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]  # AAPLon, USDC
+//! key_env = "UPDATER_KEY_AAPLON_USDC"
+//! allow_symbol_mismatch = true   # no venue symbol to check: the price comes from Ondo
+//! min_mid = "100"
+//! max_mid = "500"
+//!
+//! [pairs.pricing]
+//! kind    = "ondo"
+//! symbol  = "AAPLon"
+//! api_key = { env = "ONDO_API_KEY" }
+//! delta   = "0.003"                 # half-spread, a fraction of the mid (30 bp)
+//! ```
+
+pub mod api;
+pub mod compliance;
+pub mod oracle;
+pub mod status;
+
+use std::{sync::Arc, time::Duration};
+
+use quote_updater::{Address, eyre, prelude::*};
+use serde::Deserialize;
+
+use crate::{
+    chain::parse_address,
+    ports::StatusFeed,
+    stock::{
+        guard::RestrictionGuardFactory,
+        pricer::{self, Adapters, Settings, Stanza, StockPricer},
+    },
+};
+
+/// The `[pairs.pricing]` stanza for `kind = "ondo"`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OndoCfg {
+    /// The asset's GM symbol in Ondo's API, e.g. `AAPLon`.
+    pub symbol: String,
+    /// The stock's ticker, e.g. `AAPL`: needed only if Ondo's price answer does not name it,
+    /// and checked against the answer when it does. Ondo may file the asset's events under it.
+    #[serde(default)]
+    pub ticker: Option<String>,
+    /// The Ondo GM API key, as `{ env = "ONDO_API_KEY" }`.
+    pub api_key: EnvSecret,
+    /// Published as the delta: the half-spread as a fraction of the mid (`"0.003"` = 30 bp).
+    pub delta: String,
+    /// Ondo's GM API.
+    #[serde(default = "default_api")]
+    pub api: String,
+    /// The `SyntheticSharesOracle`; Ethereum mainnet's by default.
+    #[serde(default)]
+    pub multiplier_oracle: Option<String>,
+    /// How often the price is polled, in milliseconds (default 1000; Ondo caches it 1s).
+    #[serde(default = "default_poll_ms")]
+    pub poll_ms: u64,
+    /// How often the market and asset status are polled (default 15s).
+    #[serde(default = "default_status_poll_secs")]
+    pub status_poll_secs: u64,
+    /// The oldest price, by Ondo's timestamp, that is quoted (default 15s).
+    #[serde(default = "default_max_price_age_secs")]
+    pub max_price_age_secs: u64,
+    /// The longest Ondo's price may stand still and be quoted (default 30s): a halted
+    /// stock's price stops moving before Ondo's status says so. Raise it for a stock that
+    /// trades thinly enough to sit on one price that long in session.
+    #[serde(default = "default_max_unchanged_secs")]
+    pub max_unchanged_secs: u64,
+    /// The oldest status or multiplier reading that is trusted (default 60s).
+    #[serde(default = "default_max_status_age_secs")]
+    pub max_status_age_secs: u64,
+    /// How long before a scheduled corporate-action pause quoting stops (default 300s).
+    #[serde(default = "default_pause_lead_secs")]
+    pub pause_lead_secs: u64,
+    /// The largest relative gap between Ondo's multiplier and the chain's (default 0.001).
+    #[serde(default = "default_max_multiplier_gap")]
+    pub max_multiplier_gap: f64,
+    /// Inventory skew: the mid moves by `skew × (base share − 0.5)`, down when the vault is
+    /// long the stock, so fills rebalance it. 0, the default, reads no inventory.
+    #[serde(default)]
+    pub skew: f64,
+}
+
+fn default_api() -> String {
+    "https://api.gm.ondo.finance".to_owned()
+}
+fn default_poll_ms() -> u64 {
+    1_000
+}
+fn default_status_poll_secs() -> u64 {
+    15
+}
+fn default_max_price_age_secs() -> u64 {
+    15
+}
+fn default_max_unchanged_secs() -> u64 {
+    30
+}
+fn default_max_status_age_secs() -> u64 {
+    60
+}
+fn default_pause_lead_secs() -> u64 {
+    300
+}
+fn default_max_multiplier_gap() -> f64 {
+    0.001
+}
+
+impl OndoCfg {
+    /// The keys the core reads, as the core reads them.
+    fn stanza(&self) -> Stanza<'_> {
+        Stanza {
+            kind: "ondo",
+            source: "Ondo",
+            symbol: &self.symbol,
+            delta: &self.delta,
+            price_poll: Duration::from_millis(self.poll_ms),
+            status_poll: Some(Duration::from_secs(self.status_poll_secs)),
+            max_price_age_secs: self.max_price_age_secs,
+            max_unchanged_secs: self.max_unchanged_secs,
+            max_status_age_secs: self.max_status_age_secs,
+            pause_lead_secs: self.pause_lead_secs,
+            max_multiplier_gap: self.max_multiplier_gap,
+            skew: self.skew,
+        }
+    }
+
+    /// The stanza checked against its pair: the core's rules, then Ondo's own. Answers the
+    /// core's settings and the oracle the multiplier is read from.
+    fn check(&self, pair: &PairShape) -> eyre::Result<(Settings, Address)> {
+        let settings = Settings::new(&self.stanza(), pair)?;
+        api::check_api(&self.api).map_err(|err| eyre::eyre!(err))?;
+        eyre::ensure!(
+            (250..=60_000).contains(&self.poll_ms),
+            "poll_ms {} is not in 250..=60000: Ondo caches prices for a second",
+            self.poll_ms
+        );
+        eyre::ensure!(
+            self.ticker.as_ref().is_none_or(|ticker| !ticker.is_empty()),
+            "ticker is empty"
+        );
+        let oracle = parse_address(
+            self.multiplier_oracle
+                .as_deref()
+                .unwrap_or(oracle::MAINNET_MULTIPLIER_ORACLE),
+        )
+        .map_err(|err| eyre::eyre!("multiplier_oracle: {err}"))?;
+        Ok((settings, oracle))
+    }
+}
+
+/// Registered as `ondo`.
+pub struct OndoFactory;
+
+impl Factory for OndoFactory {
+    type Config = OndoCfg;
+    type Pricer = StockPricer;
+
+    fn validate(&self, cfg: &OndoCfg, pair: &PairShape) -> eyre::Result<()> {
+        cfg.check(pair).map(drop)
+    }
+
+    fn summary(&self, cfg: &OndoCfg) -> String {
+        format!("{} delta {} skew {}", cfg.symbol, cfg.delta, cfg.skew)
+    }
+
+    fn build<'a>(
+        &'a self,
+        cfg: &'a OndoCfg,
+        ctx: &'a mut BuildCtx,
+    ) -> BoxFuture<'a, eyre::Result<StockPricer>> {
+        Box::pin(async move {
+            let (settings, oracle) = cfg.check(ctx.pair())?;
+            let key = cfg.api_key.resolve()?;
+            let chain = ctx.chain()?;
+            let token = ctx.pair().tokens.0;
+            let (api, every) = (cfg.api.clone(), Duration::from_secs(cfg.status_poll_secs));
+            let status_key = key.clone();
+            let adapters = Adapters {
+                prices: Box::new(api::OndoPrices {
+                    http: api::client(),
+                    api: cfg.api.clone(),
+                    key,
+                    symbol: cfg.symbol.clone(),
+                    ticker: cfg.ticker.clone(),
+                }),
+                valuation: Box::new(oracle::OndoOracle {
+                    chain: Arc::new(chain),
+                    oracle,
+                    token,
+                }),
+                status: Some(Box::pin(async move {
+                    let shared = status::Status::shared(&api, &status_key, every).await?;
+                    Ok(StatusFeed {
+                        reader: Box::new(status::OndoStatus::new(Arc::clone(&shared))),
+                        refresh: Box::pin(status::keep_fresh(shared)),
+                    })
+                })),
+            };
+            pricer::build(ctx, settings, adapters).await
+        })
+    }
+}
+
+/// Registered as `ondo_token`: the restriction guard over Ondo's pause and lists.
+pub fn token_guard() -> RestrictionGuardFactory {
+    RestrictionGuardFactory {
+        issuer: "Ondo",
+        restrictions: |chain, token| Box::new(compliance::OndoCompliance { chain, token }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use quote_updater::testing;
+
+    use super::{
+        status::{OndoStatus, Readings, Status},
+        *,
+    };
+    use crate::{
+        poll::Stamped,
+        stock::pricer::testkit::{self, Built, read_at},
+    };
+
+    fn cfg(extra: serde_json::Value) -> OndoCfg {
+        let mut stanza = serde_json::json!({
+            "symbol": "AAPLon",
+            "api_key": {"env": "ONDO_API_KEY"},
+            "delta": "0.003",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            stanza[key] = value.clone();
+        }
+        serde_json::from_value(stanza).unwrap()
+    }
+
+    /// Ondo reporting `session` and the events in `events_body` (`/v1/status/assets`'s
+    /// answer), a second ago.
+    fn ondo_reports(session: &str, events_body: &str) -> Arc<Status> {
+        Status::of(Readings {
+            session: Some(Stamped {
+                at: read_at(),
+                value: session.to_owned(),
+            }),
+            events: Some(Stamped {
+                at: read_at(),
+                value: api::parse_asset_events(events_body).unwrap(),
+            }),
+        })
+    }
+
+    /// The `ondo` pricer as its build leaves it, over the status Ondo reports, for AAPLon,
+    /// whose stock Ondo's price answer names AAPL.
+    fn built(status: Arc<Status>) -> Built {
+        let pair = testkit::pair();
+        let (settings, _) = cfg(serde_json::json!({})).check(&pair).unwrap();
+        let reads = testkit::healthy(Some(Box::new(OndoStatus::new(status))));
+        testkit::built(pair, settings, reads, None)
+    }
+
+    #[test]
+    fn the_regular_session_with_no_event_quotes() {
+        assert!(built(ondo_reports("regular", "[]")).price().is_ok());
+    }
+
+    #[test]
+    fn the_regular_session_quotes_however_ondo_capitalises_it() {
+        for session in ["REGULAR", "Regular"] {
+            assert!(
+                built(ondo_reports(session, "[]")).price().is_ok(),
+                "{session}"
+            );
+        }
+    }
+
+    /// `/v1/status/assets` listing one upcoming event on AAPLon, starting at `start` (a JSON
+    /// value as written, or none).
+    fn upcoming(moves_multiplier: bool, code: &str, start: Option<&str>) -> String {
+        let start = start.map_or_else(String::new, |start| format!(r#""start":{start},"#));
+        format!(
+            r#"[{{"symbol":"AAPLon","status":"upcoming","type":"scheduled",{start}
+                 "updateSharesMultiplier":{moves_multiplier},
+                 "reason":{{"code":"{code}","message":"split"}}}}]"#
+        )
+    }
+
+    #[test]
+    fn an_upcoming_corporate_action_withdraws_from_the_lead_before_the_start_ondo_gives() {
+        // NOW is 2026-10-08 14:00:00 UTC, and the lead is 300s.
+        let at = |start| {
+            built(ondo_reports(
+                "regular",
+                &upcoming(true, "ASSET_PAUSED", start),
+            ))
+        };
+        assert!(at(Some(r#""2026-10-08T14:05:01Z""#)).price().is_ok());
+        let refusal = at(Some(r#""2026-10-08T14:05:00Z""#)).refusal();
+        assert_eq!(refusal.reason(), "asset_event");
+        // In milliseconds, as Ondo writes its other timestamps.
+        assert!(at(Some("1791468301000")).price().is_ok());
+        assert!(at(Some("1791468300000")).price().is_err());
+        // No start, or one that does not read as a time: from the moment Ondo lists it.
+        assert!(at(None).price().is_err());
+        assert!(at(Some(r#""next week""#)).price().is_err());
+    }
+
+    #[test]
+    fn an_upcoming_event_that_leaves_the_multiplier_alone_withdraws_from_its_start() {
+        let at = |start| {
+            built(ondo_reports(
+                "regular",
+                &upcoming(false, "ASSET_LIMITED", start),
+            ))
+        };
+        assert!(at(Some(r#""2026-10-08T14:00:01Z""#)).price().is_ok());
+        assert_eq!(
+            at(Some(r#""2026-10-08T14:00:00Z""#)).refusal().reason(),
+            "asset_event"
+        );
+        // With no start there is nothing to withdraw from until Ondo says it is on.
+        assert!(at(None).price().is_ok());
+    }
+
+    #[test]
+    fn any_session_but_regular_withdraws() {
+        for session in [
+            "premarket",
+            "postmarket",
+            "overnight",
+            "offhours",
+            "paused",
+            "closed",
+        ] {
+            let refusal = built(ondo_reports(session, "[]")).refusal();
+            assert_eq!(refusal.reason(), "market_session", "{session}");
+            assert!(refusal.message().contains(session), "{}", refusal.message());
+        }
+    }
+
+    #[test]
+    fn an_active_asset_event_withdraws() {
+        let refusal = built(ondo_reports(
+            "regular",
+            r#"[{"symbol":"AAPLon","status":"active","reason":{"code":"ASSET_PAUSED","message":"halt"}}]"#,
+        ))
+        .refusal();
+        assert_eq!(refusal.reason(), "asset_event");
+        assert!(
+            refusal.message().contains("ASSET_PAUSED"),
+            "{}",
+            refusal.message()
+        );
+        // Another asset's event is not this one's.
+        let other = ondo_reports(
+            "regular",
+            r#"[{"symbol":"TSLAon","status":"active","reason":{"code":"ASSET_PAUSED","message":"halt"}}]"#,
+        );
+        assert!(built(other).price().is_ok());
+    }
+
+    #[test]
+    fn an_event_under_the_stocks_ticker_withdraws() {
+        let refusal = built(ondo_reports(
+            "regular",
+            r#"[{"symbol":"AAPL","status":"active","reason":{"code":"ASSET_PAUSED","message":"halt"}}]"#,
+        ))
+        .refusal();
+        assert_eq!(refusal.reason(), "asset_event");
+        assert_eq!(refusal.message(), "Ondo reports AAPLon: ASSET_PAUSED: halt");
+    }
+
+    #[test]
+    fn a_corporate_action_ondo_lists_as_upcoming_withdraws_before_the_chain_schedules_it() {
+        // No pauseStartTime on chain (healthy's multiplier has none): Ondo's list is all
+        // there is.
+        let refusal = built(ondo_reports(
+            "regular",
+            r#"[{"symbol":"AAPLon","status":"upcoming","type":"scheduled","updateSharesMultiplier":true,
+                 "reason":{"code":"ASSET_PAUSED","message":"split"}}]"#,
+        ))
+        .refusal();
+        assert_eq!(refusal.reason(), "asset_event");
+        assert!(refusal.message().contains("split"), "{}", refusal.message());
+    }
+
+    #[test]
+    fn the_stanza_is_checked_against_its_pair() {
+        let pair = testkit::pair();
+        assert!(
+            OndoFactory
+                .validate(&cfg(serde_json::json!({})), &pair)
+                .is_ok()
+        );
+        assert!(
+            OndoFactory
+                .validate(
+                    &cfg(serde_json::json!({"api": "http://127.0.0.1:8556"})),
+                    &pair
+                )
+                .is_ok(),
+            "the smoke test's mock"
+        );
+        for (bad, why) in [
+            (serde_json::json!({"delta": "0"}), "zero delta"),
+            (serde_json::json!({"delta": "0.1"}), "10% delta"),
+            (serde_json::json!({"delta": "3bp"}), "not a number"),
+            (serde_json::json!({"symbol": ""}), "no symbol"),
+            (
+                serde_json::json!({"poll_ms": 100}),
+                "polling faster than Ondo caches",
+            ),
+            (
+                serde_json::json!({"status_poll_secs": 0}),
+                "status never polled",
+            ),
+            (
+                serde_json::json!({"max_status_age_secs": 15}),
+                "status always stale",
+            ),
+            (
+                serde_json::json!({"max_price_age_secs": 1, "poll_ms": 1000}),
+                "price always stale",
+            ),
+            (
+                serde_json::json!({"max_unchanged_secs": 1}),
+                "a price still at every poll",
+            ),
+            (
+                serde_json::json!({"max_multiplier_gap": 0.0}),
+                "no gap allowed",
+            ),
+            (serde_json::json!({"skew": 0.6}), "skew over half"),
+            (
+                serde_json::json!({"multiplier_oracle": "0x1234"}),
+                "short address",
+            ),
+            (serde_json::json!({"api": "ftp://ondo"}), "not http"),
+            (serde_json::json!({"ticker": ""}), "an empty ticker"),
+            (
+                serde_json::json!({"api": "http://api.gm.ondo.finance"}),
+                "the key in the clear",
+            ),
+            (
+                serde_json::json!({"pause_lead_secs": u64::MAX}),
+                "a lead that wraps negative",
+            ),
+            (
+                serde_json::json!({"pause_lead_secs": 7 * 86_400 + 1}),
+                "a lead over a week",
+            ),
+            (
+                serde_json::json!({"max_price_age_secs": u64::MAX}),
+                "a price age that overflows",
+            ),
+            (
+                serde_json::json!({"max_price_age_secs": 3_601}),
+                "a price over an hour old",
+            ),
+            (
+                serde_json::json!({"max_status_age_secs": u64::MAX}),
+                "a status age that overflows",
+            ),
+            (
+                serde_json::json!({"status_poll_secs": 3_601, "max_status_age_secs": 3_602}),
+                "status read hourly",
+            ),
+        ] {
+            assert!(
+                OndoFactory.validate(&cfg(bad), &pair).is_err(),
+                "{why} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pair_labelled_by_its_lane_validates_so_it_can_be_halted() {
+        // A halted pair is never read, so the library labels it by its lane, as it does a
+        // pair whose symbol() it could not read. Refusing that refused every halt of a stock
+        // pair, and every reload while a symbol() read timed out; the build reads the token's
+        // own symbol() instead, and only a live pair is built.
+        let mut halted = testkit::pair();
+        halted.label = "lane 0x95a4117f".to_owned();
+        assert!(
+            OndoFactory
+                .validate(&cfg(serde_json::json!({})), &halted)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_stanza_refuses_unknown_keys() {
+        testing::assert_rejects_unknown_fields::<OndoCfg>(
+            "symbol = \"AAPLon\"\napi_key = { env = \"ONDO_API_KEY\" }\ndelta = \"0.003\"",
+        );
+    }
+
+    #[test]
+    fn the_mainnet_oracle_is_the_default() {
+        let (_, oracle) = cfg(serde_json::json!({})).check(&testkit::pair()).unwrap();
+        assert_eq!(
+            format!("{oracle:#x}"),
+            "0x9bc39db6fbb44b91a48b8d5a6c208b82b1741be6"
+        );
+    }
+}

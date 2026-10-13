@@ -1,0 +1,4 @@
+.env
+target/
+# An operator's filled-in config: it holds the builders' api_key.
+/config.toml

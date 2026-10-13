@@ -1,0 +1,78 @@
+# propamm-stocks: one Ondo stock token against USDC on Ethereum mainnet. The file format is
+# the library's (see docs/manual.md); the kinds named in [pairs.pricing] and [[pairs.guards]]
+# are the ones src/main.rs registers.
+#
+# Before it runs:
+# - ONDO_API_KEY: an Ondo GM API key (partner-only; Ondo onboarding).
+# - UPDATER_KEY_AAPLON_USDC: the pair's updater key, registered on the PropAMM.
+# - The vault holds AAPLon and USDC and has approved the PropAMM for both.
+# Then `propamm-stocks --config config.toml --check`, and without `--check` to run.
+
+# The PropAMM the pair quotes on. Zero here: fill in your instance's.
+target = "0x0000000000000000000000000000000000000000"
+
+[settings]
+mode = "builder"
+rpc_url = "http://127.0.0.1:8545"
+requote_ms = 50
+metrics_addr = "127.0.0.1:9464"
+
+[[pairs]]
+# The stock token first: the `ondo` pricer checks it is the token `symbol` names, and prices
+# it in USDC per token, the way Ondo does.
+tokens  = ["0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c",   # AAPLon
+           "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]   # USDC
+key_env = "UPDATER_KEY_AAPLON_USDC"
+# No `symbol`/`sources`: the `ondo` pricer polls Ondo itself. Nothing to check the tokens'
+# on-chain symbols against, so the startup symbol check is told so.
+allow_symbol_mismatch = true
+# The band, as the lane carries the price: the core withdraws any mid outside it. Keep it
+# tight around where the stock trades; it is the last check on a bad price from a single
+# source. The lane carries USDC per token here because AAPLon's address sorts before USDC's
+# (0xA0b8...). For a stock token whose address sorts after it, the lane carries token per
+# USDC and the band is 1/price: for a $150-$400 stock, min_mid = "0.0025", max_mid =
+# "0.0066667". --check's mid column prints the lane's number, and a band written the other
+# way up fails the build.
+min_mid = "150"
+max_mid = "400"
+
+[pairs.pricing]
+kind    = "ondo"
+symbol  = "AAPLon"
+api_key = { env = "ONDO_API_KEY" }
+delta   = "0.003"               # 30 bp half-spread: fixed, so sized for the open, not lunch
+# Defaults, written out:
+# ticker             = "AAPL"   # unset: Ondo's price answer names it (the build fails if not)
+# api                = "https://api.gm.ondo.finance"
+# multiplier_oracle  = "0x9BC39DB6fbB44B91a48b8D5A6C208B82B1741bE6"   # SyntheticSharesOracle
+# poll_ms            = 1000     # Ondo caches prices for 1s
+# status_poll_secs   = 15
+# max_price_age_secs = 15
+# max_unchanged_secs = 30       # a price that has not moved this long: the stock may be halted
+# max_status_age_secs = 60
+# pause_lead_secs    = 300      # stop this long before a scheduled corporate action
+# max_multiplier_gap = 0.001    # Ondo's multiplier against the chain's
+# skew               = 0        # inventory skew off; 0.02 moves the mid 0.5% at a 75/25 vault
+
+[[pairs.guards]]
+kind              = "us_market_hours"
+open_delay_secs   = 60          # let the opening auction settle
+close_margin_secs = 60
+# NYSE's calendar (nyse.com/markets/hours-calendars), from today through 2027. Extend it
+# before it runs out: past listed_through the guard withdraws (reason calendar_ended),
+# since it cannot tell a holiday from a trading day, and the build warns a month before.
+holidays     = ["2026-11-26", "2026-12-25",
+                "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+                "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24"]
+early_closes = ["2026-11-27", "2026-12-24", "2027-11-26"]
+listed_through = "2027-12-31"
+
+[[pairs.guards]]
+kind         = "ondo_token"
+poll_secs    = 12
+max_age_secs = 60
+
+[[builder]]
+name = "titan-eu"
+endpoint = "wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate"
+api_key = "your-maker-key"

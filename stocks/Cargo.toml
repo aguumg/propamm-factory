@@ -1,0 +1,30 @@
+# The quote updater for Ondo Global Markets tokenized stocks (AAPLon/USDC and the like): the
+# library, plus the pricing model and the guards a stock pair needs. See README.md.
+#
+# The empty [workspace] table keeps this crate out of the root workspace, as example/ is: it
+# has its own Cargo.lock and its own target/.
+[workspace]
+
+[package]
+name = "propamm-stocks"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "propamm-stocks"
+path = "src/main.rs"
+
+[dependencies]
+quote-updater = { path = "../quote-updater" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+# The same release profile as the root Cargo.toml: Cargo reads the release profile from the
+# binary's own workspace. No panic = "abort": the library refuses to start with it.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"

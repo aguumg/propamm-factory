@@ -75,6 +75,28 @@ jobs:
           help=$(./e2e/downstream/target/debug/downstream --help)
           printf '%s\n' "$help" | head -1
 
+  stocks:
+    name: Stocks updater (format / clippy / tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # stocks/ is a crate of its own, like example/: its own Cargo.lock and target/, so the
+    # workspace job above does not see it.
+    defaults:
+      run:
+        working-directory: stocks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stocks
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
   alert-rules:
     name: Alert rules (promtool)
     runs-on: ubuntu-latest

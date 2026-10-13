@@ -27,7 +27,8 @@ mod inputs;
 mod volatile;
 
 pub use self::inputs::{
-    Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport,
+    CallOutcome, Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome,
+    LandingReport,
 };
 pub use self::{feed::Feed, fixed::Fixed, volatile::Volatile};
 #[cfg(test)]

@@ -4,7 +4,9 @@
 # ../compose.yaml globs `/etc/prometheus/rules/*.rules.yml`, and it must never load a file
 # of fixtures as live rules.
 #
-# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry. The first is a `predict_linear`, which is the only
+# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, plus
+# PusherStockCalendarEnding (last), which is new enough to want its labels and wording
+# proven. The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -138,3 +140,30 @@ tests:
             exp_annotations:
               summary: "EMPTY: signer has no ETH left"
               description: "The key that signs this pair's updates has a zero balance, so nothing it signs can land and the lane is dead until someone tops it up. PusherSignerNearlyDry cannot say this: a balance that is already flat at zero extrapolates to zero, not below it."
+
+  # A stock pair's trading calendar (`us_market_hours`) running out. Past its last listed day
+  # the guard withdraws every quote, so a month's notice is the point; a pair with a year
+  # left must stay quiet, and so must a pair that is not a stock pair, which never publishes
+  # the series.
+  - interval: 1m
+    name: a stock calendar under a month from its end raises a ticket
+    input_series:
+      - series: 'quote_updater_diagnostic{pair="AAPLon/USDC",kind="us_market_hours",name="calendar_days_left"}'
+        values: "29x120"
+      - series: 'quote_updater_diagnostic{pair="TSLAon/USDC",kind="us_market_hours",name="calendar_days_left"}'
+        values: "365x120"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PusherStockCalendarEnding
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: PusherStockCalendarEnding
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: AAPLon/USDC
+              kind: us_market_hours
+              name: calendar_days_left
+            exp_annotations:
+              summary: "AAPLon/USDC: the trading calendar ends in 29 days"
+              description: "The us_market_hours guard withdraws every quote past its listed_through date, since it cannot tell a holiday from a trading day there. List the next year's NYSE holidays and early closes in the pair's guard stanza, move listed_through, and reload."

@@ -554,3 +554,22 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: "{{ $labels.pair }}: {{ $labels.call }} p95 past the 50ms requote budget"
+
+      # A stock pair's trading calendar (`us_market_hours` in propamm-stocks) running out:
+      # past its listed_through date the guard withdraws every quote, since it cannot tell a
+      # holiday from a trading day there. The guard publishes the days left every tick and
+      # warns in its log from 30 days out; this is the same 30 days (pinned by a test in
+      # stocks/src/stock/hours.rs), for whoever does not read the log. Silent on every pair
+      # without the guard, which never publishes the series.
+      - alert: PusherStockCalendarEnding
+        expr: >-
+          quote_updater_diagnostic{kind="us_market_hours",name="calendar_days_left"} < 30
+        for: 1h
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: the trading calendar ends in {{ $value }} days"
+          description: >-
+            The us_market_hours guard withdraws every quote past its listed_through date,
+            since it cannot tell a holiday from a trading day there. List the next year's NYSE
+            holidays and early closes in the pair's guard stanza, move listed_through, and
+            reload.

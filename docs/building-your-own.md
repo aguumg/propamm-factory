@@ -72,7 +72,10 @@ What to know:
   `call_sig(to, "balanceOf(address)", &[Value::Address(a)])` encodes it with the ethrex
   types re-exported as `quote_updater::calldata`, so no ethrex pin of your own, and
   `calldata::decode_return_data("(uint256)", &answer)` decodes the answer; not
-  `decode_calldata`, which expects a selector and would read every word four bytes late),
+  `decode_calldata`, which expects a selector and would read every word four bytes late;
+  `call_sig_as(from, to, …)` makes the call as `from` and answers a revert as
+  `CallOutcome::Reverted` rather than an error, for a guard that asks a contract whether it
+  would let an account do something by trying it),
   the
   market's σ history (`ctx.history()`: the process-level samples the volatile model reads,
   kept across reloads), the pair's vault inventory (`ctx.inventory().await`: read once,

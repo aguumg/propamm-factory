@@ -54,10 +54,10 @@ pub mod prelude {
         },
         observe::{BlockOutcome, Event, Observer, ReloadOutcome},
         pricing::{
-            BoxFuture, BuildCtx, Chain, DiagHandle, Diagnostics, EnvSecret, Factory, FormField,
-            History, Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport, Market,
-            MarketGuardFactory, PairShape, Pricer, PricerOutput, QuoteGuardFactory, Refusal,
-            RefusalHandle, TickCtx,
+            BoxFuture, BuildCtx, CallOutcome, Chain, DiagHandle, Diagnostics, EnvSecret, Factory,
+            FormField, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome,
+            LandingReport, Market, MarketGuardFactory, PairShape, Pricer, PricerOutput,
+            QuoteGuardFactory, Refusal, RefusalHandle, TickCtx,
         },
     };
 }
