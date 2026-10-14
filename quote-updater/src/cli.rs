@@ -174,6 +174,13 @@ pub(crate) struct Flags {
     #[arg(long, env = "DISABLE_CROSS_REGION", value_parser = FalseyValueParser::new())]
     pub(crate) disable_cross_region: bool,
 
+    /// Publish each update with a third slot holding its signing instant in UNIX
+    /// nanoseconds, so an update found on chain says by itself when its price was computed.
+    /// The contract reads only the first two slots. Public, and one more storage write per
+    /// landed update.
+    #[arg(long, env = "QUOTE_ID", value_parser = FalseyValueParser::new())]
+    pub(crate) quote_id: bool,
+
     /// Record the Binance mid of every symbol and each pair's vault balances into this
     /// Postgres (e.g. postgresql://ponder:pass@127.0.0.1:5432/ponder), the indexer's
     /// database, for the P&L dashboard. Unset disables recording. Ignored under --check and
@@ -423,6 +430,11 @@ pub(crate) fn apply_file_settings(
     {
         args.flags.disable_cross_region = disable;
     }
+    if let Some(quote_id) = settings.quote_id
+        && !given("quote_id")
+    {
+        args.flags.quote_id = quote_id;
+    }
     Ok(())
 }
 
@@ -593,6 +605,7 @@ mod tests {
             metrics_addr: Some("127.0.0.1:9464".to_owned()),
             price_decimals: Some(6),
             disable_cross_region: Some(true),
+            quote_id: Some(true),
             ..Default::default()
         };
         apply_file_settings(&mut args, &|_| false, &settings).unwrap();
@@ -603,10 +616,25 @@ mod tests {
         assert_eq!(args.flags.interval, 3);
         assert_eq!(args.flags.price_decimals, 6);
         assert!(args.flags.disable_cross_region);
+        assert!(args.flags.quote_id);
         assert_eq!(
             args.flags.metrics_addr,
             Some("127.0.0.1:9464".parse::<SocketAddr>().unwrap())
         );
+    }
+
+    /// Publishing the signing instant is opt-in: nothing on the command line, in the
+    /// environment or in the file leaves it off, and a file without the key does not turn
+    /// it on.
+    #[test]
+    fn quote_id_is_off_unless_asked_for() {
+        let mut args = defaulted_args();
+        assert!(!args.flags.quote_id);
+        apply_file_settings(&mut args, &|_| false, &config::FileSettings::default()).unwrap();
+        assert!(!args.flags.quote_id);
+        let on = Args::try_parse_from(["quote-updater", "--config", "config.toml", "--quote-id"])
+            .expect("parses");
+        assert!(on.flags.quote_id);
     }
 
     /// And does not touch what it did. The local `make` targets drive everything from

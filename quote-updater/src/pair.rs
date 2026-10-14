@@ -936,6 +936,8 @@ pub(crate) struct SendOpts {
     /// Where the quote loop records every update it signs, when recording is on. Carried
     /// here for the same reason as `price_decimals`.
     pub(crate) recorder: Option<record::Recorder>,
+    /// Whether each update carries its signing instant as a third slot; see `--quote-id`.
+    pub(crate) quote_id: bool,
 }
 
 #[cfg(test)]

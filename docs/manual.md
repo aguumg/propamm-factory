@@ -578,9 +578,9 @@ overridable per run: `my-quote-updater --requote-ms 25`.
 Two conventions make a file that documents every knob safe to keep around:
 
 - A blank value (`MINE=`) reads as *not set*, and the option falls back to its default.
-- The on/off flags (`ONCE`, `NO_PIN`, `MINE`, `DISABLE_CROSS_REGION`) take `false`, `f`,
-  `no`, `n`, `off`, `0` and blank as off, anything else as on — so a variable left at
-  `false` is genuinely off rather than merely present. This matters because the updater
+- The on/off flags (`ONCE`, `NO_PIN`, `MINE`, `DISABLE_CROSS_REGION`, `QUOTE_ID`) take
+  `false`, `f`, `no`, `n`, `off`, `0` and blank as off, anything else as on — so a variable
+  left at `false` is genuinely off rather than merely present. This matters because the updater
   checks the *values* of mutually exclusive options rather than leaning on clap's
   `conflicts_with`, which counts anything that came from the environment as set.
 
@@ -606,6 +606,11 @@ variable exists so a flag-driven run stays possible, and setting one overrides t
   ignored entirely.
 - `REQUOTE_MS` — the requote cadence; keep it well under the builder's ~400ms eviction
   (Titan's protocol, and its own guidance is a ~50ms cadence).
+- `QUOTE_ID` — publish each update with a third slot holding its signing instant in UNIX
+  nanoseconds, so an update found on chain says by itself when its price was computed.
+  Public: anyone reading the calldata sees it. Shown as `quote_id 0x…` in the block summary.
+  PropAMM reads only the first two slots; the third costs one more storage write per landed
+  update. Off by default.
 
 `REGISTRY`, `PRICE_DECIMALS` and `BINANCE_WS` already default to the mainnet values.
 `INTERVAL` paces node mode only and has no effect in builder mode, and `MINE`/`NO_PIN` are

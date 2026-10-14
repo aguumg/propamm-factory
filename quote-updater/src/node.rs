@@ -18,7 +18,7 @@ use crate::{
     landing::{get_state_calldata, runway_check},
     metrics::NodePush,
     pair::{Live, SendOpts},
-    record,
+    quote_id, record,
     rpc::{bounded, call_view, decode_return_data, raw_rpc},
     update::{self, BLOCK_TIME_SECS, UpdateParams, UpdateStamp, next_block_max_fee},
 };
@@ -135,7 +135,8 @@ pub(crate) async fn push_update(
         )?;
     }
 
-    let calldata = update::update_calldata(&params, ts, delta, mid)?;
+    let quote_id = opts.quote_id.then(|| U256::from(quote_id::mint()));
+    let calldata = update::update_calldata(&params, ts, delta, mid, quote_id)?;
     // Nonce from the pending block, not latest (the SDK's default): the pool can hold
     // queued transactions from this account (an earlier tick's, or a user's on the
     // no-mining anvil), and the latest-block count would reuse their nonce and collide.
@@ -195,7 +196,17 @@ pub(crate) async fn push_update(
     // mode's characteristic failure — landed in no bucket. `confirm_and_verify` still uses
     // plain `?` throughout; the one classification point below is what makes a future `?`
     // added inside it safe by default (`NodePush::Failed`) instead of silently uncounted.
-    if let Err(err) = confirm_and_verify(client, live, opts, &params, tx_hash, ts, delta, mid).await
+    if let Err(err) = confirm_and_verify(
+        client,
+        live,
+        opts,
+        &params,
+        tx_hash,
+        ts,
+        (delta, mid),
+        quote_id,
+    )
+    .await
     {
         let outcome = err
             .downcast_ref::<PostSendFailure>()
@@ -258,8 +269,8 @@ async fn confirm_and_verify(
     params: &UpdateParams,
     tx_hash: H256,
     ts: u32,
-    delta: U256,
-    mid: U256,
+    (delta, mid): (U256, U256),
+    quote_id: Option<U256>,
 ) -> Result<()> {
     let label = &live.pair.label;
     let receipt = wait_for_transaction_receipt(tx_hash, client, RECEIPT_RETRIES).await?;
@@ -297,10 +308,10 @@ async fn confirm_and_verify(
     )
     .await?;
     let got = decode_return_data("r(uint32,uint256[])", &ret)?;
-    let want = vec![
-        Value::Uint(ts.into()),
-        Value::Array(vec![Value::Uint(delta), Value::Uint(mid)]),
-    ];
+    // The registry stores the slots as sent, so the third is read back too when there is one.
+    let mut slots = vec![Value::Uint(delta), Value::Uint(mid)];
+    slots.extend(quote_id.map(Value::Uint));
+    let want = vec![Value::Uint(ts.into()), Value::Array(slots)];
     if got != want {
         return Err(PostSendFailure {
             outcome: NodePush::Mismatch,
@@ -316,8 +327,9 @@ async fn confirm_and_verify(
     // `Mismatch`, and no test would catch it — the two `.inc()` calls are far enough apart
     // in the function that nothing else enforces the ordering.
     live.metrics.node_pushes(NodePush::Landed).inc();
+    let id = quote_id.map_or(String::new(), |id| format!(" quote_id {id:#x}"));
     tracing::info!(
-        "[{label}] verified via getState as {:#x}: lane {} -> slots = [{delta}, {mid}] at timestamp {ts}",
+        "[{label}] verified via getState as {:#x}: lane {} -> slots = [{delta}, {mid}] at timestamp {ts}{id}",
         params.target,
         params.lane
     );
@@ -431,6 +443,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 18,
             recorder: None,
+            quote_id: false,
         };
         live.latch.trip(
             "funding",
@@ -529,6 +542,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 18,
             recorder: None,
+            quote_id: false,
         };
         // Port 1: nothing listens, and nothing needs to — the refusal happens before the
         // first RPC call. If that ever stops being true this test will hang rather than pass

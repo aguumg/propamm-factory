@@ -721,15 +721,25 @@ fn test_shape(inverted: bool, price_decimals: u32) -> PairShape {
     }
 }
 
-/// updateState(target, lane, ts, [delta, mid]) calldata, shared by both send paths.
-pub fn update_calldata(params: &UpdateParams, ts: u32, delta: U256, mid: U256) -> Result<Vec<u8>> {
+/// updateState(target, lane, ts, slots) calldata, shared by both send paths. The slots are
+/// `[delta, mid]`, plus `quote_id` as a third when one is given; the contract reads the
+/// first two and ignores the rest.
+pub fn update_calldata(
+    params: &UpdateParams,
+    ts: u32,
+    delta: U256,
+    mid: U256,
+    quote_id: Option<U256>,
+) -> Result<Vec<u8>> {
+    let mut slots = vec![Value::Uint(delta), Value::Uint(mid)];
+    slots.extend(quote_id.map(Value::Uint));
     Ok(encode_calldata(
         UPDATE_STATE_SIG,
         &[
             Value::Address(params.target),
             Value::Uint(params.lane),
             Value::Uint(ts.into()),
-            Value::Array(vec![Value::Uint(delta), Value::Uint(mid)]),
+            Value::Array(slots),
         ],
     )?)
 }
@@ -752,13 +762,14 @@ pub async fn sign_update_tx(
     stamp: UpdateStamp,
     nonce: u64,
     (delta, mid): (U256, U256),
+    quote_id: Option<u64>,
 ) -> Result<Vec<u8>> {
     let tx = build_generic_tx(
         client,
         TxType::EIP1559,
         params.registry,
         signer.address(),
-        update_calldata(params, stamp.ts, delta, mid)?.into(),
+        update_calldata(params, stamp.ts, delta, mid, quote_id.map(U256::from))?.into(),
         Overrides {
             gas_limit: Some(UPDATE_GAS_LIMIT),
             max_fee_per_gas: Some(next_block_max_fee(stamp.parent_base_fee, 0)),
@@ -790,6 +801,26 @@ pub(crate) fn stamped_ts(raw_tx: &[u8]) -> u32 {
         panic!("the third argument of updateState is the timestamp");
     };
     ts.as_u32()
+}
+
+/// The slots a signed update carries, read back out of its raw bytes. Test-only, like
+/// `stamped_ts`.
+#[cfg(test)]
+pub(crate) fn stamped_slots(raw_tx: &[u8]) -> Vec<U256> {
+    use ethrex_l2_sdk::calldata::decode_calldata;
+    use ethrex_rlp::decode::RLPDecode;
+    let tx = EIP1559Transaction::decode(&raw_tx[1..]).expect("a type-prefixed EIP-1559 tx");
+    let values = decode_calldata(UPDATE_STATE_SIG, tx.data).expect("updateState calldata");
+    let Value::Array(slots) = &values[3] else {
+        panic!("the fourth argument of updateState is the slots");
+    };
+    slots
+        .iter()
+        .map(|slot| match slot {
+            Value::Uint(v) => *v,
+            other => panic!("a slot is a uint, not {other:?}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1097,8 +1128,14 @@ mod tests {
     #[test]
     fn update_calldata_round_trips_through_the_registry_abi() {
         let params = params();
-        let calldata =
-            update_calldata(&params, 1_755_000_012, U256::from(5u64), U256::from(9u64)).unwrap();
+        let calldata = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            None,
+        )
+        .unwrap();
         let decoded = decode_calldata(UPDATE_STATE_SIG, Bytes::from(calldata)).unwrap();
         assert_eq!(
             decoded,
@@ -1114,12 +1151,50 @@ mod tests {
         );
     }
 
+    /// A quote id rides as a third slot after the two the contract reads, and nowhere else:
+    /// everything before the slots is byte-identical to the two-slot calldata.
+    #[test]
+    fn a_quote_id_is_a_third_slot() {
+        let params = params();
+        let quote_id = U256::from(0xDEAD_BEEF_0000_0001u64);
+        let calldata = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            Some(quote_id),
+        )
+        .unwrap();
+        let without = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            None,
+        )
+        .unwrap();
+        // Selector, three static arguments, the array offset and its length: the slots start
+        // after that, and only the length word and the tail differ.
+        let head = 4 + 32 * 4;
+        assert_eq!(calldata[..head], without[..head]);
+        assert_eq!(calldata.len(), without.len() + 32);
+        let decoded = decode_calldata(UPDATE_STATE_SIG, Bytes::from(calldata)).unwrap();
+        assert_eq!(
+            decoded[3],
+            Value::Array(vec![
+                Value::Uint(U256::from(5u64)),
+                Value::Uint(U256::from(9u64)),
+                Value::Uint(quote_id),
+            ])
+        );
+    }
+
     /// The registry is the transaction's `to`, not an ABI argument, so it must not appear
     /// in the calldata — a swap of the two would silently publish for the wrong target.
     #[test]
     fn update_calldata_does_not_encode_the_registry() {
         let params = params();
-        let calldata = update_calldata(&params, 1, U256::one(), U256::one()).unwrap();
+        let calldata = update_calldata(&params, 1, U256::one(), U256::one(), None).unwrap();
         assert!(
             !calldata
                 .windows(20)

@@ -81,6 +81,10 @@ pub struct FileSettings {
     pub metrics_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_cross_region: Option<bool>,
+    /// Publish each update with its signing instant (UNIX ns) as a third slot; see
+    /// `--quote-id`. Off unless set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_id: Option<bool>,
     /// Where the backoffice listens, e.g. `100.x.y.z:8088`. Unset disables it, which is the
     /// default: a service that listens on nothing is the one that cannot be reached wrong.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,6 +122,7 @@ impl FileSettings {
             "disable_cross_region",
             self.disable_cross_region != other.disable_cross_region,
         );
+        check("quote_id", self.quote_id != other.quote_id);
         check(
             "backoffice_addr",
             self.backoffice_addr != other.backoffice_addr,
@@ -2077,11 +2082,12 @@ disable_cross_region = false
             requote_ms: Some(25),
             rpc_url: Some("https://b.example".to_owned()),
             metrics_addr: Some("127.0.0.1:9464".to_owned()),
+            quote_id: Some(true),
             ..Default::default()
         };
         assert_eq!(
             running.changed_keys(&desired),
-            vec!["rpc_url", "requote_ms", "metrics_addr"]
+            vec!["rpc_url", "requote_ms", "metrics_addr", "quote_id"]
         );
     }
 

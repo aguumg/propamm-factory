@@ -91,6 +91,7 @@ pub mod pricers {
     pub use crate::pricing::{Feed, Fixed, Volatile};
 }
 mod pusher;
+mod quote_id;
 mod quoting;
 mod record;
 mod reload;

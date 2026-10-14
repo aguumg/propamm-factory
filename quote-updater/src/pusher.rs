@@ -401,6 +401,7 @@ async fn run_inner(
         disable_cross_region: args.flags.disable_cross_region,
         price_decimals: args.flags.price_decimals,
         recorder: recorder.clone(),
+        quote_id: args.flags.quote_id,
     };
 
     // A feed that never delivers aborts the whole process rather than starting the pairs
