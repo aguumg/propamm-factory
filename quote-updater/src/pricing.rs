@@ -259,6 +259,8 @@ pub const RESERVED_REASONS: &[&str] = &[
     "out_of_band",
     "delta_overflow",
     "panic",
+    "source_stale",
+    "source_divergence",
 ];
 
 /// What a pricer publishes: the half-spread and the mid, exact, in lane orientation and at

@@ -154,17 +154,25 @@ pub enum UnusableKind {
     /// tripped, so it is counted at most once per lane. Appended last: `ALL`'s order is
     /// the metric array's.
     Panic,
+    /// The pair's primary source is older than `max_source_age_ms` (or has dropped out),
+    /// judged by `source_gate`. Appended after `Panic`, for the same reason.
+    SourceStale,
+    /// The pair's primary source is further than `max_source_divergence` from another
+    /// fresh source, judged by `source_gate`.
+    SourceDivergence,
 }
 
 impl UnusableKind {
     /// Declaration order is load-bearing: `metrics::PairMetrics` indexes its pre-bound
     /// children by `kind as usize`.
-    pub const ALL: [UnusableKind; 5] = [
+    pub const ALL: [UnusableKind; 7] = [
         UnusableKind::NoSample,
         UnusableKind::Stale,
         UnusableKind::OutOfBand,
         UnusableKind::DeltaOverflow,
         UnusableKind::Panic,
+        UnusableKind::SourceStale,
+        UnusableKind::SourceDivergence,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -174,6 +182,8 @@ impl UnusableKind {
             UnusableKind::OutOfBand => "out_of_band",
             UnusableKind::DeltaOverflow => "delta_overflow",
             UnusableKind::Panic => "panic",
+            UnusableKind::SourceStale => "source_stale",
+            UnusableKind::SourceDivergence => "source_divergence",
         }
     }
 }
@@ -285,6 +295,10 @@ pub struct ValueSource {
     /// `BuildCtx::landings` feed. A pricer that never asked for it has no reader, and the
     /// report goes nowhere.
     landings: tokio::sync::watch::Sender<Option<crate::pricing::LandingReport>>,
+    /// The checks on the pair's primary source (`max_source_age_ms`,
+    /// `max_source_divergence`), judged right after the freshness gate; `None` for a pair
+    /// that sets neither.
+    sources: Option<Arc<crate::source_gate::SourceGate>>,
 }
 
 /// What a pricer's build declared, bound to its metric series, and the tasks it started.
@@ -426,7 +440,14 @@ impl ValueSource {
             latch: crate::guard::Latch::new(),
             guards: Arc::new(Mutex::new(Vec::new())),
             landings: tokio::sync::watch::channel(None).0,
+            sources: None,
         }
+    }
+
+    /// The pair's source checks, judged on every tick after the freshness gate.
+    pub(crate) fn with_source_gate(mut self, gate: crate::source_gate::SourceGate) -> Self {
+        self.sources = Some(Arc::new(gate));
+        self
     }
 
     /// The sender of the build context the pricer took its landing feed from, so the
@@ -586,7 +607,12 @@ impl ValueSource {
     pub fn current_detailed(&self, band: &MidBand) -> Result<Priced, Unusable> {
         let now = Instant::now();
         let market = match &self.market {
-            Some(rx) => match fresh_sample(rx) {
+            // The source checks right behind the freshness gate, and refused the same way:
+            // a primary that is late or disagrees withdraws the tick before the pricer runs.
+            Some(rx) => match fresh_sample(rx).and_then(|sample| match &self.sources {
+                Some(gate) => gate.check(now, SystemTime::now()).map(|()| sample),
+                None => Ok(sample),
+            }) {
                 Ok(sample) => Some(Market::from_sample(&sample, &self.pair)),
                 // Refused before the pricer runs, and still judged by the quote guards: a
                 // feed gone quiet is the commonest way a lane is withdrawn, so a guard that
@@ -660,6 +686,31 @@ impl ValueSource {
                 if rx.changed().await.is_err() {
                     std::future::pending().await
                 }
+            }
+        }
+    }
+
+    /// Resolves when the primary source's price is due to grow too old for
+    /// `max_source_age_ms`, so the quote loop withdraws on time when the primary simply stops
+    /// and nothing else wakes the loop. Never resolves for a pair without that check, or
+    /// while the primary is already stale: only a new price can change that, and a new price
+    /// wakes the loop through [`Self::changed`].
+    ///
+    /// The deadline is read when this is called, and the future borrows nothing, so the
+    /// loop can hold it beside [`Self::changed`]'s.
+    pub fn source_stale(&self) -> impl std::future::Future<Output = ()> + Send + use<> {
+        let deadline = self
+            .sources
+            .as_ref()
+            .and_then(|gate| gate.stale_at(Instant::now(), SystemTime::now()));
+        async move {
+            match deadline {
+                // A hair past the deadline, so the tick it wakes reads the age over the
+                // limit rather than exactly at it (the limit is inclusive).
+                Some(deadline) => {
+                    tokio::time::sleep_until((deadline + Duration::from_millis(1)).into()).await
+                }
+                None => std::future::pending().await,
             }
         }
     }
@@ -1359,6 +1410,8 @@ mod tests {
                 "out_of_band",
                 "delta_overflow",
                 "panic",
+                "source_stale",
+                "source_divergence",
             ]
         );
         // A pricer may not declare a reason that is the core's: the list it is checked

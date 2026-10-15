@@ -1430,6 +1430,7 @@ async fn drive(
                 Action::Nothing => {}
             }
 
+            let source_stale = source.source_stale();
             tokio::select! {
                 // The shared shutdown signal rather than a listener of this loop's own:
                 // one that only exists while the loop runs leaves a pair waiting out a
@@ -1440,6 +1441,9 @@ async fn drive(
                 }
                 // Event-driven: re-sign exactly when the feed moves, never on a poll.
                 _ = source.changed() => {}
+                // The primary source aging past `max_source_age_ms` with nothing else moving:
+                // the next pass withdraws. Pending for a pair without that check.
+                _ = source_stale => {}
                 // A trip from outside this loop (the composite task's guards, a panic in a
                 // component's task, a kill switch) halts on this tick, not on the next
                 // price move: the next `decide` reads the latch first. Resolves at once

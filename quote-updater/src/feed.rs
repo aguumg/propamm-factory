@@ -18,12 +18,74 @@ use crate::record::Recorder;
 use crate::venue::{Connection, Keepalive, Quote, VenueId};
 use crate::ws;
 
-/// Whether a venue is connected, held by its feed task, which is the one that knows, and
-/// read by the metrics when Prometheus scrapes (`Metrics::watch_venue`). Nothing about it is
-/// written ahead of time, so nothing about it can be lost: a restart, a reload, a write the
-/// gate dropped, none of them can leave `quote_updater_venue_feed_up` saying the wrong thing.
+/// Whether a venue is connected, and when it last priced, held by its feed task, which is
+/// the one that knows, and read by the metrics when Prometheus scrapes
+/// (`Metrics::watch_venue`) and by the quote loop's source checks (`SourceGate`). Nothing
+/// about it is written ahead of time, so nothing about it can be lost: a restart, a reload,
+/// a write the gate dropped, none of them can leave `quote_updater_venue_feed_up` or
+/// `quote_updater_venue_source_age_ms` saying the wrong thing.
 #[derive(Clone, Default)]
-pub struct Connected(Arc<AtomicU8>);
+pub struct Connected {
+    up: Arc<AtomicU8>,
+    /// When the venue last delivered a price this feed accepted; see [`PriceClock`].
+    priced: Arc<std::sync::Mutex<Option<PriceClock>>>,
+}
+
+/// When a venue's latest accepted price was made: when its frame arrived, on both clocks,
+/// and how long after the exchange's own stamp it arrived.
+///
+/// Separate from [`PriceSample::at`], and on purpose: the sample's stamp is refreshed by
+/// every ping a live socket answers, which is what keeps a quiet book publishable for
+/// [`crate::update::MAX_PRICE_AGE`]. That is also why it cannot see a stream that is alive
+/// but late: frames keep arriving, each one old, and each one re-stamps the sample as new.
+/// This clock moves only on a price, and carries the exchange's time when the frame does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PriceClock {
+    /// When the frame carrying the price arrived, on the monotonic clock.
+    pub received_at: Instant,
+    /// The same, on the wall clock.
+    pub received_wall: SystemTime,
+    /// How far the arrival trailed the exchange's stamp for the price: `None` for a venue
+    /// whose frames carry no time, whose price is then aged by its arrival alone. A stamp
+    /// ahead of our clock (skew) reads as no lag rather than as a negative one.
+    pub lag: Option<Duration>,
+}
+
+impl PriceClock {
+    /// A price that arrived at `(received_at, received_wall)`, stamped `event` by the venue.
+    pub fn new(received_at: Instant, received_wall: SystemTime, event: Option<SystemTime>) -> Self {
+        Self {
+            received_at,
+            received_wall,
+            lag: event.map(|event| {
+                received_wall
+                    .duration_since(event)
+                    .unwrap_or(Duration::ZERO)
+            }),
+        }
+    }
+
+    /// How old the price is at `(now, wall)`: `now - exchange time` when the venue stamps
+    /// its frames, `now - arrival` when it does not. The arrival's age is read by whichever
+    /// clock says older, as [`PriceSample::age_at`] reads a sample's.
+    pub fn age_at(&self, now: Instant, wall: SystemTime) -> Duration {
+        let monotonic = now.saturating_duration_since(self.received_at);
+        let since_arrival =
+            monotonic.max(wall.duration_since(self.received_wall).unwrap_or(monotonic));
+        since_arrival + self.lag.unwrap_or_default()
+    }
+
+    /// The monotonic instant from which [`Self::age_at`] exceeds `limit`, for a timer:
+    /// already past for a price that arrived later than `limit` after its own stamp.
+    pub fn stale_after(&self, limit: Duration) -> Instant {
+        self.received_at + limit.saturating_sub(self.lag.unwrap_or_default())
+    }
+
+    /// Whether the age is measured from the exchange's stamp (`true`) or the arrival.
+    pub fn by_exchange_time(&self) -> bool {
+        self.lag.is_some()
+    }
+}
 
 const DOWN: u8 = 0;
 const UP: u8 = 1;
@@ -33,20 +95,42 @@ const GONE: u8 = 2;
 
 impl Connected {
     fn set(&self, up: bool) {
-        self.0.store(if up { UP } else { DOWN }, Ordering::Relaxed);
+        self.up.store(if up { UP } else { DOWN }, Ordering::Relaxed);
     }
 
     fn gone(&self) {
-        self.0.store(GONE, Ordering::Relaxed);
+        self.up.store(GONE, Ordering::Relaxed);
     }
 
     /// What `quote_updater_venue_feed_up` reads: 1 connected, 0 not, NaN no feed task.
     pub fn gauge_value(&self) -> f64 {
-        match self.0.load(Ordering::Relaxed) {
+        match self.up.load(Ordering::Relaxed) {
             UP => 1.0,
             DOWN => 0.0,
             _ => f64::NAN,
         }
+    }
+
+    /// Records the clock of a price the feed just accepted.
+    pub(crate) fn priced(&self, clock: PriceClock) {
+        *self.priced.lock().unwrap_or_else(|e| e.into_inner()) = Some(clock);
+    }
+
+    /// When the venue last delivered a price, or `None` before its first.
+    pub fn price_clock(&self) -> Option<PriceClock> {
+        *self.priced.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What `quote_updater_venue_source_age_ms` reads: the latest price's age in
+    /// milliseconds (see [`PriceClock::age_at`]), NaN before the first price and once the
+    /// feed task is gone.
+    pub fn source_age_ms(&self, now: Instant, wall: SystemTime) -> f64 {
+        if self.up.load(Ordering::Relaxed) == GONE {
+            return f64::NAN;
+        }
+        self.price_clock().map_or(f64::NAN, |clock| {
+            clock.age_at(now, wall).as_secs_f64() * 1000.0
+        })
     }
 
     /// A flag already set, for tests of what reads it.
@@ -462,19 +546,23 @@ impl Feed {
             ..
         } = self;
         let (venue, decimals, invert) = (*venue, *decimals, *invert);
-        let parsed = venue.parse(text).map_err(Rejected::malformed);
-        let quote = match parsed {
+        let parsed = venue.parse_stamped(text).map_err(Rejected::malformed);
+        let (quote, event) = match parsed {
             // A frame that carries no price (an acknowledgement, a heartbeat, a text pong)
             // is a sign of life and nothing more: the same as a protocol Ping.
             Ok(None) => {
                 refresh_if_current(tx, *sample_is_current);
                 return;
             }
-            Ok(Some(quote)) => quote_from_book(quote, decimals, invert),
-            Err(err) => Err(err),
+            Ok(Some((quote, event))) => (quote_from_book(quote, decimals, invert), event),
+            Err(err) => (Err(err), None),
         };
         match quote {
             Ok((delta, mid)) => {
+                let (at, wall) = (Instant::now(), SystemTime::now());
+                // Before the sample is sent, so whoever wakes on the sample reads the clock
+                // that goes with it.
+                self.connected.priced(PriceClock::new(at, wall, event));
                 *sample_is_current = true;
                 if let Some(recorder) = recorder {
                     // The market's own mid, whichever way this lane carries it, so two lanes
@@ -504,8 +592,8 @@ impl Feed {
                 tx.send_replace(Some(PriceSample {
                     delta,
                     mid,
-                    at: Instant::now(),
-                    wall: SystemTime::now(),
+                    at,
+                    wall,
                 }));
             }
             Err(err) => {

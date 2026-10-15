@@ -12,6 +12,12 @@ pub mod kucoin;
 pub mod mexc;
 pub mod okx;
 
+/// An exchange's millisecond timestamp as a wall-clock time: what a venue that stamps its
+/// frames (OKX's `ts`, Gate's `t`) says the price is as of, for the feed's source age.
+pub fn epoch_ms(ms: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+}
+
 /// The quotes a market may be in for a pair quoted in `quote`, besides `quote` itself:
 /// for a USDC or USDT pair, the other of the two and USD, since the busiest market an
 /// exchange has for a dollar pair is often in one of the others (Coinbase's ETH-USDC is

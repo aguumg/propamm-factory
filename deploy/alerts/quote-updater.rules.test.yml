@@ -4,7 +4,8 @@
 # ../compose.yaml globs `/etc/prometheus/rules/*.rules.yml`, and it must never load a file
 # of fixtures as live rules.
 #
-# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry. The first is a `predict_linear`, which is the only
+# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, and to
+# PusherSourceWithdrawn (at the end). The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -138,3 +139,39 @@ tests:
             exp_annotations:
               summary: "EMPTY: signer has no ETH left"
               description: "The key that signs this pair's updates has a zero balance, so nothing it signs can land and the lane is dead until someone tops it up. PusherSignerNearlyDry cannot say this: a balance that is already flat at zero extrapolates to zero, not below it."
+
+  # PusherSourceWithdrawn: five minutes withdrawn by the source checks raises a ticket; a
+  # withdrawal that ends inside that (the checks resuming on their own) does not, nor does a
+  # lane whose breaker has tripped, which PusherBreakerTripped already pages for. Scrape-rate
+  # fixtures, like the level check above: the gauge holds its value between ticks.
+  - interval: 1m
+    name: a pair withdrawn by its source checks for five minutes raises a ticket
+    input_series:
+      - series: 'quote_updater_source_withdrawn{pair="LATE",reason="source_stale"}'
+        values: "0 1x10"
+      - series: 'quote_updater_source_withdrawn{pair="LATE",reason="source_divergence"}'
+        values: "0x10"
+      - series: 'quote_updater_breaker_tripped{pair="LATE"}'
+        values: "0x10"
+      - series: 'quote_updater_source_withdrawn{pair="BLIP",reason="source_divergence"}'
+        values: "0 1x3 0x6"
+      - series: 'quote_updater_breaker_tripped{pair="BLIP"}'
+        values: "0x10"
+      - series: 'quote_updater_source_withdrawn{pair="HALTED",reason="source_stale"}'
+        values: "0 1x10"
+      - series: 'quote_updater_breaker_tripped{pair="HALTED"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PusherSourceWithdrawn
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherSourceWithdrawn
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: LATE
+              reason: source_stale
+            exp_annotations:
+              summary: "LATE: withdrawn by its source checks (source_stale) for 5 minutes"
+              description: "The pair's primary source has been stale (source_stale) or away from another fresh source (source_divergence) for five minutes, so the lane has quoted nothing in that time. quote_updater_venue_source_age_ms says how far behind each venue is; the updater's stderr names the venues and numbers on every withdrawn block."

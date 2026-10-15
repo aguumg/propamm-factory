@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use eyre::{Result, eyre};
 
@@ -116,6 +116,20 @@ impl VenueId {
             VenueId::Bitget => bitget::parse(text),
             VenueId::Gate => gate::parse(text),
             VenueId::Mexc => mexc::parse(text),
+        }
+    }
+
+    /// [`Self::parse`], plus the exchange's own time for the price when the frame carries
+    /// one: OKX's `ts` and Gate's `t`, and Binance's `E` on a stream that sends it (its spot
+    /// bookTicker does not). `None` for every other venue, whose prices are then aged by
+    /// when they arrived. Kept beside `parse` rather than replacing it so a venue that
+    /// carries no time needs nothing new.
+    pub fn parse_stamped(self, text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
+        match self {
+            VenueId::Binance => binance::parse_stamped(text),
+            VenueId::Okx => okx::parse_stamped(text),
+            VenueId::Gate => gate::parse_stamped(text),
+            _ => Ok(self.parse(text)?.map(|quote| (quote, None))),
         }
     }
 

@@ -609,6 +609,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -683,6 +684,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -747,6 +749,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -799,6 +802,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -853,6 +857,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -905,6 +910,7 @@ mod tests {
                 source(VenueId::Binance, "silent", "1"),
             ],
             min_sources: 2,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -948,6 +954,7 @@ mod tests {
                 source(VenueId::Binance, "silent", "1"),
             ],
             min_sources: 2,
+            checks: Default::default(),
         };
         let spawned = spawn(
             &feeds,

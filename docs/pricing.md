@@ -121,6 +121,10 @@ Around every model, whatever it returns:
 
 - The core refuses a spread of a whole unit or more and a zero mid, and the pair's
   `min_mid`/`max_mid` band refuses a mid outside it.
+- Before the model runs, the core refuses a market price that is missing or stale, and, on
+  a pair that sets `max_source_age_ms` or `max_source_divergence`, one whose primary source
+  is late or disagrees with the other sources ([manual.md](manual.md), "Source checks").
+  The model is not called on those ticks.
 - `--check` runs the model once against the live market and prints what it would publish,
   without sending anything.
 - `quote_updater::testing` builds a model and runs `price` on a market you make up, with no

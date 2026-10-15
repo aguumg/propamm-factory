@@ -114,8 +114,10 @@ What to know:
   `--check`, as `max_deviation` on a fixed mid is. A `QuoteGuard` judges our quote in the
   loop, after the pricer, the core's bounds and the band, on every tick: on the pricer's
   output *or a refusal*, the pricer's or the core's. That includes a feed with no sample yet
-  or a stale one, which the core refuses before the pricer runs: on that tick the candidate
-  has no market and no diagnostics, and `Refusal::reason` reads `no_sample` or `stale`, so
+  or a stale one, and a pair's source checks (`max_source_age_ms`, `max_source_divergence`,
+  manual.md "Source checks"), which the core refuses before the pricer runs: on that tick the
+  candidate has no market and no diagnostics, and `Refusal::reason` reads `no_sample`,
+  `stale`, `source_stale` or `source_divergence` (names a pricer cannot declare), so
   "halt after ten minutes withdrawn" counts every withdrawn tick. A quote guard answers
   `Allow`, `Withdraw` (under a reason its build declared) or `Halt`; every quote guard runs
   and the most severe answer wins, and on a refusal `Allow` changes nothing, so a guard can

@@ -295,6 +295,17 @@ max_deviation = "0.002"
 #   { venue = "binance", symbol = "ETHUSDC", weight = "2" },
 #   { venue = "binance", symbol = "ETHUSDT", weight = "1" },
 # ]
+#
+# Optional, and off unless set: withdraw the pair while its primary source (the highest
+# weight, the first of them on a tie) is late or disagrees with the others, and quote again
+# as soon as it is neither. `max_source_age_ms` ages the primary's latest price by the
+# exchange's own timestamp where the venue sends one (okx, gate) and by its arrival
+# elsewhere (binance's bookTicker carries none); `max_source_divergence` is the furthest,
+# as a fraction, the primary's mid may sit from any other source whose own price is fresh.
+# Starting points: 1500 and 0.001 for an ETH pair; 10000 and 0.0005 for a stable pair.
+# See "Source checks" in docs/manual.md.
+# max_source_age_ms = "1500"
+# max_source_divergence = "0.001"
 
 # A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
 # the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its

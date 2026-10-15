@@ -433,6 +433,29 @@ groups:
             enough of them are down or stale at once. The per-venue series say which:
             quote_updater_venue_feed_up and quote_updater_venue_feed_last_tick_timestamp_seconds.
 
+      # The source checks (`max_source_age_ms`, `max_source_divergence`) withdraw a pair and
+      # resume it on their own, tick by tick, so a withdrawal of a few seconds is the check
+      # doing its job and pages nobody. Five minutes of it is a primary venue that is down,
+      # persistently behind the exchange, or quoting away from the others: the pair is not
+      # trading until that venue recovers or the config names another primary.
+      #
+      # `unless ... breaker_tripped`: a halted lane keeps whatever its last tick recorded, and
+      # PusherBreakerTripped already pages for it. `unless` keeps every left-hand series that
+      # has no match, so a pair whose breaker series is missing still alerts.
+      - alert: PusherSourceWithdrawn
+        expr: >-
+          quote_updater_source_withdrawn == 1
+            unless on (pair) quote_updater_breaker_tripped == 1
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: withdrawn by its source checks ({{ $labels.reason }}) for 5 minutes"
+          description: >-
+            The pair's primary source has been stale (source_stale) or away from another fresh
+            source (source_divergence) for five minutes, so the lane has quoted nothing in that
+            time. quote_updater_venue_source_age_ms says how far behind each venue is; the
+            updater's stderr names the venues and numbers on every withdrawn block.
+
       - alert: PusherVenueFeedDown
         expr: quote_updater_venue_feed_up == 0
         for: 5m

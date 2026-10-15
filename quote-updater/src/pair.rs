@@ -9,6 +9,7 @@ use eyre::{Result, WrapErr, ensure};
 
 use std::sync::Arc;
 
+use crate::source_gate::{GateSource as SourceGateSource, SourceGate};
 use crate::{
     composite,
     config::{self, Pair, ResolvedPair},
@@ -588,7 +589,17 @@ pub(crate) async fn build_live(
     // Both sides' kinds, for `guards{pair,kind}` and the removal that retires it.
     let mut guard_kinds = guard_kinds;
     guard_kinds.extend(quote_guards.iter().map(|guard| guard.kind));
-    let values = values.with_guards(latch.clone(), quote_guards);
+    let mut values = values.with_guards(latch.clone(), quote_guards);
+    // The checks on the primary source, read off the venues the composite dialled: a pair
+    // that sets neither gets no gate and quotes exactly as it did.
+    if let Some(feeds) = &resolved.feeds {
+        let sources = venues.iter().map(SourceGateSource::of).collect();
+        if let Some(gate) =
+            SourceGate::new(feeds, sources, price_decimals, Some(pair_metrics.clone()))
+        {
+            values = values.with_source_gate(gate);
+        }
+    }
     Ok(Built {
         live: Live {
             pair: resolved.pair,

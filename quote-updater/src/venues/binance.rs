@@ -2,11 +2,13 @@
 //! The market is named in the URL, so there is no subscribe message, and the server pings
 //! on its own, so a protocol ping is the right probe for a quiet book.
 
+use std::time::SystemTime;
+
 use eyre::{Result, eyre};
 use serde::Deserialize;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::unwrap_alias;
+use crate::venues::{epoch_ms, unwrap_alias};
 
 /// The main Binance stream. Overridden from the settings for binance.us or a mock.
 pub const DEFAULT_ENDPOINT: &str = "wss://stream.binance.com:9443/ws";
@@ -30,17 +32,30 @@ struct BookTicker {
     bid: String,
     #[serde(rename = "a")]
     ask: String,
+    /// The event time, in milliseconds. The spot bookTicker stream does not send one (its
+    /// frame is `u s b B a A`), so on the default endpoint a Binance price is aged by when
+    /// it arrived; read when present, for an endpoint whose bookTicker carries it.
+    #[serde(rename = "E")]
+    event_ms: Option<u64>,
 }
 
 /// Every frame on a bookTicker stream is a ticker, so anything else is malformed rather
 /// than ignorable.
 pub fn parse(text: &str) -> Result<Option<Quote>> {
+    Ok(parse_stamped(text)?.map(|(quote, _)| quote))
+}
+
+/// [`parse`], with the frame's event time when it carries one.
+pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     let ticker: BookTicker = serde_json::from_str(text)
         .map_err(|err| eyre!(err).wrap_err("not a bookTicker message"))?;
-    Ok(Some(Quote::Book {
-        bid: ticker.bid,
-        ask: ticker.ask,
-    }))
+    Ok(Some((
+        Quote::Book {
+            bid: ticker.bid,
+            ask: ticker.ask,
+        },
+        ticker.event_ms.map(epoch_ms),
+    )))
 }
 
 /// The stream a pair declared as `(base, quote)` should be reading: `ETHUSDC`. Order
@@ -80,6 +95,18 @@ mod tests {
         );
         assert!(parse("{}").is_err());
         assert!(parse("not json").is_err());
+    }
+
+    /// The spot frame carries no time, so the price is aged by its arrival; a frame that
+    /// does carry `E` is stamped with it.
+    #[test]
+    fn the_event_time_is_read_only_when_the_frame_has_one() {
+        let spot = r#"{"u":1,"s":"ETHUSDT","b":"4000.00","B":"2.0","a":"4000.01","A":"3.0"}"#;
+        assert_eq!(parse_stamped(spot).unwrap().unwrap().1, None);
+        let stamped = r#"{"e":"bookTicker","u":1,"E":1760000000123,"s":"ETHUSDT","b":"4000.00","B":"2.0","a":"4000.01","A":"3.0"}"#;
+        let (quote, at) = parse_stamped(stamped).unwrap().unwrap();
+        assert_eq!(at, Some(epoch_ms(1_760_000_000_123)));
+        assert_eq!(Some(quote), parse(stamped).unwrap());
     }
 
     #[test]

@@ -241,6 +241,14 @@ pub struct RawPair {
     /// How many of `sources` must have a fresh price for the pair to publish. Default 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_sources: Option<String>,
+    /// How old, in milliseconds, the primary source's latest price may be before the pair
+    /// withdraws. See [`SourceChecks`]. Blank: no such check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_source_age_ms: Option<String>,
+    /// How far, as a fraction, the primary source's mid may sit from any other fresh
+    /// source's before the pair withdraws. See [`SourceChecks`]. Blank: no such check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_source_divergence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_mid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,6 +327,42 @@ pub struct Source {
 pub struct Feeds {
     pub sources: Vec<Source>,
     pub min_sources: usize,
+    /// The checks on the primary source; both off unless the stanza sets them.
+    pub checks: SourceChecks,
+}
+
+/// The largest `max_source_age_ms`: past [`crate::update::MAX_PRICE_AGE`] a source has
+/// already dropped out of the average, so a looser limit could never be what withdraws.
+pub const MAX_SOURCE_AGE_MS: u64 = 30_000;
+
+/// What withdraws a pair because of its primary source: the highest-weight entry of
+/// `sources` (the first of them on a tie), or the one `symbol` names.
+///
+/// Both are off by default, and a pair that sets neither quotes exactly as before. Setting
+/// either makes the primary a requirement: the pair withdraws, for that block and every one
+/// after it until the primary is good again, whenever
+///
+/// - the primary's latest price is older than `max_age` (by the exchange's own time when
+///   its frames carry one, else by arrival; see `feed::PriceClock`), or than
+///   [`crate::update::MAX_PRICE_AGE`] when only the divergence is set, under the refusal
+///   `source_stale`; or
+/// - its mid is further than `max_divergence` from the mid of any other source whose own
+///   price is fresh, under `source_divergence`.
+///
+/// Nothing latches: the next tick that passes both quotes again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceChecks {
+    /// `max_source_age_ms`.
+    pub max_age: Option<std::time::Duration>,
+    /// `max_source_divergence`, a fraction scaled by 10^price_decimals.
+    pub max_divergence: Option<U256>,
+}
+
+impl SourceChecks {
+    /// Whether either check is on.
+    pub fn any(&self) -> bool {
+        self.max_age.is_some() || self.max_divergence.is_some()
+    }
 }
 
 impl Feeds {
@@ -331,7 +375,19 @@ impl Feeds {
                 weight: U256::exp10(WEIGHT_DECIMALS as usize),
             }],
             min_sources: 1,
+            checks: SourceChecks::default(),
         }
+    }
+
+    /// Which of `sources` is the primary: the highest weight, the first of them on a tie.
+    pub fn primary(&self) -> usize {
+        let mut primary = 0;
+        for (i, source) in self.sources.iter().enumerate() {
+            if source.weight > self.sources[primary].weight {
+                primary = i;
+            }
+        }
+        primary
     }
 
     /// The one-line description the report and the backoffice print: `binance:ETHUSDC`, or
@@ -524,7 +580,7 @@ pub fn spread_scale(price_decimals: u32) -> U256 {
 ///
 /// `symbol` is the short form of one Binance source and the two keys are exclusive, so a
 /// stanza cannot say two different things about where its price comes from.
-fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
+fn parse_feeds(raw: &RawPair, price_decimals: u32, at: &str) -> Result<Option<Feeds>> {
     let mut sources = Vec::with_capacity(raw.sources.len() + 1);
     match (&raw.symbol, raw.sources.is_empty()) {
         (Some(_), false) => bail!(
@@ -536,12 +592,19 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
                 raw.min_sources.is_none(),
                 "{at}: min_sources needs sources to count"
             );
-            return Ok(Some(Feeds::single_binance(symbol)));
+            let mut feeds = Feeds::single_binance(symbol);
+            feeds.checks = parse_source_checks(raw, 1, price_decimals, at)?;
+            return Ok(Some(feeds));
         }
         (None, true) => {
             ensure!(
                 raw.min_sources.is_none(),
                 "{at}: min_sources needs sources to count"
+            );
+            ensure!(
+                raw.max_source_age_ms.is_none() && raw.max_source_divergence.is_none(),
+                "{at}: max_source_age_ms and max_source_divergence judge a pair's sources, \
+                 and this pair has none"
             );
             return Ok(None);
         }
@@ -602,10 +665,64 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
             n
         }
     };
+    let checks = parse_source_checks(raw, sources.len(), price_decimals, at)?;
     Ok(Some(Feeds {
         sources,
         min_sources,
+        checks,
     }))
+}
+
+/// `max_source_age_ms` and `max_source_divergence`, for a pair reading `sources` venues.
+/// The age is a whole number of milliseconds, above zero and at most
+/// [`MAX_SOURCE_AGE_MS`]; the divergence is a fraction checked like every threshold
+/// ([`parse_threshold`]: above zero at the price scale, below one), and needs a second
+/// source to diverge from.
+fn parse_source_checks(
+    raw: &RawPair,
+    sources: usize,
+    price_decimals: u32,
+    at: &str,
+) -> Result<SourceChecks> {
+    let max_age = match &raw.max_source_age_ms {
+        None => None,
+        Some(text) => {
+            let ms: u64 = text.trim().parse().wrap_err_with(|| {
+                format!("{at}: max_source_age_ms {text:?} is not a whole number of milliseconds")
+            })?;
+            ensure!(
+                ms > 0,
+                "{at}: max_source_age_ms is zero, so no price would ever be fresh enough"
+            );
+            ensure!(
+                ms <= MAX_SOURCE_AGE_MS,
+                "{at}: max_source_age_ms {ms} is above {MAX_SOURCE_AGE_MS}: a source is \
+                 already dropped after 30 seconds, so the limit could never be what withdraws \
+                 (it is milliseconds: write 1500 for 1.5 seconds)"
+            );
+            Some(std::time::Duration::from_millis(ms))
+        }
+    };
+    let max_divergence = match &raw.max_source_divergence {
+        None => None,
+        Some(fraction) => {
+            ensure!(
+                sources >= 2,
+                "{at}: max_source_divergence compares the primary source with the others, and \
+                 this pair has one source"
+            );
+            Some(parse_threshold(
+                fraction,
+                price_decimals,
+                "max_source_divergence",
+                at,
+            )?)
+        }
+    };
+    Ok(SourceChecks {
+        max_age,
+        max_divergence,
+    })
 }
 
 /// Parses one threshold fraction, applying every check that makes a threshold trustworthy.
@@ -1013,7 +1130,7 @@ pub fn parse_config_with(
         );
 
         let pricing = parse_pricing(&raw_pair.pricing, &at)?;
-        let feeds = parse_feeds(raw_pair, &at)?;
+        let feeds = parse_feeds(raw_pair, price_decimals, &at)?;
 
         // Bounds are read in lane orientation, so they need no inversion: they describe the
         // number this lane publishes, which is the one the check below has in hand.
@@ -1639,6 +1756,124 @@ sources = [{ venue = "binance", symbol = "ETHUSDT" }]
         );
         let err = parse_config(&text, 18).map(|_| ()).unwrap_err().to_string();
         assert!(err.contains("not both"), "{err}");
+    }
+
+    /// The source checks are off unless set, read as written when they are, and the
+    /// primary is the highest-weight source (the first of them on a tie).
+    #[test]
+    fn source_checks_default_off_and_parse_when_set() {
+        let two = r#"
+pricing = { kind = "feed", delta = "0.0005" }
+sources = [
+  { venue = "okx", symbol = "ETH-USDC" },
+  { venue = "binance", symbol = "ETHUSDC", weight = "2" },
+]
+"#;
+        let plain = parse_config(&pair_with(two), 18).unwrap();
+        let feeds = plain.pairs[0].feeds.as_ref().unwrap();
+        assert_eq!(feeds.checks, SourceChecks::default());
+        assert!(!feeds.checks.any());
+        assert_eq!(feeds.primary(), 1, "the highest weight");
+
+        let set = parse_config(
+            &pair_with(&format!(
+                "{two}max_source_age_ms = \"1500\"\nmax_source_divergence = \"0.001\"\n"
+            )),
+            18,
+        )
+        .unwrap();
+        let checks = &set.pairs[0].feeds.as_ref().unwrap().checks;
+        assert_eq!(checks.max_age, Some(std::time::Duration::from_millis(1500)));
+        assert_eq!(
+            checks.max_divergence,
+            Some(parse_decimal_scaled("0.001", 18).unwrap())
+        );
+        assert_ne!(set.pairs, plain.pairs, "a reload sees the change");
+
+        // A tie goes to the first listed.
+        let tied = parse_config(
+            &pair_with(
+                r#"
+pricing = { kind = "feed", delta = "0.0005" }
+sources = [{ venue = "okx", symbol = "ETH-USDC" }, { venue = "binance", symbol = "ETHUSDC" }]
+"#,
+            ),
+            18,
+        )
+        .unwrap();
+        assert_eq!(tied.pairs[0].feeds.as_ref().unwrap().primary(), 0);
+
+        // The `symbol` form takes the age limit; its one source is the primary.
+        let single = parse_config(
+            &pair_with("symbol = \"ETHUSDC\"\nmax_source_age_ms = \"10000\"\n"),
+            18,
+        )
+        .unwrap();
+        let feeds = single.pairs[0].feeds.as_ref().unwrap();
+        assert_eq!(
+            feeds.checks.max_age,
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(feeds.primary(), 0);
+
+        // Written back only when set, and read back the same.
+        let raw: RawConfig =
+            toml::from_str(&pair_with(&format!("{two}max_source_age_ms = \"1500\"\n"))).unwrap();
+        let written = render_raw(&raw).unwrap();
+        assert!(
+            written.contains("max_source_age_ms = \"1500\""),
+            "{written}"
+        );
+        assert!(!written.contains("max_source_divergence"), "{written}");
+        parse_config(&written, 18).expect("a rendered config must load");
+    }
+
+    #[test]
+    fn source_checks_refuse_what_cannot_be_trusted() {
+        let two = r#"
+pricing = { kind = "feed", delta = "0.0005" }
+sources = [{ venue = "binance", symbol = "ETHUSDC" }, { venue = "okx", symbol = "ETH-USDC" }]
+"#;
+        let cases = [
+            (format!("{two}max_source_age_ms = \"0\""), "is zero"),
+            (
+                format!("{two}max_source_age_ms = \"-5\""),
+                "not a whole number of milliseconds",
+            ),
+            (
+                format!("{two}max_source_age_ms = \"1.5\""),
+                "not a whole number of milliseconds",
+            ),
+            (format!("{two}max_source_age_ms = \"30001\""), "is above 30000"),
+            (format!("{two}max_source_divergence = \"0\""), "is zero"),
+            (
+                format!("{two}max_source_divergence = \"-0.001\""),
+                "invalid max_source_divergence",
+            ),
+            (
+                format!("{two}max_source_divergence = \"1\""),
+                "not a percentage",
+            ),
+            (
+                format!("{two}max_source_divergence = \"10\""),
+                "not a percentage",
+            ),
+            (
+                "symbol = \"ETHUSDC\"\nmax_source_divergence = \"0.001\"".to_owned(),
+                "this pair has one source",
+            ),
+            (
+                "pricing = { kind = \"fixed\", mid = \"4000\", delta = \"0.0005\" }\nmax_source_age_ms = \"1500\"".to_owned(),
+                "this pair has none",
+            ),
+        ];
+        for (body, expected) in cases {
+            let err = format!(
+                "{:#}",
+                parse_config(&pair_with(&body), 18).map(|_| ()).unwrap_err()
+            );
+            assert!(err.contains(expected), "{body}: {err}");
+        }
     }
 
     #[test]

@@ -98,6 +98,7 @@ mod rpc;
 #[cfg(test)]
 mod rpc_mock;
 mod service;
+mod source_gate;
 mod supervisor;
 mod tasks;
 pub mod testing;
