@@ -201,11 +201,17 @@ and every block after it until a tick passes both checks. Nothing latches; there
 reload to make, unlike the circuit breaker.
 
 - **`max_source_age_ms`** (whole milliseconds, 1 to 30000): how old the primary's latest
-  price may be. Where the venue stamps its frames, the age is measured from that stamp
-  (`now - exchange time`): OKX's `tickers` (`ts`) and Gate's `book_ticker` (`t`). Where it
-  does not, it is measured from the frame's arrival: Binance's spot `bookTicker` carries no
-  event time (its frame is `u s b B a A`), nor do the other venues as the updater reads
-  them. The age moves only on a price, never on a ping, so a stream that is connected but
+  price may be. Where the venue stamps its frames (OKX's `tickers` `ts`, Gate's
+  `book_ticker` `t`), the age is the time since the frame arrived plus how much later than
+  usual it arrived behind its stamp. "Usual" is the least lag the venue's frames have had
+  over the last hour. That baseline absorbs this host's clock offset from the exchange's,
+  ahead or behind, and the network's ordinary latency, so a host clock 5 seconds fast does
+  not age every OKX price by 5 seconds, and one 5 seconds slow does not hide a 5-second
+  backlog. Two costs: a backlog that lasts more than an hour becomes the baseline, and a
+  venue that is already late when its feed is dialled (at start or on a reload) reads as
+  on time until it catches up once. Where the venue does not stamp its frames, the age is
+  measured from the frame's arrival: Binance's spot `bookTicker` carries no event time (its
+  frame is `u s b B a A`), nor do the other venues as the updater reads them. The age moves only on a price, never on a ping, so a stream that is connected but
   sends nothing new ages out. The quote loop also sets a timer for the moment the primary
   would cross the limit, so a primary that simply stops is withdrawn on time even when
   nothing else is moving.
@@ -214,6 +220,10 @@ reload to make, unlike the circuit breaker.
   30 seconds, and inside `max_source_age_ms` when that is set). A source that is itself late
   is not compared, so it cannot withdraw a pair whose primary is fine. Needs at least two
   sources. Set alone, the primary is held to the 30-second rule every source already has.
+  While no other source is fresh, the divergence check compares nothing and so withdraws
+  nothing. Only the age check (if set) still guards the primary. The updater logs a warning
+  when the check stops comparing and a line when it starts again, and
+  `quote_updater_venue_source_age_ms` shows which venues are behind.
 
 Why both, and why the 30-second rule is not enough. That rule counts a venue fresh while
 frames keep arriving, and the last price stands until 30 seconds pass with no frame at all.
@@ -237,8 +247,11 @@ is not. The divergence limit has to sit above the ordinary dispersion between th
 watch `quote_updater_venue_source_age_ms` and `quote_updater_source_withdrawn` for a few
 days before widening.
 
-The keys are config-file only for now: the backoffice's pair form does not show them, and
-an edit through it keeps whatever the file sets.
+The backoffice's pair form has both fields. Blank clears a key. A form loaded before the
+fields existed does not post them, so it keeps whatever the file sets. An edit the file
+parser would refuse, such as a divergence left on a pair cut down to one venue, is refused
+before anything is written. The same form then comes back with the reason and the values
+as posted, so the field can be fixed or cleared there.
 
 ### What the updater charges a taker
 ### What the updater charges a taker

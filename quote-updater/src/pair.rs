@@ -97,6 +97,10 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
         m.guard(kind).set(1.0);
     }
     adopt_breaker_metrics(live);
+    // A new generation has judged nothing yet: whatever the last one left (withdrawn, or
+    // checks this generation no longer has) is not this one's. Its first tick, if it has a
+    // source gate, writes the real value.
+    m.clear_source_withdrawn();
     m.signer_runway_updates.set(f64::INFINITY);
     m.signer_balance_wei.set(f64::NAN);
     match live.values.market_rx() {
@@ -594,9 +598,13 @@ pub(crate) async fn build_live(
     // that sets neither gets no gate and quotes exactly as it did.
     if let Some(feeds) = &resolved.feeds {
         let sources = venues.iter().map(SourceGateSource::of).collect();
-        if let Some(gate) =
-            SourceGate::new(feeds, sources, price_decimals, Some(pair_metrics.clone()))
-        {
+        if let Some(gate) = SourceGate::new(
+            &resolved.pair.label,
+            feeds,
+            sources,
+            price_decimals,
+            Some(pair_metrics.clone()),
+        ) {
             values = values.with_source_gate(gate);
         }
     }
@@ -1098,6 +1106,45 @@ mod tests {
             2.0,
             "the panel shows the price it started on"
         );
+    }
+
+    /// A pair reloaded while its source checks held it withdrawn, into a config that drops
+    /// both keys: the new generation has no gate to write the gauge, so adoption lowers it,
+    /// or `PusherSourceWithdrawn` would raise a ticket for a pair that is quoting.
+    #[tokio::test]
+    async fn adoption_lowers_a_source_withdrawal_the_last_generation_left() {
+        use crate::source_gate::SourceFault;
+        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
+
+        let secret = secp256k1::SecretKey::from_slice(&[0x24; 32]).unwrap();
+        let metrics = metrics::Metrics::new().unwrap();
+        let before = metrics.for_pair("SRC/TEST");
+        before.source_withdrawn(SourceFault::Stale).set(1.0);
+        before.source_withdrawn(SourceFault::Divergence).set(1.0);
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let live = Live {
+            pair: Pair {
+                tokens: (Address::zero(), Address::zero()),
+                lane: U256::from(5),
+                signer: Signer::from(LocalSigner::new(secret)),
+                label: "SRC/TEST".to_owned(),
+                band: config::MidBand::default(),
+            },
+            values: ValueSource::feed_for_tests(rx, None, false, 18),
+            latch: crate::guard::Latch::new(),
+            armed: false,
+            guard_kinds: Vec::new(),
+            deviation: None,
+            metrics: metrics.for_pair("SRC/TEST"),
+            venues: Vec::new(),
+            observers: Default::default(),
+        };
+
+        adopt_metrics(&live, 18, &metrics);
+
+        for fault in SourceFault::ALL {
+            assert_eq!(before.source_withdrawn(fault).get(), 0.0, "{fault:?}");
+        }
     }
 
     fn unix_seconds(at: std::time::SystemTime) -> f64 {

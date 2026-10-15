@@ -673,6 +673,16 @@ fn parse_feeds(raw: &RawPair, price_decimals: u32, at: &str) -> Result<Option<Fe
     }))
 }
 
+/// Refuses a pair whose `max_source_age_ms` or `max_source_divergence` the file parser
+/// would refuse, with the same message: for the backoffice, which checks an edit before
+/// writing it. A pair setting neither is not looked at, so nothing else changes there.
+pub(crate) fn check_source_keys(raw: &RawPair, price_decimals: u32) -> Result<()> {
+    if raw.max_source_age_ms.is_none() && raw.max_source_divergence.is_none() {
+        return Ok(());
+    }
+    parse_feeds(raw, price_decimals, "this pair").map(|_| ())
+}
+
 /// `max_source_age_ms` and `max_source_divergence`, for a pair reading `sources` venues.
 /// The age is a whole number of milliseconds, above zero and at most
 /// [`MAX_SOURCE_AGE_MS`]; the divergence is a fraction checked like every threshold

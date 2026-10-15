@@ -426,6 +426,12 @@ struct AddPair {
     max_deviation_window: String,
     #[serde(default)]
     max_deviation_window_blocks: String,
+    /// The source checks. `None` is a form rendered before these fields existed, which
+    /// keeps whatever the file sets; a blank field clears the key.
+    #[serde(default)]
+    max_source_age_ms: Option<String>,
+    #[serde(default)]
+    max_source_divergence: Option<String>,
     #[serde(default)]
     allow_symbol_mismatch: Option<String>,
     /// The pricing kind the operator chose. Every kind's section is posted whichever is
@@ -443,6 +449,20 @@ struct AddPair {
 fn optional(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// A field a form may not post at all: absent keeps `key` as it is (a page rendered before
+/// the field existed), present sets it as [`optional`] reads it, blank clearing it.
+fn set_if_posted(key: &mut Option<String>, posted: Option<&str>) {
+    if let Some(value) = posted {
+        *key = optional(value);
+    }
+}
+
+/// The scale the file's prices and fractions are read at: its own setting, else the flag's
+/// default. A process started with another `--price-decimals` re-checks on the reload.
+fn file_price_decimals(config: &RawConfig) -> u32 {
+    config.settings.price_decimals.unwrap_or(18)
 }
 
 /// The `[pairs.pricing]` stanza a form describes: the chosen kind, and the values it posted
@@ -510,6 +530,7 @@ async fn add_pair(
     let kinds = Arc::clone(&state.kinds);
     apply(&state, peer, &what, move |config| {
         let pair = pair_from_form(&form, &kinds)?;
+        config::check_source_keys(&pair, file_price_decimals(config))?;
         if config
             .pairs
             .iter()
@@ -537,8 +558,8 @@ fn pair_from_form(form: &AddPair, kinds: &crate::kinds::Kinds) -> Result<RawPair
         symbol: None,
         sources: Vec::new(),
         min_sources: None,
-        max_source_age_ms: None,
-        max_source_divergence: None,
+        max_source_age_ms: form.max_source_age_ms.as_deref().and_then(optional),
+        max_source_divergence: form.max_source_divergence.as_deref().and_then(optional),
         min_mid: optional(&form.min_mid),
         max_mid: optional(&form.max_mid),
         max_deviation: optional(&form.max_deviation),
@@ -1210,6 +1231,12 @@ struct EditPair {
     max_deviation_window: String,
     #[serde(default)]
     max_deviation_window_blocks: String,
+    /// The source checks. `None` is a form rendered before these fields existed, which
+    /// keeps whatever the file sets; a blank field clears the key.
+    #[serde(default)]
+    max_source_age_ms: Option<String>,
+    #[serde(default)]
+    max_source_divergence: Option<String>,
     #[serde(default)]
     allow_symbol_mismatch: Option<String>,
     /// The pricing kind the operator chose. Every kind's section is posted whichever is
@@ -1232,35 +1259,78 @@ async fn edit_pair(
 ) -> Response {
     let what = format!("edited pair {}", form.key_env);
     let kinds = Arc::clone(&state.kinds);
-    apply(&state, peer, &what, move |config| {
-        let pair = config
-            .pairs
-            .iter_mut()
-            .find(|pair| pair.key_env == form.key_env.trim())
-            .ok_or_else(|| {
-                eyre!(
-                    "no pair with key_env {:?}; it may have been removed since this page was \
-                     loaded",
-                    form.key_env
-                )
-            })?;
-        apply_sources(pair, &form.sources, &form.symbol)?;
-        pair.pricing = pricing_stanza(
-            &kinds,
-            &form.pricing,
-            Some(&pair.pricing),
-            &form.kind_fields,
-        )?;
-        pair.min_mid = optional(&form.min_mid);
-        pair.max_mid = optional(&form.max_mid);
-        pair.max_deviation = optional(&form.max_deviation);
-        pair.max_deviation_window = optional(&form.max_deviation_window);
-        pair.max_deviation_window_blocks = optional(&form.max_deviation_window_blocks);
-        pair.allow_symbol_mismatch = form.allow_symbol_mismatch.is_some();
-        Ok(())
-    })
-    .await
-    .redirect()
+    let form = Arc::new(form);
+    let outcome = {
+        let (form, kinds) = (Arc::clone(&form), Arc::clone(&kinds));
+        apply(&state, peer, &what, move |config| {
+            let decimals = file_price_decimals(config);
+            let pair = config
+                .pairs
+                .iter_mut()
+                .find(|pair| pair.key_env == form.key_env.trim())
+                .ok_or_else(|| {
+                    eyre!(
+                        "no pair with key_env {:?}; it may have been removed since this page \
+                         was loaded",
+                        form.key_env
+                    )
+                })?;
+            edit_from_form(pair, &form, &kinds)?;
+            config::check_source_keys(pair, decimals)
+        })
+        .await
+    };
+    if outcome.ok {
+        return outcome.redirect();
+    }
+    // Refused: the same form again, as it was posted and with the reason above it, so the
+    // field that made it invalid (a divergence left on one venue, say) can be fixed or
+    // cleared in the same form rather than lost on the way back to the list.
+    let Ok(config) = config::load_raw(&state.config_path) else {
+        return outcome.redirect();
+    };
+    match config
+        .pairs
+        .iter()
+        .find(|pair| pair.key_env == form.key_env.trim())
+    {
+        Some(pair) => {
+            let mut posted = pair.clone();
+            // Best effort: what could be applied is shown, the rest as the file has it.
+            let _ = edit_from_form(&mut posted, &form, &kinds);
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Html(render_pair_form_with(
+                    Some(&posted),
+                    &kinds,
+                    Some(&outcome.message),
+                )),
+            )
+                .into_response()
+        }
+        None => outcome.redirect(),
+    }
+}
+
+/// An edit form's changes to `pair`, without the checks the reload makes.
+fn edit_from_form(pair: &mut RawPair, form: &EditPair, kinds: &crate::kinds::Kinds) -> Result<()> {
+    apply_sources(pair, &form.sources, &form.symbol)?;
+    pair.pricing = pricing_stanza(kinds, &form.pricing, Some(&pair.pricing), &form.kind_fields)?;
+    pair.min_mid = optional(&form.min_mid);
+    pair.max_mid = optional(&form.max_mid);
+    pair.max_deviation = optional(&form.max_deviation);
+    pair.max_deviation_window = optional(&form.max_deviation_window);
+    pair.max_deviation_window_blocks = optional(&form.max_deviation_window_blocks);
+    set_if_posted(
+        &mut pair.max_source_age_ms,
+        form.max_source_age_ms.as_deref(),
+    );
+    set_if_posted(
+        &mut pair.max_source_divergence,
+        form.max_source_divergence.as_deref(),
+    );
+    pair.allow_symbol_mismatch = form.allow_symbol_mismatch.is_some();
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1715,6 +1785,18 @@ const SOURCE_FIELDS: &[Field] = &[
         "1000",
         "how many blocks that window covers",
     ),
+    Field::new(
+        "max_source_age_ms",
+        "1500",
+        "withdraw while the primary venue's price (the highest weight) is older than this \
+         many milliseconds, by the exchange's own time where it sends one. Blank is off",
+    ),
+    Field::new(
+        "max_source_divergence",
+        "0.001",
+        "withdraw while the primary venue's mid is this fraction away from another fresh \
+         venue's. Needs two venues. Blank is off",
+    ),
 ];
 
 /// How many venues must have a fresh price before the pair publishes.
@@ -1912,6 +1994,8 @@ struct IndexPage {
 #[derive(Template)]
 #[template(path = "pair_form.html")]
 struct PairFormPage {
+    /// Why the save that brought this form back was refused.
+    error: Option<String>,
     /// See [`pair_script_version`].
     script_version: &'static str,
     /// The `key_env` being edited, or `None` when adding.
@@ -2029,6 +2113,15 @@ struct KindSection {
 }
 
 fn render_pair_form(pair: Option<&RawPair>, kinds: &crate::kinds::Kinds) -> String {
+    render_pair_form_with(pair, kinds, None)
+}
+
+/// [`render_pair_form`], with why the last save of it was refused.
+fn render_pair_form_with(
+    pair: Option<&RawPair>,
+    kinds: &crate::kinds::Kinds,
+    error: Option<&str>,
+) -> String {
     let editing_key = pair.map(|pair| pair.key_env.clone());
     let editing = editing_key.is_some();
     let identity_values: Vec<Option<&str>> = match pair {
@@ -2046,6 +2139,8 @@ fn render_pair_form(pair: Option<&RawPair>, kinds: &crate::kinds::Kinds) -> Stri
             pair.max_deviation.as_deref(),
             pair.max_deviation_window.as_deref(),
             pair.max_deviation_window_blocks.as_deref(),
+            pair.max_source_age_ms.as_deref(),
+            pair.max_source_divergence.as_deref(),
         ],
         None => vec![None; SOURCE_FIELDS.len()],
     };
@@ -2092,6 +2187,7 @@ fn render_pair_form(pair: Option<&RawPair>, kinds: &crate::kinds::Kinds) -> Stri
         .collect();
 
     PairFormPage {
+        error: error.map(str::to_owned),
         script_version: pair_script_version(),
         editing: editing_key,
         identity: PAIR_IDENTITY
@@ -2803,6 +2899,160 @@ api_key = "k"
         assert_eq!(written.pairs[0].symbol.as_deref(), Some("ETHUSDC"));
         assert!(written.pairs[0].sources.is_empty());
         assert_eq!(written.pairs[0].min_sources, None);
+    }
+
+    /// The source checks through the real form decoder: set, kept by a form that predates
+    /// the fields (absent), cleared by a blank one. An edit the file parser would refuse
+    /// (a divergence left on one venue) is refused before anything is written, and the same
+    /// form comes back with the reason and the posted values, so the field can be cleared
+    /// right there.
+    #[tokio::test]
+    async fn the_source_checks_are_set_kept_cleared_and_refused_in_the_form() {
+        let (path, state, mut reloads) = config_on_disk("source-checks");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
+        )
+        .await
+        .unwrap();
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _service = {
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                while let Some(request) = reloads.recv().await {
+                    served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
+                }
+            })
+        };
+        let post = |body: &str| {
+            format!(
+                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let common = "key_env=UPDATER_KEY_WETH_USDC&pricing=feed&pricing_feed_delta=0.0005\
+                      &min_mid=&max_mid=&max_deviation=&max_deviation_window=\
+                      &max_deviation_window_blocks=";
+        let two = "&symbol_binance=ETHUSDC&weight_binance=2&symbol_okx=ETH-USDC&weight_okx=";
+        let one = "&symbol_binance=ETHUSDC&weight_binance=&symbol_okx=&weight_okx=";
+        let read = || config::load_raw(&path).unwrap().pairs.remove(0);
+
+        // Set.
+        let posted = http(
+            local,
+            &post(&format!(
+                "{common}{two}&max_source_age_ms=1500&max_source_divergence=0.001"
+            )),
+        )
+        .await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        let pair = read();
+        assert_eq!(pair.max_source_age_ms.as_deref(), Some("1500"));
+        assert_eq!(pair.max_source_divergence.as_deref(), Some("0.001"));
+
+        // A form from before the fields existed posts neither: both kept.
+        let posted = http(local, &post(&format!("{common}{two}"))).await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        let pair = read();
+        assert_eq!(pair.max_source_age_ms.as_deref(), Some("1500"));
+        assert_eq!(pair.max_source_divergence.as_deref(), Some("0.001"));
+
+        // Down to one venue with the divergence still set: refused, nothing written, and
+        // the form comes back with the reason and what was posted.
+        let refused = http(
+            local,
+            &post(&format!(
+                "{common}{one}&max_source_age_ms=1500&max_source_divergence=0.001"
+            )),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 422"), "{refused}");
+        assert!(refused.contains("class=banner-err"), "{refused}");
+        assert!(refused.contains("this pair has one source"), "{refused}");
+        assert!(
+            refused.contains("name=\"max_source_divergence\"\n         value=\"0.001\""),
+            "{refused}"
+        );
+        assert!(
+            refused.contains(r#"name="symbol_okx" value="""#),
+            "the posted venue table, not the file's: {refused}"
+        );
+        assert_eq!(read().sources.len(), 2, "nothing written");
+
+        // Cleared in that same form: saved.
+        let posted = http(
+            local,
+            &post(&format!(
+                "{common}{one}&max_source_age_ms=1500&max_source_divergence="
+            )),
+        )
+        .await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        let pair = read();
+        assert_eq!(pair.symbol.as_deref(), Some("ETHUSDC"));
+        assert_eq!(pair.max_source_age_ms.as_deref(), Some("1500"));
+        assert_eq!(pair.max_source_divergence, None);
+
+        // An age the file parser refuses is refused here too.
+        let refused = http(
+            local,
+            &post(&format!(
+                "{common}{one}&max_source_age_ms=0&max_source_divergence="
+            )),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 422"), "{refused}");
+        assert!(refused.contains("max_source_age_ms is zero"), "{refused}");
+
+        let posted = http(
+            local,
+            &post(&format!(
+                "{common}{one}&max_source_age_ms=&max_source_divergence="
+            )),
+        )
+        .await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        assert_eq!(read().max_source_age_ms, None);
+        config::parse_config(&std::fs::read_to_string(&path).unwrap(), 18)
+            .expect("what the form saved loads");
+
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "the refused edits asked for no reload"
+        );
+    }
+
+    /// Both source-check fields are on both forms, the edit form showing the file's values.
+    #[test]
+    fn the_source_check_fields_render_on_both_forms() {
+        for name in ["max_source_age_ms", "max_source_divergence"] {
+            assert!(
+                render_pair_form(None, &test_kinds()).contains(&format!(r#"name="{name}""#)),
+                "{name} is missing from the new-pair form"
+            );
+        }
+        let mut config = a_config();
+        config.pairs[0].max_source_age_ms = Some("10000".to_owned());
+        config.pairs[0].max_source_divergence = Some("0.0005".to_owned());
+        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
+        assert!(
+            form.contains("name=\"max_source_age_ms\"\n         value=\"10000\""),
+            "{form}"
+        );
+        assert!(
+            form.contains("name=\"max_source_divergence\"\n         value=\"0.0005\""),
+            "{form}"
+        );
+        assert!(!form.contains("class=banner-err"), "{form}");
     }
 
     /// The lookup the page's script calls once both addresses are typed: the token names

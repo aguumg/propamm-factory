@@ -32,7 +32,7 @@ pub struct Connected {
 }
 
 /// When a venue's latest accepted price was made: when its frame arrived, on both clocks,
-/// and how long after the exchange's own stamp it arrived.
+/// and how much later than usual it arrived behind the exchange's own stamp.
 ///
 /// Separate from [`PriceSample::at`], and on purpose: the sample's stamp is refreshed by
 /// every ping a live socket answers, which is what keeps a quiet book publishable for
@@ -45,29 +45,26 @@ pub struct PriceClock {
     pub received_at: Instant,
     /// The same, on the wall clock.
     pub received_wall: SystemTime,
-    /// How far the arrival trailed the exchange's stamp for the price: `None` for a venue
-    /// whose frames carry no time, whose price is then aged by its arrival alone. A stamp
-    /// ahead of our clock (skew) reads as no lag rather than as a negative one.
+    /// How far the arrival trailed the exchange's stamp, over the least it has trailed it
+    /// lately ([`LagFloor`]): `None` for a venue whose frames carry no time, whose price is
+    /// then aged by its arrival alone.
     pub lag: Option<Duration>,
 }
 
 impl PriceClock {
-    /// A price that arrived at `(received_at, received_wall)`, stamped `event` by the venue.
-    pub fn new(received_at: Instant, received_wall: SystemTime, event: Option<SystemTime>) -> Self {
+    /// A price that arrived at `(received_at, received_wall)`, `lag` behind its usual lag.
+    pub fn new(received_at: Instant, received_wall: SystemTime, lag: Option<Duration>) -> Self {
         Self {
             received_at,
             received_wall,
-            lag: event.map(|event| {
-                received_wall
-                    .duration_since(event)
-                    .unwrap_or(Duration::ZERO)
-            }),
+            lag,
         }
     }
 
-    /// How old the price is at `(now, wall)`: `now - exchange time` when the venue stamps
-    /// its frames, `now - arrival` when it does not. The arrival's age is read by whichever
-    /// clock says older, as [`PriceSample::age_at`] reads a sample's.
+    /// How old the price is at `(now, wall)`: its age since arrival plus how much later
+    /// than usual it arrived behind the exchange's stamp, for a venue that stamps its
+    /// frames; its age since arrival alone for one that does not. The arrival's age is read
+    /// by whichever clock says older, as [`PriceSample::age_at`] reads a sample's.
     pub fn age_at(&self, now: Instant, wall: SystemTime) -> Duration {
         let monotonic = now.saturating_duration_since(self.received_at);
         let since_arrival =
@@ -84,6 +81,66 @@ impl PriceClock {
     /// Whether the age is measured from the exchange's stamp (`true`) or the arrival.
     pub fn by_exchange_time(&self) -> bool {
         self.lag.is_some()
+    }
+}
+
+/// How long [`LagFloor`] remembers a venue's least lag. A backlog shorter than this is
+/// measured in full; a skew or a baseline latency that holds for longer is subtracted out.
+pub(crate) const LAG_FLOOR_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// The resolution of that memory: one minimum per this much time.
+const LAG_FLOOR_BUCKET: Duration = Duration::from_secs(60);
+
+/// The least lag a venue's stamped frames have arrived with over [`LAG_FLOOR_WINDOW`], and
+/// each new frame's lag over it.
+///
+/// `arrival wall clock - exchange stamp` is not a frame's lateness alone: it also carries
+/// our clock's offset from the exchange's (ahead adds to every frame, behind subtracts) and
+/// the network's ordinary latency. Both hold steady over an hour where a backlog does not,
+/// so subtracting the hour's minimum leaves the lateness: a host whose clock is 5 seconds
+/// ahead does not read every OKX price as 5 seconds old, and one 5 seconds behind does not
+/// hide a 5-second backlog. Signed, for that second case. The cost: the first frame after
+/// the feed starts sets the floor, so a venue already late when it is dialled reads as on
+/// time until it catches up once.
+#[derive(Debug, Default)]
+pub(crate) struct LagFloor {
+    /// `(bucket start, least lag in it in ms)`, oldest first.
+    buckets: std::collections::VecDeque<(Instant, i64)>,
+}
+
+impl LagFloor {
+    /// Records a frame stamped `event` that arrived at `(now, wall)`, and returns its lag
+    /// over the floor.
+    pub(crate) fn lag(&mut self, now: Instant, wall: SystemTime, event: SystemTime) -> Duration {
+        let raw = signed_epoch_ms(wall) - signed_epoch_ms(event);
+        match self.buckets.back_mut() {
+            Some((start, least)) if now.saturating_duration_since(*start) < LAG_FLOOR_BUCKET => {
+                *least = (*least).min(raw);
+            }
+            _ => self.buckets.push_back((now, raw)),
+        }
+        while self
+            .buckets
+            .front()
+            .is_some_and(|(start, _)| now.saturating_duration_since(*start) >= LAG_FLOOR_WINDOW)
+        {
+            self.buckets.pop_front();
+        }
+        let floor = self
+            .buckets
+            .iter()
+            .map(|(_, least)| *least)
+            .min()
+            .unwrap_or(raw);
+        Duration::from_millis(u64::try_from(raw - floor).unwrap_or(0))
+    }
+}
+
+/// Milliseconds since the epoch, negative before it.
+fn signed_epoch_ms(at: SystemTime) -> i64 {
+    match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
+        Err(before) => -i64::try_from(before.duration().as_millis()).unwrap_or(i64::MAX),
     }
 }
 
@@ -313,6 +370,7 @@ pub fn spawn_feed(
         metrics,
         recorder,
         connected,
+        lag_floor: Default::default(),
     };
     tokio::spawn(async move {
         let Feed {
@@ -412,6 +470,8 @@ struct Feed {
     recorder: Option<Recorder>,
     /// Whether this venue is connected right now; see [`Connected`].
     connected: Connected,
+    /// The venue's usual lag behind its own stamps, across reconnects; see [`LagFloor`].
+    lag_floor: std::sync::Mutex<LagFloor>,
 }
 
 impl Feed {
@@ -562,7 +622,13 @@ impl Feed {
                 let (at, wall) = (Instant::now(), SystemTime::now());
                 // Before the sample is sent, so whoever wakes on the sample reads the clock
                 // that goes with it.
-                self.connected.priced(PriceClock::new(at, wall, event));
+                let lag = event.map(|event| {
+                    self.lag_floor
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .lag(at, wall, event)
+                });
+                self.connected.priced(PriceClock::new(at, wall, lag));
                 *sample_is_current = true;
                 if let Some(recorder) = recorder {
                     // The market's own mid, whichever way this lane carries it, so two lanes

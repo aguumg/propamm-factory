@@ -1063,6 +1063,9 @@ impl ReloadFailure {
 ///   the new generation runs are set to 1 by its seed.
 fn retire_stopped(live: &crate::pair::Live, stopped: &Stopped) {
     let m = &live.metrics;
+    // The stopped generation's source-check verdict: the replacement may not run the
+    // checks at all (a reload that removed both keys), and nothing else would lower it.
+    m.clear_source_withdrawn();
     if let Some(trip) = &stopped.trip {
         m.trip_source(trip.source, trip.cause.as_str()).set(0.0);
     }

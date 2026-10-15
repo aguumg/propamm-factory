@@ -13,6 +13,7 @@
 //! with the other venues, which catches a late primary whichever clock it is aged by.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use ethrex_common::U256;
@@ -77,6 +78,8 @@ impl GateSource {
 /// A pair's source checks, live. Shared by every attempt of the lane's quote loop through
 /// its `ValueSource`.
 pub(crate) struct SourceGate {
+    /// The pair's label, for the lines this says.
+    label: String,
     sources: Vec<GateSource>,
     primary: usize,
     checks: SourceChecks,
@@ -85,12 +88,16 @@ pub(crate) struct SourceGate {
     /// The fault judged at the last tick, and when, so the time until the next tick can be
     /// counted under it.
     last: Mutex<Option<(Instant, Option<SourceFault>)>>,
+    /// Whether the divergence check last found no fresh source to compare the primary
+    /// with, so the line saying so is said once per stretch rather than every tick.
+    peerless: AtomicBool,
 }
 
 impl SourceGate {
     /// The gate for `feeds`, reading `sources` (in `feeds.sources` order), or `None` when
     /// the pair sets neither check, which leaves its quoting exactly as it was.
     pub(crate) fn new(
+        label: &str,
         feeds: &Feeds,
         sources: Vec<GateSource>,
         decimals: u32,
@@ -106,12 +113,14 @@ impl SourceGate {
             "one gate source per configured source"
         );
         Some(Self {
+            label: label.to_owned(),
             primary: feeds.primary(),
             sources,
             checks: feeds.checks.clone(),
             decimals,
             metrics,
             last: Mutex::new(None),
+            peerless: AtomicBool::new(false),
         })
     }
 
@@ -177,10 +186,12 @@ impl SourceGate {
         };
         let scale = U256::exp10(self.decimals as usize);
         let mut widest: Option<(U256, &GateSource, U256)> = None;
+        let mut compared = 0;
         for (i, other) in self.sources.iter().enumerate() {
             if i == self.primary || !self.is_fresh(other, now, wall) {
                 continue;
             }
+            compared += 1;
             let Some(other_mid) = other.sample().map(|s| s.mid) else {
                 continue;
             };
@@ -191,6 +202,7 @@ impl SourceGate {
                 widest = Some((divergence, other, other_mid));
             }
         }
+        self.say_peerless(compared == 0, primary);
         match widest {
             Some((divergence, other, other_mid)) if divergence > limit => Err((
                 SourceFault::Divergence,
@@ -206,6 +218,29 @@ impl SourceGate {
                 ),
             )),
             _ => Ok(()),
+        }
+    }
+
+    /// Says, once each way, that the divergence check has stopped comparing (every other
+    /// source is stale, so a late primary would go unseen unless its own age shows it) and
+    /// that it has started again. Each venue's age is in `quote_updater_venue_source_age_ms`.
+    fn say_peerless(&self, peerless: bool, primary: &GateSource) {
+        if self.peerless.swap(peerless, Ordering::Relaxed) == peerless {
+            return;
+        }
+        if peerless {
+            tracing::warn!(
+                "[{}] max_source_divergence is not checking: no source but the primary {} \
+                 has a fresh price to compare with",
+                self.label,
+                primary.name
+            );
+        } else {
+            tracing::info!(
+                "[{}] max_source_divergence is checking {} again",
+                self.label,
+                primary.name
+            );
         }
     }
 
@@ -284,9 +319,7 @@ mod tests {
         age: Duration,
         lag: Option<Duration>,
     ) -> PriceClock {
-        let mut clock = PriceClock::new(now - age, wall - age, None);
-        clock.lag = lag;
-        clock
+        PriceClock::new(now - age, wall - age, lag)
     }
 
     const DECIMALS: u32 = 8;
@@ -336,6 +369,7 @@ mod tests {
             connected.push(flag);
         }
         let gate = SourceGate::new(
+            "ETH/USDT",
             &feeds,
             sources,
             DECIMALS,
@@ -392,25 +426,25 @@ mod tests {
             rx,
             connected: Connected::default(),
         };
-        assert!(SourceGate::new(&feeds, vec![source], DECIMALS, None).is_none());
+        assert!(SourceGate::new("ETH/USDT", &feeds, vec![source], DECIMALS, None).is_none());
     }
 
-    /// Exchange time when the venue stamps its frames, arrival when it does not: a price
-    /// that arrived 100ms ago but was made 2s before that is 2.1s old.
+    /// Arrival alone when the venue does not stamp its frames; arrival plus the lag over
+    /// the venue's usual one when it does: a price that arrived 100ms ago, 2s later than
+    /// usual behind its stamp, is 2.1s old.
     #[test]
-    fn a_price_is_aged_by_exchange_time_when_it_has_one_and_by_arrival_when_not() {
+    fn a_price_is_aged_by_its_lag_over_the_usual_when_stamped_and_by_arrival_when_not() {
         let (now, wall) = (Instant::now(), SystemTime::now());
         let arrival = clock_aged(now, wall, Duration::from_millis(100), None);
         assert_eq!(arrival.age_at(now, wall), Duration::from_millis(100));
         assert!(!arrival.by_exchange_time());
 
-        let event = wall - Duration::from_millis(2_100);
-        let late = PriceClock::new(
-            now - Duration::from_millis(100),
-            wall - Duration::from_millis(100),
-            Some(event),
+        let late = clock_aged(
+            now,
+            wall,
+            Duration::from_millis(100),
+            Some(Duration::from_secs(2)),
         );
-        assert_eq!(late.lag, Some(Duration::from_secs(2)));
         assert_eq!(late.age_at(now, wall), Duration::from_millis(2_100));
         assert!(late.by_exchange_time());
         // Due when the age crosses the limit, on the monotonic clock.
@@ -418,11 +452,42 @@ mod tests {
             late.stale_after(Duration::from_secs(3)),
             now - Duration::from_millis(100) + Duration::from_secs(1)
         );
+    }
 
-        // An exchange stamp ahead of our clock is skew, not a negative age.
-        let ahead = PriceClock::new(now, wall, Some(wall + Duration::from_secs(1)));
-        assert_eq!(ahead.lag, Some(Duration::ZERO));
-        assert_eq!(ahead.age_at(now, wall), Duration::ZERO);
+    /// Our clock 5s ahead of the exchange's, level with it, or 5s behind: the usual lag is
+    /// subtracted, so an on-time frame reads as on time and a 30s backlog reads as 30s
+    /// whichever way the clock is off.
+    #[test]
+    fn the_lag_floor_removes_clock_skew_in_either_direction() {
+        for skew_ms in [5_000i64, 0, -5_000] {
+            let mut floor = crate::feed::LagFloor::default();
+            let start = Instant::now();
+            let wall0 = SystemTime::now();
+            // A frame stamped `delay_ms` before it arrived, `at_s` into the run, as our
+            // clock (off by `skew_ms`) reads the arrival.
+            let mut frame = |at_s: u64, delay_ms: u64| {
+                let now = start + Duration::from_secs(at_s);
+                let true_wall = wall0 + Duration::from_secs(at_s);
+                let event = true_wall - Duration::from_millis(delay_ms);
+                let wall = if skew_ms >= 0 {
+                    true_wall + Duration::from_millis(skew_ms as u64)
+                } else {
+                    true_wall - Duration::from_millis((-skew_ms) as u64)
+                };
+                floor.lag(now, wall, event)
+            };
+            assert_eq!(frame(0, 80), Duration::ZERO, "skew {skew_ms}");
+            assert_eq!(frame(1, 60), Duration::ZERO, "skew {skew_ms}");
+            assert_eq!(frame(2, 120), Duration::from_millis(60), "skew {skew_ms}");
+            // The 10-08 backlog, ten minutes in.
+            assert_eq!(
+                frame(600, 30_060),
+                Duration::from_secs(30),
+                "skew {skew_ms}"
+            );
+            // A lag held for longer than the window becomes the usual one.
+            assert_eq!(frame(600 + 3_600, 30_060), Duration::ZERO, "skew {skew_ms}");
+        }
     }
 
     #[test]
@@ -664,33 +729,79 @@ mod tests {
         assert!(lane.price().is_ok(), "{:?}", lane.price().err());
     }
 
-    /// The same incident on a venue whose frames carry the exchange's time: a primary
-    /// delivering prices made 30s ago is stale the moment they arrive, without waiting for
-    /// the market to move.
+    /// The same incident on a venue whose frames carry the exchange's time, with our clock
+    /// 5s ahead of the exchange's, level, and 5s behind: on-time frames quote, a primary
+    /// whose prices start arriving 30s after their stamps is stale on the first such frame,
+    /// without waiting for the market to move, and quotes again when it catches up.
     #[tokio::test]
     async fn a_primary_thirty_seconds_behind_by_exchange_time_is_withdrawn_on_arrival() {
+        for skew_ms in [5_000i64, 0, -5_000] {
+            let (binance_url, binance) = scripted_venue().await;
+            let (okx_url, okx) = scripted_venue().await;
+            // OKX is the primary here: it is the venue that stamps its frames.
+            let lane = Lane::start(
+                &binance_url,
+                &okx_url,
+                ("1", "2"),
+                checks(Some(1_500), None),
+            )
+            .await;
+            // What a stamp made `ago_ms` before now reads as, against our skewed clock.
+            let stamp = |ago_ms: i64| (now_ms() as i64 - skew_ms - ago_ms) as u64;
+            binance.send(book_ticker("4000.00")).unwrap();
+            okx.send(okx_ticker("4000.00", stamp(50))).unwrap();
+            let mut rx = lane.rx.clone();
+            lane.until_both_priced().await;
+            wait_for_mid(&mut rx, |_| true).await;
+            assert!(
+                lane.price().is_ok(),
+                "skew {skew_ms}: {:?}",
+                lane.price().err()
+            );
+
+            okx.send(okx_ticker("4000.01", stamp(30_050))).unwrap();
+            lane.until_venue_mid(1, price("4000.01")).await;
+            let err = lane.price().expect_err("30s behind is stale");
+            assert_eq!(err.kind(), Some(UnusableKind::SourceStale), "{err}");
+            assert!(err.to_string().contains("by exchange time"), "{err}");
+
+            okx.send(okx_ticker("4000.02", stamp(50))).unwrap();
+            lane.until_venue_mid(1, price("4000.02")).await;
+            assert!(
+                lane.price().is_ok(),
+                "skew {skew_ms}: {:?}",
+                lane.price().err()
+            );
+        }
+    }
+
+    /// The failure the floor exists for: a host clock 5s ahead used to read every OKX price
+    /// as 5s old, so with `max_source_age_ms` set the secondary was dropped from the
+    /// divergence check and a late primary went unseen. With the floor it stays compared.
+    #[tokio::test]
+    async fn a_skewed_clock_does_not_switch_the_divergence_check_off() {
         let (binance_url, binance) = scripted_venue().await;
         let (okx_url, okx) = scripted_venue().await;
-        // OKX is the primary here: it is the venue that stamps its frames.
         let lane = Lane::start(
             &binance_url,
             &okx_url,
-            ("1", "2"),
-            checks(Some(1_500), None),
+            ("2", "1"),
+            checks(Some(1_500), Some("0.001")),
         )
         .await;
+        let ahead = |ms: u64| ms - 5_000;
         binance.send(book_ticker("4000.00")).unwrap();
-        okx.send(okx_ticker("4000.00", now_ms() - 30_000)).unwrap();
+        okx.send(okx_ticker("4000.00", ahead(now_ms()))).unwrap();
         let mut rx = lane.rx.clone();
         lane.until_both_priced().await;
-        wait_for_mid(&mut rx, |_| true).await;
-        let err = lane.price().expect_err("30s behind is stale");
-        assert_eq!(err.kind(), Some(UnusableKind::SourceStale), "{err}");
-        assert!(err.to_string().contains("by exchange time"), "{err}");
-
-        okx.send(okx_ticker("4000.00", now_ms())).unwrap();
-        lane.until_venue_fresh(1).await;
+        wait_for_mid(&mut rx, |mid| mid == price("4000")).await;
         assert!(lane.price().is_ok(), "{:?}", lane.price().err());
+
+        binance.send(book_ticker("4000.00")).unwrap();
+        okx.send(okx_ticker("4016.00", ahead(now_ms()))).unwrap();
+        wait_for_mid(&mut rx, |mid| mid > price("4000")).await;
+        let err = lane.price().expect_err("still compared, so 40bp withdraws");
+        assert_eq!(err.kind(), Some(UnusableKind::SourceDivergence), "{err}");
     }
 
     /// Two sources with no checks set: no gate, and the late primary is quoted from, as it
@@ -772,6 +883,7 @@ mod tests {
             );
             let sources = spawned.venues.iter().map(GateSource::of).collect();
             if let Some(gate) = SourceGate::new(
+                "ETH/USDT",
                 &feeds,
                 sources,
                 DECIMALS,
@@ -814,22 +926,6 @@ mod tests {
             })
             .await
             .expect("the venue never delivered that price");
-        }
-
-        async fn until_venue_fresh(&self, i: usize) {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let fresh = self.venues[i].connected.price_clock().is_some_and(|clock| {
-                        clock.age_at(Instant::now(), SystemTime::now()) < Duration::from_secs(1)
-                    });
-                    if fresh {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("the venue never delivered a fresh price");
         }
     }
 

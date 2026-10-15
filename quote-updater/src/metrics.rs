@@ -1387,6 +1387,14 @@ impl PairMetrics {
     pub fn price_unusable(&self, kind: UnusableKind) -> &IntCounter {
         &self.price_unusable[kind as usize]
     }
+    /// Lowers both source-check gauges: what a generation that has not judged a tick, or a
+    /// pair whose checks were removed, says. Without it a pair reloaded out of the checks
+    /// while withdrawn would read 1 until the process restarted, and keep a ticket open.
+    pub fn clear_source_withdrawn(&self) {
+        for gauge in &self.source_withdrawn {
+            gauge.set(0.0);
+        }
+    }
     /// 1 while the source checks hold the pair withdrawn for `fault`.
     pub fn source_withdrawn(&self, fault: SourceFault) -> &Gauge {
         &self.source_withdrawn[fault as usize]
