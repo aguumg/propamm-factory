@@ -456,6 +456,25 @@ groups:
             time. quote_updater_venue_source_age_ms says how far behind each venue is; the
             updater's stderr names the venues and numbers on every withdrawn block.
 
+      # The other way the source checks can fail: quietly. With no other source fresh, the
+      # divergence check compares the primary with nothing and withdraws nothing, which is
+      # the state a late primary goes unseen in. Every secondary down, or every stamped one
+      # reading late because this host's clock runs more than a second ahead.
+      - alert: PusherSourceDivergenceInactive
+        expr: >-
+          quote_updater_source_divergence_inactive == 1
+            unless on (pair) quote_updater_breaker_tripped == 1
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: the divergence check has compared nothing for 5 minutes"
+          description: >-
+            max_source_divergence is set but no source other than the primary has had a fresh
+            price, so a primary running behind its exchange would not be caught by it.
+            quote_updater_venue_source_age_ms says which venues are behind; a steady
+            quote_updater_venue_future_stamps_total or ages near a constant point at this
+            host's clock.
+
       - alert: PusherVenueFeedDown
         expr: quote_updater_venue_feed_up == 0
         for: 5m

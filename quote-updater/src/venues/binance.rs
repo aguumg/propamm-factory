@@ -34,7 +34,9 @@ struct BookTicker {
     ask: String,
     /// The event time, in milliseconds. The spot bookTicker stream does not send one (its
     /// frame is `u s b B a A`), so on the default endpoint a Binance price is aged by when
-    /// it arrived; read when present, for an endpoint whose bookTicker carries it.
+    /// it arrived, which sees a stream gone silent but not one delivering a backlog on time
+    /// (`max_source_divergence` is what catches that); read when present, for an endpoint
+    /// whose bookTicker carries it.
     #[serde(rename = "E")]
     event_ms: Option<u64>,
 }

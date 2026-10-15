@@ -270,8 +270,10 @@ pub struct Metrics {
     venue_feed_mid: GaugeVec,
     venue_feed_delta: GaugeVec,
     venue_source_age_ms: GaugeVec,
+    venue_future_stamps: IntCounterVec,
     price_unusable: IntCounterVec,
     source_withdrawn: GaugeVec,
+    source_divergence_inactive: GaugeVec,
     source_withdrawn_seconds: CounterVec,
     diagnostic: GaugeVec,
     trip_source: GaugeVec,
@@ -333,6 +335,9 @@ pub struct PairMetrics {
     price_unusable: [IntCounter; UnusableKind::ALL.len()],
     source_withdrawn: [Gauge; SourceFault::ALL.len()],
     source_withdrawn_seconds: [Counter; SourceFault::ALL.len()],
+    /// 1 while `max_source_divergence` is set and no source but the primary is fresh, so
+    /// the check compares nothing.
+    pub source_divergence_inactive: Gauge,
     publish_decisions: [IntCounter; 4],
     pub published_mid: Gauge,
     pub published_delta: Gauge,
@@ -372,6 +377,8 @@ pub struct VenueMetrics {
     /// `quote_updater_venue_source_age_ms`: written at scrape time from the feed's own
     /// clock (see `Metrics::render`), and by `quiesce`.
     pub source_age_ms: Gauge,
+    /// Frames whose exchange stamp was too far ahead of their arrival to read a lag from.
+    pub future_stamps: IntCounter,
 }
 
 impl VenueMetrics {
@@ -625,6 +632,13 @@ impl Metrics {
                  timestamp when its frames carry one, else by arrival.",
                 pv,
             )?,
+            venue_future_stamps: counter(
+                &r,
+                "quote_updater_venue_future_stamps_total",
+                "Frames whose exchange timestamp was more than 2s ahead of their arrival, left \
+                 out of the venue's usual lag: this host's clock or the venue's is off.",
+                pv,
+            )?,
             price_unusable: counter(
                 &r,
                 "quote_updater_price_unusable_total",
@@ -637,6 +651,13 @@ impl Metrics {
                 "1 while the pair is withdrawn by its source checks for this reason \
                  (source_stale, source_divergence).",
                 &["pair", "reason"],
+            )?,
+            source_divergence_inactive: gauge(
+                &r,
+                "quote_updater_source_divergence_inactive",
+                "1 while max_source_divergence is set and no source but the primary has a \
+                 fresh price, so the divergence check compares nothing.",
+                &["pair"],
             )?,
             source_withdrawn_seconds: seconds_counter(
                 &r,
@@ -1042,6 +1063,7 @@ impl Metrics {
                 .map(|k| self.price_unusable.with_label_values(&[pair, k.as_str()])),
             source_withdrawn: SourceFault::ALL
                 .map(|f| self.source_withdrawn.with_label_values(&[pair, f.as_str()])),
+            source_divergence_inactive: self.source_divergence_inactive.with_label_values(p),
             source_withdrawn_seconds: SourceFault::ALL.map(|f| {
                 self.source_withdrawn_seconds
                     .with_label_values(&[pair, f.as_str()])
@@ -1093,6 +1115,7 @@ impl Metrics {
             mid: self.venue_feed_mid.with_label_values(pv),
             delta: self.venue_feed_delta.with_label_values(pv),
             source_age_ms: self.venue_source_age_ms.with_label_values(pv),
+            future_stamps: self.venue_future_stamps.with_label_values(pv),
         }
     }
 
@@ -1382,18 +1405,20 @@ impl PairMetrics {
         for gauge in &self.source_withdrawn {
             gauge.set(f64::NAN);
         }
+        self.source_divergence_inactive.set(f64::NAN);
     }
 
     pub fn price_unusable(&self, kind: UnusableKind) -> &IntCounter {
         &self.price_unusable[kind as usize]
     }
-    /// Lowers both source-check gauges: what a generation that has not judged a tick, or a
-    /// pair whose checks were removed, says. Without it a pair reloaded out of the checks
+    /// Lowers the source-check gauges (withdrawn, divergence inactive): what a generation
+    /// that has not judged a tick, or a pair whose checks were removed, says. Without it a pair reloaded out of the checks
     /// while withdrawn would read 1 until the process restarted, and keep a ticket open.
     pub fn clear_source_withdrawn(&self) {
         for gauge in &self.source_withdrawn {
             gauge.set(0.0);
         }
+        self.source_divergence_inactive.set(0.0);
     }
     /// 1 while the source checks hold the pair withdrawn for `fault`.
     pub fn source_withdrawn(&self, fault: SourceFault) -> &Gauge {

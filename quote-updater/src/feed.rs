@@ -84,40 +84,87 @@ impl PriceClock {
     }
 }
 
-/// How long [`LagFloor`] remembers a venue's least lag. A backlog shorter than this is
-/// measured in full; a skew or a baseline latency that holds for longer is subtracted out.
+/// How long [`LagFloor`] remembers a venue's least lag.
 pub(crate) const LAG_FLOOR_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// The resolution of that memory: one minimum per this much time.
 const LAG_FLOOR_BUCKET: Duration = Duration::from_secs(60);
 
-/// The least lag a venue's stamped frames have arrived with over [`LAG_FLOOR_WINDOW`], and
-/// each new frame's lag over it.
+/// The most [`LagFloor`] will ever subtract, in milliseconds: what a host clock kept by NTP
+/// and a network path to the venue plausibly add between them. Lag beyond it is always
+/// counted as lateness, so a venue that is already behind when it is dialled, or one that
+/// stays behind for longer than the window, cannot become its own baseline.
+pub(crate) const LAG_FLOOR_MAX_MS: i64 = 1_000;
+
+/// How far ahead of its arrival a stamp may be, in milliseconds, and still be taken as a
+/// reading of the venue's lag. A stamp further ahead says the venue's clock or ours is
+/// wrong; it is left out of the floor (and counted, `quote_updater_venue_future_stamps_total`)
+/// rather than allowed to drag the floor down and make every later frame look late.
+pub(crate) const FUTURE_STAMP_MS: i64 = 2_000;
+
+/// How far this host's wall clock may move against its monotonic clock between two frames,
+/// in milliseconds, before it is taken as a step (an NTP jump, a resume from sleep) and the
+/// floor, measured on the old wall clock, is dropped.
+const CLOCK_STEP_MS: i64 = 1_000;
+
+/// The least lag a venue's stamped frames have arrived with over [`LAG_FLOOR_WINDOW`], at
+/// most [`LAG_FLOOR_MAX_MS`], and each new frame's lag over it.
 ///
 /// `arrival wall clock - exchange stamp` is not a frame's lateness alone: it also carries
-/// our clock's offset from the exchange's (ahead adds to every frame, behind subtracts) and
-/// the network's ordinary latency. Both hold steady over an hour where a backlog does not,
-/// so subtracting the hour's minimum leaves the lateness: a host whose clock is 5 seconds
-/// ahead does not read every OKX price as 5 seconds old, and one 5 seconds behind does not
-/// hide a 5-second backlog. Signed, for that second case. The cost: the first frame after
-/// the feed starts sets the floor, so a venue already late when it is dialled reads as on
-/// time until it catches up once.
+/// our clock's offset from the exchange's and the network's ordinary latency. Subtracting
+/// the least lag seen lately takes those out, up to [`LAG_FLOOR_MAX_MS`]: a clock a few
+/// hundred milliseconds off does not age every OKX price by that much, while a backlog of
+/// seconds, however long it lasts and whenever the feed was dialled, is always counted. A
+/// host clock more than that ahead of the exchange's makes the venue's prices read late,
+/// which fails closed: a primary withdraws, and a secondary drops out of the divergence
+/// check, which says so (`quote_updater_source_divergence_inactive`).
 #[derive(Debug, Default)]
 pub(crate) struct LagFloor {
     /// `(bucket start, least lag in it in ms)`, oldest first.
     buckets: std::collections::VecDeque<(Instant, i64)>,
+    /// The monotonic instant the wall clock is read against, and `wall - monotonic` at the
+    /// last frame, in ms: how a step of the wall clock is seen.
+    anchor: Option<(Instant, i64)>,
+}
+
+/// One frame's reading by [`LagFloor::lag`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Lag {
+    /// How much later than usual the frame arrived behind its stamp.
+    pub(crate) over_floor: Duration,
+    /// Whether the stamp was more than [`FUTURE_STAMP_MS`] ahead of the arrival, and so
+    /// left out of the floor.
+    pub(crate) future: bool,
 }
 
 impl LagFloor {
     /// Records a frame stamped `event` that arrived at `(now, wall)`, and returns its lag
     /// over the floor.
-    pub(crate) fn lag(&mut self, now: Instant, wall: SystemTime, event: SystemTime) -> Duration {
-        let raw = signed_epoch_ms(wall) - signed_epoch_ms(event);
-        match self.buckets.back_mut() {
-            Some((start, least)) if now.saturating_duration_since(*start) < LAG_FLOOR_BUCKET => {
-                *least = (*least).min(raw);
+    pub(crate) fn lag(&mut self, now: Instant, wall: SystemTime, event: SystemTime) -> Lag {
+        let wall_ms = signed_epoch_ms(wall);
+        // A step of the wall clock moves every later frame's lag by the step, against a
+        // floor measured before it: start the floor again.
+        let anchor = self.anchor.map_or(now, |(anchor, _)| anchor);
+        let offset = wall_ms
+            - i64::try_from(now.saturating_duration_since(anchor).as_millis()).unwrap_or(i64::MAX);
+        if let Some((_, last)) = self.anchor
+            && (offset - last).abs() > CLOCK_STEP_MS
+        {
+            self.buckets.clear();
+        }
+        self.anchor = Some((anchor, offset));
+
+        let raw = wall_ms - signed_epoch_ms(event);
+        let future = raw < -FUTURE_STAMP_MS;
+        if !future {
+            match self.buckets.back_mut() {
+                Some((start, least))
+                    if now.saturating_duration_since(*start) < LAG_FLOOR_BUCKET =>
+                {
+                    *least = (*least).min(raw);
+                }
+                _ => self.buckets.push_back((now, raw)),
             }
-            _ => self.buckets.push_back((now, raw)),
         }
         while self
             .buckets
@@ -131,8 +178,11 @@ impl LagFloor {
             .iter()
             .map(|(_, least)| *least)
             .min()
-            .unwrap_or(raw);
-        Duration::from_millis(u64::try_from(raw - floor).unwrap_or(0))
+            .map_or(0, |least| least.min(LAG_FLOOR_MAX_MS));
+        Lag {
+            over_floor: Duration::from_millis(u64::try_from(raw - floor).unwrap_or(0)),
+            future,
+        }
     }
 }
 
@@ -623,10 +673,15 @@ impl Feed {
                 // Before the sample is sent, so whoever wakes on the sample reads the clock
                 // that goes with it.
                 let lag = event.map(|event| {
-                    self.lag_floor
+                    let lag = self
+                        .lag_floor
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .lag(at, wall, event)
+                        .lag(at, wall, event);
+                    if lag.future {
+                        metrics.record(|m| m.future_stamps.inc());
+                    }
+                    lag.over_floor
                 });
                 self.connected.priced(PriceClock::new(at, wall, lag));
                 *sample_is_current = true;

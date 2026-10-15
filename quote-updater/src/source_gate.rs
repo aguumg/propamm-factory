@@ -185,30 +185,48 @@ impl SourceGate {
             return stale("has not priced yet".to_owned());
         };
         let scale = U256::exp10(self.decimals as usize);
-        let mut widest: Option<(U256, &GateSource, U256)> = None;
-        let mut compared = 0;
-        for (i, other) in self.sources.iter().enumerate() {
-            if i == self.primary || !self.is_fresh(other, now, wall) {
+        // The secondaries the check compares against: the fresh ones and, when any of
+        // those has its freshness vouched for by the exchange's own stamp, only those. An
+        // unstamped source is fresh by arrival, which a backlog does not change, so it is
+        // trusted only when no stamped source is fresh to say otherwise.
+        let fresh: Vec<(&GateSource, U256, bool)> = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(i, other)| *i != self.primary && self.is_fresh(other, now, wall))
+            .filter_map(|(_, other)| {
+                let mid = other.sample()?.mid;
+                let stamped = other
+                    .connected
+                    .price_clock()
+                    .is_some_and(|clock| clock.by_exchange_time());
+                Some((other, mid, stamped))
+            })
+            .collect();
+        let any_stamped = fresh.iter().any(|(_, _, stamped)| *stamped);
+        // The nearest of them decides: the pair withdraws when the primary is away from
+        // every source compared, so one secondary off on its own (a bad tick, a book of its
+        // own) cannot withdraw a primary that another fresh source agrees with. With one
+        // secondary that one decides. A secondary whose mid is zero is no comparison.
+        let mut nearest: Option<(U256, &GateSource, U256)> = None;
+        for (other, other_mid, stamped) in fresh {
+            if any_stamped && !stamped {
                 continue;
             }
-            compared += 1;
-            let Some(other_mid) = other.sample().map(|s| s.mid) else {
-                continue;
-            };
             let Some(divergence) = divergence(primary_mid, other_mid, scale) else {
                 continue;
             };
-            if widest.is_none_or(|(widest, _, _)| divergence > widest) {
-                widest = Some((divergence, other, other_mid));
+            if nearest.is_none_or(|(nearest, _, _)| divergence < nearest) {
+                nearest = Some((divergence, other, other_mid));
             }
         }
-        self.say_peerless(compared == 0, primary);
-        match widest {
+        self.say_peerless(nearest.is_none(), primary);
+        match nearest {
             Some((divergence, other, other_mid)) if divergence > limit => Err((
                 SourceFault::Divergence,
                 format!(
-                    "primary source {} mid {} is {} from {} mid {} (max_source_divergence {}); \
-                     withdrawn until they agree",
+                    "primary source {} mid {} is {} from {} mid {} (max_source_divergence {}), \
+                     the nearest fresh source; withdrawn until they agree",
                     primary.name,
                     format_scaled(primary_mid, self.decimals),
                     percent(divergence, self.decimals),
@@ -221,10 +239,16 @@ impl SourceGate {
         }
     }
 
-    /// Says, once each way, that the divergence check has stopped comparing (every other
-    /// source is stale, so a late primary would go unseen unless its own age shows it) and
-    /// that it has started again. Each venue's age is in `quote_updater_venue_source_age_ms`.
+    /// Sets `quote_updater_source_divergence_inactive`, and says, once each way, that the
+    /// divergence check has stopped comparing (no other source is fresh, so a late primary
+    /// would go unseen unless its own age shows it) and that it has started again. Each
+    /// venue's age is in `quote_updater_venue_source_age_ms`.
     fn say_peerless(&self, peerless: bool, primary: &GateSource) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .source_divergence_inactive
+                .set(if peerless { 1.0 } else { 0.0 });
+        }
         if self.peerless.swap(peerless, Ordering::Relaxed) == peerless {
             return;
         }
@@ -337,19 +361,26 @@ mod tests {
     }
 
     fn fixture(checks: SourceChecks) -> Fixture {
-        let feeds = Feeds {
-            sources: vec![
-                Source {
-                    venue: VenueId::Binance,
-                    symbol: "ETHUSDT".into(),
-                    weight: parse_decimal_scaled("2", WEIGHT_DECIMALS).unwrap(),
-                },
-                Source {
-                    venue: VenueId::Okx,
-                    symbol: "ETH-USDT".into(),
-                    weight: parse_decimal_scaled("1", WEIGHT_DECIMALS).unwrap(),
-                },
+        fixture_of(
+            &[
+                (VenueId::Binance, "ETHUSDT", "2"),
+                (VenueId::Okx, "ETH-USDT", "1"),
             ],
+            checks,
+        )
+    }
+
+    /// `sources` as `(venue, symbol, weight)`, under `checks`.
+    fn fixture_of(sources: &[(VenueId, &str, &str)], checks: SourceChecks) -> Fixture {
+        let feeds = Feeds {
+            sources: sources
+                .iter()
+                .map(|(venue, symbol, weight)| Source {
+                    venue: *venue,
+                    symbol: (*symbol).into(),
+                    weight: parse_decimal_scaled(weight, WEIGHT_DECIMALS).unwrap(),
+                })
+                .collect(),
             min_sources: 1,
             checks,
         };
@@ -454,40 +485,127 @@ mod tests {
         );
     }
 
-    /// Our clock 5s ahead of the exchange's, level with it, or 5s behind: the usual lag is
-    /// subtracted, so an on-time frame reads as on time and a 30s backlog reads as 30s
-    /// whichever way the clock is off.
+    /// A frame stamped `delay_ms` before it arrived, `at_ms` into a run started at
+    /// `(start, wall0)`, on a host clock `skew_ms` off the exchange's (positive is ahead).
+    fn frame(
+        floor: &mut crate::feed::LagFloor,
+        (start, wall0): (Instant, SystemTime),
+        skew_ms: i64,
+        at_ms: u64,
+        delay_ms: i64,
+    ) -> crate::feed::Lag {
+        let now = start + Duration::from_millis(at_ms);
+        let true_wall = wall0 + Duration::from_millis(at_ms);
+        let shift = |t: SystemTime, ms: i64| {
+            if ms >= 0 {
+                t + Duration::from_millis(ms as u64)
+            } else {
+                t - Duration::from_millis((-ms) as u64)
+            }
+        };
+        floor.lag(now, shift(true_wall, skew_ms), shift(true_wall, -delay_ms))
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A host clock off by up to the cap either way: the usual lag is subtracted, so an
+    /// on-time frame reads as on time and a 30s backlog as 30s. A backlog that outlasts
+    /// the window is still counted, less the cap.
     #[test]
-    fn the_lag_floor_removes_clock_skew_in_either_direction() {
-        for skew_ms in [5_000i64, 0, -5_000] {
+    fn the_lag_floor_removes_a_small_skew_in_either_direction() {
+        for skew_ms in [800i64, 0, -800, -1_500] {
             let mut floor = crate::feed::LagFloor::default();
-            let start = Instant::now();
-            let wall0 = SystemTime::now();
-            // A frame stamped `delay_ms` before it arrived, `at_s` into the run, as our
-            // clock (off by `skew_ms`) reads the arrival.
-            let mut frame = |at_s: u64, delay_ms: u64| {
-                let now = start + Duration::from_secs(at_s);
-                let true_wall = wall0 + Duration::from_secs(at_s);
-                let event = true_wall - Duration::from_millis(delay_ms);
-                let wall = if skew_ms >= 0 {
-                    true_wall + Duration::from_millis(skew_ms as u64)
-                } else {
-                    true_wall - Duration::from_millis((-skew_ms) as u64)
-                };
-                floor.lag(now, wall, event)
-            };
-            assert_eq!(frame(0, 80), Duration::ZERO, "skew {skew_ms}");
-            assert_eq!(frame(1, 60), Duration::ZERO, "skew {skew_ms}");
-            assert_eq!(frame(2, 120), Duration::from_millis(60), "skew {skew_ms}");
-            // The 10-08 backlog, ten minutes in.
-            assert_eq!(
-                frame(600, 30_060),
-                Duration::from_secs(30),
-                "skew {skew_ms}"
-            );
-            // A lag held for longer than the window becomes the usual one.
-            assert_eq!(frame(600 + 3_600, 30_060), Duration::ZERO, "skew {skew_ms}");
+            let run = (Instant::now(), SystemTime::now());
+            let mut at = |at_ms, delay| frame(&mut floor, run, skew_ms, at_ms, delay).over_floor;
+            assert_eq!(at(0, 80), Duration::ZERO, "skew {skew_ms}");
+            assert_eq!(at(1_000, 60), Duration::ZERO, "skew {skew_ms}");
+            assert_eq!(at(2_000, 120), ms(60), "skew {skew_ms}");
+            assert_eq!(at(600_000, 30_060), ms(30_000), "skew {skew_ms}");
+            let held = at(600_000 + 3_600_000, 30_060);
+            // Every frame in the window is now 30s late: the floor is that, capped.
+            let expected = 30_060 + skew_ms - crate::feed::LAG_FLOOR_MAX_MS;
+            assert_eq!(held, ms(expected as u64), "skew {skew_ms}");
         }
+    }
+
+    /// Dialled while the venue is already 30s behind: at most the cap is taken as usual,
+    /// so the backlog shows from the first frame.
+    #[test]
+    fn a_venue_late_from_its_first_frame_is_still_late() {
+        let mut floor = crate::feed::LagFloor::default();
+        let run = (Instant::now(), SystemTime::now());
+        let first = frame(&mut floor, run, 0, 0, 30_000);
+        assert_eq!(first.over_floor, ms(29_000));
+        assert!(!first.future);
+    }
+
+    /// A stamp from the future is counted and left out of the floor: later frames are not
+    /// made to look late by it, and a real backlog still reads as itself.
+    #[test]
+    fn a_future_stamp_does_not_move_the_floor() {
+        let mut floor = crate::feed::LagFloor::default();
+        let run = (Instant::now(), SystemTime::now());
+        assert_eq!(frame(&mut floor, run, 0, 0, 50).over_floor, Duration::ZERO);
+        let future = frame(&mut floor, run, 0, 1_000, -10_000);
+        assert!(future.future);
+        assert_eq!(future.over_floor, Duration::ZERO);
+        assert_eq!(
+            frame(&mut floor, run, 0, 2_000, 50).over_floor,
+            Duration::ZERO
+        );
+        assert_eq!(
+            frame(&mut floor, run, 0, 3_000, 30_050).over_floor,
+            ms(30_000)
+        );
+    }
+
+    /// The host clock steps. NTP correcting a clock that ran 1.5s slow steps it forward,
+    /// and against the floor measured before the step every later frame would read 1.5s
+    /// late for the whole window, holding the pair withdrawn; the floor starts again
+    /// instead. A step back far enough makes the stamps read as from the future: counted,
+    /// and kept out of the floor, so stepping right again leaves nothing behind.
+    #[test]
+    fn a_host_clock_step_restarts_the_floor() {
+        let run = (Instant::now(), SystemTime::now());
+        let mut floor = crate::feed::LagFloor::default();
+        assert_eq!(
+            frame(&mut floor, run, -1_500, 0, 50).over_floor,
+            Duration::ZERO
+        );
+        assert_eq!(
+            frame(&mut floor, run, 0, 1_000, 50).over_floor,
+            Duration::ZERO,
+            "corrected forward: not 1.5s late"
+        );
+        assert_eq!(
+            frame(&mut floor, run, 0, 2_000, 30_050).over_floor,
+            ms(30_000)
+        );
+
+        let mut floor = crate::feed::LagFloor::default();
+        assert_eq!(frame(&mut floor, run, 0, 0, 50).over_floor, Duration::ZERO);
+        let back = frame(&mut floor, run, -60_000, 1_000, 50);
+        assert!(back.future);
+        assert_eq!(back.over_floor, Duration::ZERO);
+        assert_eq!(
+            frame(&mut floor, run, 0, 2_000, 50).over_floor,
+            Duration::ZERO
+        );
+        assert_eq!(
+            frame(&mut floor, run, 0, 3_000, 30_050).over_floor,
+            ms(30_000)
+        );
+    }
+
+    /// A host clock further ahead than the cap fails closed: every stamped price reads as
+    /// late by the excess.
+    #[test]
+    fn a_skew_beyond_the_cap_reads_late() {
+        let mut floor = crate::feed::LagFloor::default();
+        let run = (Instant::now(), SystemTime::now());
+        assert_eq!(frame(&mut floor, run, 5_000, 0, 50).over_floor, ms(4_050));
     }
 
     #[test]
@@ -576,6 +694,149 @@ mod tests {
             Some(Duration::from_secs(5)),
         );
         assert!(f.gate.check(now, wall).is_ok());
+    }
+
+    /// A secondary whose frames carry no time (Binance spot) is fresh by arrival, which a
+    /// backlog does not change. While a stamped secondary is fresh, only stamped ones are
+    /// compared, so the backlogged one cannot withdraw a primary that is fine; with no
+    /// stamped secondary fresh it is the only check there is, and it is compared.
+    #[test]
+    fn a_secondary_without_timestamps_with_a_backlog() {
+        let f = fixture_of(
+            &[
+                (VenueId::Okx, "ETH-USDT", "2"),
+                (VenueId::Binance, "ETHUSDT", "1"),
+                (VenueId::Gate, "ETH_USDT", "1"),
+            ],
+            checks(Some(1_500), Some("0.001")),
+        );
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let on_time = Some(Duration::ZERO);
+        f.price(0, "4016", now, wall, Duration::ZERO, on_time);
+        // Binance 30s behind: an old price, arriving on time.
+        f.price(1, "4000", now, wall, Duration::ZERO, None);
+        f.price(2, "4016", now, wall, Duration::ZERO, on_time);
+        assert!(
+            f.gate.check(now, wall).is_ok(),
+            "gate agrees; binance is not asked"
+        );
+
+        // Gate falls behind: Binance is the only check left, and it is used.
+        f.price(
+            2,
+            "4016",
+            now,
+            wall,
+            Duration::ZERO,
+            Some(Duration::from_secs(5)),
+        );
+        let err = f.gate.check(now, wall).unwrap_err();
+        assert_eq!(err.kind(), Some(UnusableKind::SourceDivergence), "{err}");
+        assert!(err.to_string().contains("binance:ETHUSDT"), "{err}");
+    }
+
+    /// Three or more sources: the primary withdraws only when it is away from every source
+    /// compared, so one secondary off on its own does not withdraw it, and a primary off
+    /// from all of them does. The 10-08 shape, with two Binance markets behind the same
+    /// backlog (one primary, one secondary, both unstamped) and OKX current: OKX is the one
+    /// compared, and the pair withdraws.
+    #[test]
+    fn three_sources_with_one_outlier() {
+        let f = fixture_of(
+            &[
+                (VenueId::Binance, "ETHUSDT", "2"),
+                (VenueId::Okx, "ETH-USDT", "1"),
+                (VenueId::Gate, "ETH_USDT", "1"),
+            ],
+            checks(None, Some("0.001")),
+        );
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let on_time = Some(Duration::ZERO);
+        f.price(0, "4000", now, wall, Duration::ZERO, None);
+        f.price(1, "4000", now, wall, Duration::ZERO, on_time);
+        f.price(2, "4020", now, wall, Duration::ZERO, on_time);
+        assert!(
+            f.gate.check(now, wall).is_ok(),
+            "the outlier is a secondary"
+        );
+
+        f.price(0, "4020", now, wall, Duration::ZERO, None);
+        f.price(2, "4001", now, wall, Duration::ZERO, on_time);
+        let err = f.gate.check(now, wall).unwrap_err();
+        assert_eq!(err.kind(), Some(UnusableKind::SourceDivergence), "{err}");
+        assert!(
+            err.to_string().contains("gate:ETH_USDT mid 4001"),
+            "the nearest: {err}"
+        );
+
+        let f = fixture_of(
+            &[
+                (VenueId::Binance, "ETHUSDT", "2"),
+                (VenueId::Binance, "ETHUSDC", "1"),
+                (VenueId::Okx, "ETH-USDT", "1"),
+            ],
+            checks(None, Some("0.001")),
+        );
+        f.price(0, "4000", now, wall, Duration::ZERO, None);
+        f.price(1, "4000", now, wall, Duration::ZERO, None);
+        f.price(2, "4016", now, wall, Duration::ZERO, on_time);
+        let err = f.gate.check(now, wall).unwrap_err();
+        assert_eq!(err.kind(), Some(UnusableKind::SourceDivergence), "{err}");
+    }
+
+    /// With a Binance primary the age is by arrival: frames that keep arriving with an old
+    /// price pass `max_source_age_ms` (the divergence check is what catches that), and
+    /// silence past the limit does not.
+    #[test]
+    fn max_age_with_a_binance_primary_catches_silence_only() {
+        let f = fixture(checks(Some(1_500), None));
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        f.price(0, "4000", now, wall, Duration::from_millis(100), None);
+        assert!(
+            f.gate.check(now, wall).is_ok(),
+            "arrived 100ms ago, whatever its price"
+        );
+        f.price(0, "4000", now, wall, Duration::from_millis(1_600), None);
+        let err = f.gate.check(now, wall).unwrap_err();
+        assert_eq!(err.kind(), Some(UnusableKind::SourceStale), "{err}");
+        assert!(err.to_string().contains("by arrival"), "{err}");
+    }
+
+    /// A secondary whose mid is zero is no comparison: no panic, no withdraw, and the check
+    /// says it is comparing nothing.
+    #[test]
+    fn a_secondary_with_a_zero_mid_is_not_compared() {
+        let f = fixture(checks(None, Some("0.001")));
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        f.price(0, "4000", now, wall, Duration::ZERO, None);
+        f.price(1, "0", now, wall, Duration::ZERO, Some(Duration::ZERO));
+        assert!(f.gate.check(now, wall).is_ok());
+        let pair = f.metrics.for_pair("ETH/USDT");
+        assert_eq!(pair.source_divergence_inactive.get(), 1.0);
+    }
+
+    /// The divergence check comparing nothing is a gauge, not only a log line: a stamped
+    /// secondary read as late (here a host clock 5s ahead, past the floor's cap) raises it,
+    /// and a fresh one lowers it.
+    #[test]
+    fn the_divergence_check_comparing_nothing_is_a_gauge() {
+        let f = fixture(checks(Some(1_500), Some("0.001")));
+        let pair = f.metrics.for_pair("ETH/USDT");
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        f.price(0, "4000", now, wall, Duration::ZERO, None);
+        f.price(
+            1,
+            "4016",
+            now,
+            wall,
+            Duration::ZERO,
+            Some(Duration::from_secs(4)),
+        );
+        assert!(f.gate.check(now, wall).is_ok());
+        assert_eq!(pair.source_divergence_inactive.get(), 1.0);
+        f.price(1, "4000", now, wall, Duration::ZERO, Some(Duration::ZERO));
+        assert!(f.gate.check(now, wall).is_ok());
+        assert_eq!(pair.source_divergence_inactive.get(), 0.0);
     }
 
     /// With only the divergence set, the primary is held to the 30-second rule: one that
@@ -730,12 +991,12 @@ mod tests {
     }
 
     /// The same incident on a venue whose frames carry the exchange's time, with our clock
-    /// 5s ahead of the exchange's, level, and 5s behind: on-time frames quote, a primary
+    /// 800ms ahead of the exchange's, level, and 800ms behind: on-time frames quote, a primary
     /// whose prices start arriving 30s after their stamps is stale on the first such frame,
     /// without waiting for the market to move, and quotes again when it catches up.
     #[tokio::test]
     async fn a_primary_thirty_seconds_behind_by_exchange_time_is_withdrawn_on_arrival() {
-        for skew_ms in [5_000i64, 0, -5_000] {
+        for skew_ms in [800i64, 0, -800] {
             let (binance_url, binance) = scripted_venue().await;
             let (okx_url, okx) = scripted_venue().await;
             // OKX is the primary here: it is the venue that stamps its frames.
@@ -775,9 +1036,10 @@ mod tests {
         }
     }
 
-    /// The failure the floor exists for: a host clock 5s ahead used to read every OKX price
-    /// as 5s old, so with `max_source_age_ms` set the secondary was dropped from the
-    /// divergence check and a late primary went unseen. With the floor it stays compared.
+    /// The failure the floor exists for: a host clock 800ms ahead read every OKX price as
+    /// 800ms old, so with `max_source_age_ms` under that the secondary was dropped from
+    /// the divergence check and a late primary went unseen. With the floor it stays
+    /// compared.
     #[tokio::test]
     async fn a_skewed_clock_does_not_switch_the_divergence_check_off() {
         let (binance_url, binance) = scripted_venue().await;
@@ -786,10 +1048,10 @@ mod tests {
             &binance_url,
             &okx_url,
             ("2", "1"),
-            checks(Some(1_500), Some("0.001")),
+            checks(Some(500), Some("0.001")),
         )
         .await;
-        let ahead = |ms: u64| ms - 5_000;
+        let ahead = |ms: u64| ms - 800;
         binance.send(book_ticker("4000.00")).unwrap();
         okx.send(okx_ticker("4000.00", ahead(now_ms()))).unwrap();
         let mut rx = lane.rx.clone();

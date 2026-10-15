@@ -300,9 +300,14 @@ max_deviation = "0.002"
 # weight, the first of them on a tie) is late or disagrees with the others, and quote again
 # as soon as it is neither. `max_source_age_ms` ages the primary's latest price by the
 # exchange's own timestamp where the venue sends one (okx, gate) and by its arrival
-# elsewhere (binance's bookTicker carries none); `max_source_divergence` is the furthest,
-# as a fraction, the primary's mid may sit from any other source whose own price is fresh.
-# Starting points: 1500 and 0.001 for an ETH pair; 10000 and 0.0005 for a stable pair.
+# elsewhere. Binance's bookTicker carries no timestamp, so with a Binance primary this key
+# only catches a stream gone silent; a stream that keeps delivering old prices (a backlog)
+# is caught by `max_source_divergence`, against a venue that stamps its frames (add an okx
+# or gate source: two Binance markets share the same backlog). `max_source_divergence` is
+# how far, as a fraction, the primary's mid may sit from the nearest fresh other source.
+# Starting points for an ETH pair: 1500 and 0.001. For a stable pair, whose book can sit
+# unchanged for long stretches (and the age only moves on a new price), leave
+# max_source_age_ms unset or high (10000 or more) and use 0.0005 for the divergence.
 # See "Source checks" in docs/manual.md.
 # max_source_age_ms = "1500"
 # max_source_divergence = "0.001"

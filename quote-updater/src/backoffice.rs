@@ -1260,9 +1260,10 @@ async fn edit_pair(
     let what = format!("edited pair {}", form.key_env);
     let kinds = Arc::clone(&state.kinds);
     let form = Arc::new(form);
-    let outcome = {
+    let result = {
         let (form, kinds) = (Arc::clone(&form), Arc::clone(&kinds));
-        apply(&state, peer, &what, move |config| {
+        let _guard = state.edits.lock().await;
+        change_locked(&state, peer, &what, move |config| {
             let decimals = file_price_decimals(config);
             let pair = config
                 .pairs
@@ -1280,9 +1281,16 @@ async fn edit_pair(
         })
         .await
     };
-    if outcome.ok {
-        return outcome.redirect();
-    }
+    let outcome = match result {
+        Ok(message) => return Outcome::ok(message).redirect(),
+        // Written and applied to some lanes: not a rejection, and not the form again, which
+        // would read as one. The list, saying it was saved and what the reload could not do.
+        Err(ReloadFailure::Partial(line)) => {
+            return Outcome::failed(format!("Saved; the reload applied in part: {line}"))
+                .redirect();
+        }
+        Err(ReloadFailure::Rejected(line)) => Outcome::failed(line),
+    };
     // Refused: the same form again, as it was posted and with the reason above it, so the
     // field that made it invalid (a divergence left on one venue, say) can be fixed or
     // cleared in the same form rather than lost on the way back to the list.
@@ -1794,8 +1802,8 @@ const SOURCE_FIELDS: &[Field] = &[
     Field::new(
         "max_source_divergence",
         "0.001",
-        "withdraw while the primary venue's mid is this fraction away from another fresh \
-         venue's. Needs two venues. Blank is off",
+        "withdraw while the primary venue's mid is this fraction away from every other fresh \
+         venue's (stamped venues first). Needs two venues. Blank is off",
     ),
 ];
 
@@ -3028,6 +3036,59 @@ api_key = "k"
             served.load(std::sync::atomic::Ordering::SeqCst),
             4,
             "the refused edits asked for no reload"
+        );
+    }
+
+    /// A reload that applies an edit in part is not a rejection: the file keeps the change,
+    /// so the page goes back to the list saying it was saved, not to the form as if the
+    /// edit had been refused.
+    #[tokio::test]
+    async fn an_edit_the_reload_applies_in_part_is_saved_not_refused() {
+        let (path, state, mut reloads) = config_on_disk("partial-edit");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
+        )
+        .await
+        .unwrap();
+        let _service = tokio::spawn(async move {
+            if let Some(request) = reloads.recv().await {
+                let _ = request.reply.send(Err(ReloadFailure::Partial(
+                    "1 restarted, 1 failed to start".to_owned(),
+                )));
+            }
+        });
+        let body = "key_env=UPDATER_KEY_WETH_USDC&pricing=feed&pricing_feed_delta=0.0005\
+                    &min_mid=&max_mid=&max_deviation=&max_deviation_window=\
+                    &max_deviation_window_blocks=&symbol_binance=ETHUSDC&weight_binance=\
+                    &max_source_age_ms=1500&max_source_divergence=";
+        let posted = http(
+            local,
+            &format!(
+                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(posted.starts_with("HTTP/1.1 303"), "{posted}");
+        assert!(posted.contains("location: /?err=Saved"), "{posted}");
+        assert!(
+            !posted.contains("banner-err"),
+            "not the form again: {posted}"
+        );
+        assert_eq!(
+            config::load_raw(&path).unwrap().pairs[0]
+                .max_source_age_ms
+                .as_deref(),
+            Some("1500"),
+            "the file keeps the change"
         );
     }
 

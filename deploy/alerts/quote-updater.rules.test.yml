@@ -5,7 +5,7 @@
 # of fixtures as live rules.
 #
 # Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, and to
-# PusherSourceWithdrawn (at the end). The first is a `predict_linear`, which is the only
+# PusherSourceWithdrawn and PusherSourceDivergenceInactive (at the end). The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -175,3 +175,56 @@ tests:
             exp_annotations:
               summary: "LATE: withdrawn by its source checks (source_stale) for 5 minutes"
               description: "The pair's primary source has been stale (source_stale) or away from another fresh source (source_divergence) for five minutes, so the lane has quoted nothing in that time. quote_updater_venue_source_age_ms says how far behind each venue is; the updater's stderr names the venues and numbers on every withdrawn block."
+
+  # Both reasons raise their own ticket, labelled with the reason.
+  - interval: 1m
+    name: a pair withdrawn for source_divergence raises a ticket under that reason
+    input_series:
+      - series: 'quote_updater_source_withdrawn{pair="APART",reason="source_stale"}'
+        values: "0x10"
+      - series: 'quote_updater_source_withdrawn{pair="APART",reason="source_divergence"}'
+        values: "0 1x10"
+      - series: 'quote_updater_breaker_tripped{pair="APART"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: PusherSourceWithdrawn
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: APART
+              reason: source_divergence
+            exp_annotations:
+              summary: "APART: withdrawn by its source checks (source_divergence) for 5 minutes"
+              description: "The pair's primary source has been stale (source_stale) or away from another fresh source (source_divergence) for five minutes, so the lane has quoted nothing in that time. quote_updater_venue_source_age_ms says how far behind each venue is; the updater's stderr names the venues and numbers on every withdrawn block."
+
+  # The divergence check comparing nothing for five minutes raises a ticket; a few minutes
+  # of it, or a halted lane, does not.
+  - interval: 1m
+    name: a divergence check that compares nothing for five minutes raises a ticket
+    input_series:
+      - series: 'quote_updater_source_divergence_inactive{pair="ALONE"}'
+        values: "0 1x10"
+      - series: 'quote_updater_breaker_tripped{pair="ALONE"}'
+        values: "0x10"
+      - series: 'quote_updater_source_divergence_inactive{pair="BRIEF"}'
+        values: "0 1x3 0x6"
+      - series: 'quote_updater_breaker_tripped{pair="BRIEF"}'
+        values: "0x10"
+      - series: 'quote_updater_source_divergence_inactive{pair="HALTED"}'
+        values: "0 1x10"
+      - series: 'quote_updater_breaker_tripped{pair="HALTED"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PusherSourceDivergenceInactive
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherSourceDivergenceInactive
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: ALONE
+            exp_annotations:
+              summary: "ALONE: the divergence check has compared nothing for 5 minutes"
+              description: "max_source_divergence is set but no source other than the primary has had a fresh price, so a primary running behind its exchange would not be caught by it. quote_updater_venue_source_age_ms says which venues are behind; a steady quote_updater_venue_future_stamps_total or ages near a constant point at this host's clock."

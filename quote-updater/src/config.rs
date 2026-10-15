@@ -245,7 +245,7 @@ pub struct RawPair {
     /// withdraws. See [`SourceChecks`]. Blank: no such check.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_source_age_ms: Option<String>,
-    /// How far, as a fraction, the primary source's mid may sit from any other fresh
+    /// How far, as a fraction, the primary source's mid may sit from the nearest fresh
     /// source's before the pair withdraws. See [`SourceChecks`]. Blank: no such check.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_source_divergence: Option<String>,
@@ -346,8 +346,9 @@ pub const MAX_SOURCE_AGE_MS: u64 = 30_000;
 ///   its frames carry one, else by arrival; see `feed::PriceClock`), or than
 ///   [`crate::update::MAX_PRICE_AGE`] when only the divergence is set, under the refusal
 ///   `source_stale`; or
-/// - its mid is further than `max_divergence` from the mid of any other source whose own
-///   price is fresh, under `source_divergence`.
+/// - its mid is further than `max_divergence` from every other source compared, under
+///   `source_divergence`. Compared: the other sources whose own price is fresh and, while
+///   any of those stamps its frames, only the stamped ones (`source_gate.rs`).
 ///
 /// Nothing latches: the next tick that passes both quotes again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
