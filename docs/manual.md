@@ -228,23 +228,32 @@ reload to make, unlike the circuit breaker.
   primary's mid may sit from the other sources'. Needs at least two sources. Set alone, the
   primary is held to the 30-second rule every source already has. Exactly what is
   compared:
-  - Only other sources whose own price is fresh: inside 30 seconds, and inside
-    `max_source_age_ms` when that is set.
-  - Of those, only the ones that stamp their frames, whenever at least one of them is
+  - Never a source on the *same venue* as the primary. A second market on the primary's
+    exchange shares the path to it, so it shares any backlog on that path: two Binance
+    markets behind one congested link read the same stale price and agree, which is no
+    check at all. Only a different venue is an independent cross-check.
+  - Only sources whose own price is fresh: inside 30 seconds, and inside
+    `max_source_age_ms` when that is set. A *stamped* source (OKX, Gate) is also held to
+    its exchange-time age even when `max_source_age_ms` is unset — to 30 seconds — so a
+    backlogged stamped secondary is dropped rather than used to withdraw a healthy primary.
+  - Of the fresh ones, only those that stamp their frames, whenever at least one such is
     fresh. A source without stamps is fresh by arrival, which a backlog does not change, so
     it is not trusted to withdraw the pair while a stamped source can speak instead. When
     no stamped source is fresh (or none is configured), the unstamped ones are compared,
-    because they are then the only check there is, and a backlog on one of them can then
-    withdraw a healthy pair. Pair a Binance primary with an OKX or Gate source.
+    because they are then the only check there is. Pair a Binance primary with an OKX or
+    Gate source.
   - The pair withdraws when the primary is further than the limit from every source
     compared: the nearest one decides. With one other source, that source decides, and a
     single bad tick from it withdraws the pair for that tick. With two or more, one source
     off on its own does not.
-  - While nothing is compared (no other source fresh, or only ones whose mid is zero), the
-    check withdraws nothing, and only the age check (if set) still guards the primary.
-    `quote_updater_source_divergence_inactive{pair}` reads 1 in that state, the
-    `PusherSourceDivergenceInactive` alert raises a ticket after five minutes of it, and
-    the updater logs a line when the check stops and starts comparing.
+  - The check only sees a *correlated* backlog — one across every live source at once — if
+    an independent, exchange-stamped clock is in play: the primary's own, or a compared
+    secondary's. When none is (an unstamped primary whose only live cross-checks are on its
+    own venue, or unstamped, or stale), it cannot, and `quote_updater_source_divergence_inactive{pair}`
+    reads 1, the `PusherSourceDivergenceInactive` alert raises a ticket after five minutes,
+    and the updater logs a line when the check stops and starts comparing. The same gauge
+    reads 1 when nothing at all is compared (no other source fresh, or only ones whose mid
+    is zero). This is the case to pair a stamped venue against an unstamped primary for.
 
 There is no hysteresis: a tick that fails withdraws, and the next tick that passes quotes
 again. That is a choice. A cancel costs an empty-tx update at the builders, and a persistence
@@ -268,7 +277,10 @@ Starting values: on an ETH pair, `max_source_age_ms = "1500"` and
 `max_source_divergence = "0.001"`. On a stable pair, `max_source_divergence = "0.0005"`,
 and either leave `max_source_age_ms` unset or set it high (10000 or more): the age moves
 only on a new price, and a stable book can sit unchanged for long stretches, which a tight
-limit would read as a dead feed. The divergence limit has to sit above the ordinary
+limit would read as a dead feed. With `max_source_age_ms` unset the divergence check still
+prefers stamped secondaries and still drops a backlogged stamped one, so a stable pair
+configured with divergence alone is guarded the same way — give it at least one stamped
+cross-check on a different venue. The divergence limit has to sit above the ordinary
 dispersion between the venues (and between USDT and USDC books, if the sources mix them).
 Enable on one pair first and watch `quote_updater_venue_source_age_ms` and
 `quote_updater_source_withdrawn` for a few days before widening.

@@ -107,24 +107,70 @@ pub(crate) const FUTURE_STAMP_MS: i64 = 2_000;
 /// floor, measured on the old wall clock, is dropped.
 const CLOCK_STEP_MS: i64 = 1_000;
 
-/// The least lag a venue's stamped frames have arrived with over [`LAG_FLOOR_WINDOW`], at
+/// The baseline lag a venue's stamped frames arrive with over [`LAG_FLOOR_WINDOW`], at
 /// most [`LAG_FLOOR_MAX_MS`], and each new frame's lag over it.
 ///
 /// `arrival wall clock - exchange stamp` is not a frame's lateness alone: it also carries
 /// our clock's offset from the exchange's and the network's ordinary latency. Subtracting
-/// the least lag seen lately takes those out, up to [`LAG_FLOOR_MAX_MS`]: a clock a few
+/// the baseline seen lately takes those out, up to [`LAG_FLOOR_MAX_MS`]: a clock a few
 /// hundred milliseconds off does not age every OKX price by that much, while a backlog of
 /// seconds, however long it lasts and whenever the feed was dialled, is always counted. A
 /// host clock more than that ahead of the exchange's makes the venue's prices read late,
 /// which fails closed: a primary withdraws, and a secondary drops out of the divergence
 /// check, which says so (`quote_updater_source_divergence_inactive`).
+///
+/// The baseline is robust to a single bad frame: a lag is used only once two frames in some
+/// minute have reached it (the bucket's *second*-smallest), and the baseline is the least
+/// such value across the window's minutes. One frame stamped a second or two into the
+/// future — the kind a fitful exchange clock emits — would otherwise set the baseline that
+/// far below zero and make every ordinary frame read a second or two late for the whole
+/// window; now it does not, because no other frame joins it.
 #[derive(Debug, Default)]
 pub(crate) struct LagFloor {
-    /// `(bucket start, least lag in it in ms)`, oldest first.
-    buckets: std::collections::VecDeque<(Instant, i64)>,
+    /// Each minute's two smallest lags and how many frames it saw, oldest first; see
+    /// [`Bucket`]. A minute with one frame establishes no baseline.
+    buckets: std::collections::VecDeque<Bucket>,
     /// The monotonic instant the wall clock is read against, and `wall - monotonic` at the
     /// last frame, in ms: how a step of the wall clock is seen.
     anchor: Option<(Instant, i64)>,
+}
+
+/// One minute of frames: when it began, its two smallest lags, and how many it saw. Its
+/// baseline is the second-smallest once it has two frames, so one outlier frame does not
+/// set it.
+#[derive(Debug)]
+struct Bucket {
+    start: Instant,
+    min1: i64,
+    min2: i64,
+    count: u32,
+}
+
+impl Bucket {
+    fn new(start: Instant, raw: i64) -> Self {
+        Self {
+            start,
+            min1: raw,
+            min2: i64::MAX,
+            count: 1,
+        }
+    }
+
+    fn observe(&mut self, raw: i64) {
+        if raw <= self.min1 {
+            self.min2 = self.min1;
+            self.min1 = raw;
+        } else if raw < self.min2 {
+            self.min2 = raw;
+        }
+        self.count += 1;
+    }
+
+    /// The baseline this minute vouches for: its second-smallest lag, once two frames have
+    /// reached it. `None` for a minute of one frame, which establishes nothing.
+    fn baseline(&self) -> Option<i64> {
+        (self.count >= 2).then_some(self.min2)
+    }
 }
 
 /// One frame's reading by [`LagFloor::lag`].
@@ -158,25 +204,26 @@ impl LagFloor {
         let future = raw < -FUTURE_STAMP_MS;
         if !future {
             match self.buckets.back_mut() {
-                Some((start, least))
-                    if now.saturating_duration_since(*start) < LAG_FLOOR_BUCKET =>
-                {
-                    *least = (*least).min(raw);
+                Some(bucket) if now.saturating_duration_since(bucket.start) < LAG_FLOOR_BUCKET => {
+                    bucket.observe(raw);
                 }
-                _ => self.buckets.push_back((now, raw)),
+                _ => self.buckets.push_back(Bucket::new(now, raw)),
             }
         }
         while self
             .buckets
             .front()
-            .is_some_and(|(start, _)| now.saturating_duration_since(*start) >= LAG_FLOOR_WINDOW)
+            .is_some_and(|b| now.saturating_duration_since(b.start) >= LAG_FLOOR_WINDOW)
         {
             self.buckets.pop_front();
         }
+        // The least baseline any minute vouches for (a minute of one frame vouches for
+        // none), so the floor is backed by at least two frames. `0` until some minute has
+        // two: no baseline is subtracted, which reads a frame at most its true lateness.
         let floor = self
             .buckets
             .iter()
-            .map(|(_, least)| *least)
+            .filter_map(Bucket::baseline)
             .min()
             .map_or(0, |least| least.min(LAG_FLOOR_MAX_MS));
         Lag {
