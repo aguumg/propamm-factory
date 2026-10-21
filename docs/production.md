@@ -83,6 +83,10 @@ Edit the three files:
 
 - `.env`, one line per variable:
   - `RPC_URL`: the Ethereum RPC the updater reads the chain through.
+  - `RPC_WS_URL`: the same node's WebSocket endpoint (`wss://…`), so it pushes each new
+    block to the updater instead of being polled for it four times a second. Optional but
+    worth setting: the run confirms it with `[head] subscribed to new heads at <host>`, and
+    falls back to polling whenever the socket is down.
   - `UPDATER_KEY_<PAIR>`: the private key of each wallet from step 2, one variable per pair.
     The name is yours to pick; the pair's config refers to it by that name (`key_env`).
     For example `UPDATER_KEY_WETH_USDC=0x...` and `UPDATER_KEY_USDC_USDT=0x...`.

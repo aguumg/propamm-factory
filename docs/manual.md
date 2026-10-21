@@ -669,6 +669,9 @@ variable exists so a flag-driven run stays possible, and setting one overrides t
   network. Builder mode rules out `MINE` and `NO_PIN`, which are anvil-only.
 - `RPC_URL` — reads only, but on the hot loop (latest block, pending nonce): each requote
   has a ~50ms budget, so endpoint latency shows up directly.
+- `RPC_WS_URL` — a WebSocket endpoint of the same node, for the `newHeads` subscription
+  described under builder mode above; builder mode only. Unset, the head is polled over
+  `RPC_URL`; set, each new block is pushed and the poll drops to a slow liveness check.
 - `BUILDERS` — a separate TOML file to read the `[[builder]]` entries from instead of the
   config file. An override, not an addition: given it, the config file's own list is
   ignored entirely.

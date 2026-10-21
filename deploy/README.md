@@ -20,7 +20,7 @@ rm -f .env config/config.toml alertmanager/slack-webhook
 cp .env.example .env
 cp config.example.toml config/config.toml
 cp alertmanager/slack-webhook.example alertmanager/slack-webhook
-$EDITOR .env                        # RPC_URL, one UPDATER_KEY_* per pair, the passwords, the bind addresses
+$EDITOR .env                        # RPC_URL, RPC_WS_URL, one UPDATER_KEY_* per pair, the passwords, the bind addresses
 $EDITOR config/config.toml          # target, builders, pairs
 $EDITOR alertmanager/slack-webhook  # the Slack incoming-webhook URL, one line
 docker compose build
@@ -33,6 +33,15 @@ docker compose logs -f updater
 the target and how much ETH it has, and the price it would publish. It exits 1 on anything
 the run would refuse, and prints the exact `addUpdater` calls for a key the target does not
 know. Run it after every edit to `config.toml` too.
+
+`RPC_WS_URL` is the same node's WebSocket endpoint (`wss://…`). Without it the updater
+polls the chain head over `RPC_URL` four times a second and fetches each new block; with
+it the node pushes every new block's header the moment it has it, the poll drops to one
+liveness check every 3 seconds, and the pairs roll to the next block sooner. There is no
+mode to switch: polling covers any spell the subscription is down. `--check` refuses a
+URL that is not `ws://` or `wss://` but does not dial it; only a run does, and confirms
+it with `[head] subscribed to new heads at <host>`. One that does not answer is logged
+once per distinct error while polling carries the head.
 
 ## What is where
 
@@ -55,15 +64,16 @@ reachable from the host only, or through an ssh tunnel.
 docker compose logs -f updater                 # the run
 docker compose run --rm updater --check        # after editing config/config.toml by hand
 docker compose kill -s HUP updater             # reload the config without a restart
-docker compose restart updater                 # after adding a key to .env (read once, at start)
+docker compose up -d updater                   # after editing .env (keys, RPC_WS_URL); restart would not
 docker compose pull && docker compose up -d    # newer Prometheus, Alertmanager, Grafana, Postgres
 docker compose build updater && docker compose up -d updater   # a new build of the updater
 ```
 
 A reload (`SIGHUP`, or any save in the backoffice) re-reads `config.toml` and changes only
-the pairs and builders that changed; `target` and `[settings]` are read once at startup, as
-is `.env`. [docs/manual.md](../docs/manual.md) covers the config file, the reload, the
-backoffice, the breaker, the metrics and the recorder.
+the pairs and builders that changed; `target` and `[settings]` are read once at startup,
+and `.env` only when the container is created (`docker compose up -d`, not `restart`).
+[docs/manual.md](../docs/manual.md) covers the config file, the reload, the backoffice, the
+breaker, the metrics and the recorder.
 
 ## Your own pricing models
 

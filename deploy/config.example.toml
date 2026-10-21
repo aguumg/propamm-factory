@@ -7,7 +7,8 @@ target = "0x0000000000000000000000000000000000000000"
 
 [settings]
 mode = "builder"
-# rpc_url is RPC_URL in deploy/.env (it beats this file).
+# rpc_url is RPC_URL in deploy/.env, and rpc_ws_url — the newHeads subscription, see
+# deploy/README.md — is RPC_WS_URL there; both beat this file.
 requote_ms = 50
 # Inside the container, on every interface of it: only the compose network reaches it, and
 # Prometheus scrapes it there. Not published on the host.

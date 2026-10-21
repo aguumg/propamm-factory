@@ -16,7 +16,8 @@ services:
     image: propamm/quote-updater:local
     container_name: propamm-updater
     # Every variable in deploy/.env reaches the process: the UPDATER_KEY_* the config names,
-    # RPC_URL (an environment variable beats the file's [settings]), and compose's own.
+    # RPC_URL and RPC_WS_URL (an environment variable beats the file's [settings]), and
+    # compose's own.
     env_file: .env
     environment:
       CONFIG: /config/config.toml
