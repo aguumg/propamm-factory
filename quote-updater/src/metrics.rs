@@ -268,6 +268,9 @@ pub struct Metrics {
     venue_feed_sample_current: GaugeVec,
     venue_feed_mid: GaugeVec,
     venue_feed_delta: GaugeVec,
+    venue_source_lag_ms: GaugeVec,
+    venue_late: GaugeVec,
+    venue_future_stamps: IntCounterVec,
     price_unusable: IntCounterVec,
     diagnostic: GaugeVec,
     trip_source: GaugeVec,
@@ -326,7 +329,7 @@ pub struct PairMetrics {
     pub feed_delta: Gauge,
     pub feed_sources_fresh: Gauge,
     pub feed_sources_min: Gauge,
-    price_unusable: [IntCounter; 5],
+    price_unusable: [IntCounter; UnusableKind::ALL.len()],
     publish_decisions: [IntCounter; 4],
     pub published_mid: Gauge,
     pub published_delta: Gauge,
@@ -363,6 +366,14 @@ pub struct VenueMetrics {
     pub sample_current: Gauge,
     pub mid: Gauge,
     pub delta: Gauge,
+    /// `quote_updater_venue_source_lag_ms`: written at scrape time from the feed's own
+    /// reading (see `Metrics::render`), and by `quiesce`.
+    pub source_lag_ms: Gauge,
+    /// 1 while the composite leaves this venue out of its pair's average for arriving
+    /// later than `max_source_lag_ms` behind its exchange stamp.
+    pub late: Gauge,
+    /// Frames whose exchange stamp was too far ahead of their arrival to read a lag from.
+    pub future_stamps: IntCounter,
 }
 
 impl VenueMetrics {
@@ -378,6 +389,8 @@ impl VenueMetrics {
             &self.sample_current,
             &self.mid,
             &self.delta,
+            &self.source_lag_ms,
+            &self.late,
         ] {
             gauge.set(f64::NAN);
         }
@@ -594,6 +607,28 @@ impl Metrics {
                 &r,
                 "quote_updater_venue_feed_delta",
                 "Latest half-spread observed at this venue.",
+                pv,
+            )?,
+            venue_source_lag_ms: gauge(
+                &r,
+                "quote_updater_venue_source_lag_ms",
+                "How late this venue's latest price arrived behind the exchange's own \
+                 timestamp, over the venue's usual lag, in milliseconds. NaN for a venue \
+                 whose frames carry no timestamp.",
+                pv,
+            )?,
+            venue_late: gauge(
+                &r,
+                "quote_updater_venue_late",
+                "1 while this venue is left out of its pair's average for arriving later \
+                 than max_source_lag_ms behind its exchange timestamp.",
+                pv,
+            )?,
+            venue_future_stamps: counter(
+                &r,
+                "quote_updater_venue_future_stamps_total",
+                "Frames whose exchange timestamp was more than 2s ahead of their arrival, left \
+                 out of the venue's usual lag: this host's clock or the venue's is off.",
                 pv,
             )?,
             price_unusable: counter(
@@ -1044,6 +1079,9 @@ impl Metrics {
             sample_current: self.venue_feed_sample_current.with_label_values(pv),
             mid: self.venue_feed_mid.with_label_values(pv),
             delta: self.venue_feed_delta.with_label_values(pv),
+            source_lag_ms: self.venue_source_lag_ms.with_label_values(pv),
+            late: self.venue_late.with_label_values(pv),
+            future_stamps: self.venue_future_stamps.with_label_values(pv),
         }
     }
 
@@ -1070,7 +1108,8 @@ impl Metrics {
     /// The Prometheus text exposition of everything registered right now.
     pub fn render(&self) -> Result<String> {
         // Each watched venue's `up` is what its feed task holds right now, read here, when
-        // Prometheus asks, rather than whatever was last written.
+        // Prometheus asks, rather than whatever was last written; the lateness of its last
+        // price too, from the same place.
         for ((pair, venue), connected) in self
             .venue_connections
             .lock()
@@ -1080,6 +1119,9 @@ impl Metrics {
             self.venue_feed_up
                 .with_label_values(&[pair, venue])
                 .set(connected.gauge_value());
+            self.venue_source_lag_ms
+                .with_label_values(&[pair, venue])
+                .set(connected.source_lag_ms());
         }
         Ok(TextEncoder::new().encode_to_string(&self.registry.gather())?)
     }

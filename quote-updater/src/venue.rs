@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use eyre::{Result, eyre};
 
@@ -36,6 +36,13 @@ pub enum VenueId {
 }
 
 impl VenueId {
+    /// Whether this venue's frames carry the exchange's own time for the price, so its age
+    /// lateness can be judged by that clock (`max_source_lag_ms`). Binance's spot bookTicker carries
+    /// none, and MEXC is polled over REST, whose body carries none.
+    pub fn stamps_frames(self) -> bool {
+        !matches!(self, VenueId::Binance | VenueId::Mexc)
+    }
+
     /// Every venue the binary knows, in the order the backoffice lists them.
     pub const ALL: &'static [VenueId] = &[
         VenueId::Binance,
@@ -116,6 +123,28 @@ impl VenueId {
             VenueId::Bitget => bitget::parse(text),
             VenueId::Gate => gate::parse(text),
             VenueId::Mexc => mexc::parse(text),
+        }
+    }
+
+    /// [`Self::parse`], plus the exchange's own time for the price when the frame carries
+    /// one: Kraken's `timestamp` and Coinbase's `time` (RFC 3339), OKX's `ts`, Bybit's `ts`,
+    /// KuCoin's `time`, Bitget's `ts` and Gate's `t` (epoch milliseconds), and Binance's `E`
+    /// on a stream that sends it (its spot bookTicker does not). `None` where there is none,
+    /// and for MEXC, which is polled: those prices are aged by when they arrived. Kept
+    /// beside `parse` rather than replacing it so a venue that carries no time needs
+    /// nothing new.
+    pub fn parse_stamped(self, text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
+        match self {
+            VenueId::Binance => binance::parse_stamped(text),
+            VenueId::Coinbase => coinbase::parse_stamped(text),
+            VenueId::Kraken => kraken::parse_stamped(text),
+            VenueId::Okx => okx::parse_stamped(text),
+            VenueId::Bybit => bybit::parse_stamped(text),
+            VenueId::Kucoin => kucoin::parse_stamped(text),
+            VenueId::Bitget => bitget::parse_stamped(text),
+            VenueId::Gate => gate::parse_stamped(text),
+            // Polled over REST, whose body carries no time: aged by the fetch.
+            VenueId::Mexc => Ok(self.parse(text)?.map(|quote| (quote, None))),
         }
     }
 

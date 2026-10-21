@@ -2,12 +2,14 @@
 //! `ping`, answered with the literal `pong`, and OKX drops a socket silent for 30s, which
 //! the feed loop's probe interval stays well inside. Markets are `ETH-USDC`.
 
+use std::time::SystemTime;
+
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::unwrap_alias;
+use crate::venues::{epoch_ms, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://ws.okx.com:8443/ws/v5/public";
 
@@ -38,9 +40,17 @@ struct Ticker {
     bid: String,
     #[serde(rename = "askPx")]
     ask: String,
+    /// When OKX generated the ticker, in milliseconds, as a decimal string.
+    ts: Option<String>,
 }
 
 pub fn parse(text: &str) -> Result<Option<Quote>> {
+    Ok(parse_stamped(text)?.map(|(quote, _)| quote))
+}
+
+/// [`parse`], with the ticker's `ts`. A `ts` that is not a number is read as absent rather
+/// than refusing the price: the price is what the frame is for.
+pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     if text == "pong" {
         return Ok(None);
     }
@@ -50,10 +60,16 @@ pub fn parse(text: &str) -> Result<Option<Quote>> {
         Some("error") => Err(eyre!("okx error: {}", frame.msg.unwrap_or_default())),
         Some(_) => Ok(None),
         None => match frame.data.and_then(|mut data| data.pop()) {
-            Some(ticker) => Ok(Some(Quote::Book {
-                bid: ticker.bid,
-                ask: ticker.ask,
-            })),
+            Some(ticker) => Ok(Some((
+                Quote::Book {
+                    bid: ticker.bid,
+                    ask: ticker.ask,
+                },
+                ticker
+                    .ts
+                    .and_then(|ts| ts.parse::<u64>().ok())
+                    .map(epoch_ms),
+            ))),
             None => Err(eyre!("okx frame with neither event nor data")),
         },
     }
@@ -106,5 +122,16 @@ mod tests {
                 .contains("doesn't exist")
         );
         assert!(parse("{}").is_err());
+    }
+
+    #[test]
+    fn a_ticker_push_is_stamped_with_its_ts() {
+        let push = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"4000.01","bidPx":"4000.00","ts":"1597026383085"}]}"#;
+        assert_eq!(
+            parse_stamped(push).unwrap().unwrap().1,
+            Some(epoch_ms(1_597_026_383_085))
+        );
+        let unstamped = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"4000.01","bidPx":"4000.00"}]}"#;
+        assert_eq!(parse_stamped(unstamped).unwrap().unwrap().1, None);
     }
 }

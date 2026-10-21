@@ -4,12 +4,14 @@
 //! Then the `/market/ticker:<symbol>` topic, one frame per best bid/ask change, and a
 //! JSON ping. Markets are `ETH-USDC`.
 
+use std::time::SystemTime;
+
 use eyre::{Result, WrapErr, eyre};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::unwrap_alias;
+use crate::venues::{epoch_ms_value, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.kucoin.com";
 
@@ -90,9 +92,17 @@ struct Ticker {
     bid: String,
     #[serde(rename = "bestAsk")]
     ask: String,
+    /// When the exchange made the ticker, milliseconds since the epoch.
+    time: Option<serde_json::Value>,
 }
 
 pub fn parse(text: &str) -> Result<Option<Quote>> {
+    Ok(parse_stamped(text)?.map(|(quote, _)| quote))
+}
+
+/// [`parse`], with the ticker's `time`. One that is not a millisecond stamp is taken as
+/// absent rather than refusing the price: the price is what the frame is for.
+pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     let frame: Frame =
         serde_json::from_str(text).map_err(|err| eyre!(err).wrap_err("not a kucoin frame"))?;
     match frame.kind.as_str() {
@@ -100,10 +110,13 @@ pub fn parse(text: &str) -> Result<Option<Quote>> {
             let ticker = frame
                 .data
                 .ok_or_else(|| eyre!("kucoin message without ticker data"))?;
-            Ok(Some(Quote::Book {
-                bid: ticker.bid,
-                ask: ticker.ask,
-            }))
+            Ok(Some((
+                Quote::Book {
+                    bid: ticker.bid,
+                    ask: ticker.ask,
+                },
+                ticker.time.as_ref().and_then(epoch_ms_value),
+            )))
         }
         "error" => Err(eyre!("kucoin error: {text}")),
         // welcome, ack, pong.
@@ -164,5 +177,16 @@ mod tests {
         assert_eq!(url, "wss://ws-api-spot.kucoin.com/?token=tok123");
         let sub: serde_json::Value = serde_json::from_str(&subscribe.unwrap()).unwrap();
         assert_eq!(sub["topic"], "/market/ticker:ETH-USDC");
+    }
+
+    #[test]
+    fn a_ticker_is_stamped_with_its_time() {
+        let push = r#"{"type":"message","topic":"/market/ticker:BTC-USDT","subject":"trade.ticker","data":{"bestAsk":"0.08","bestBid":"0.049","time":1704873323416}}"#;
+        assert_eq!(
+            parse_stamped(push).unwrap().unwrap().1,
+            Some(crate::venues::epoch_ms(1_704_873_323_416))
+        );
+        let unstamped = r#"{"type":"message","topic":"/market/ticker:BTC-USDT","subject":"trade.ticker","data":{"bestAsk":"0.08","bestBid":"0.049"}}"#;
+        assert_eq!(parse_stamped(unstamped).unwrap().unwrap().1, None);
     }
 }

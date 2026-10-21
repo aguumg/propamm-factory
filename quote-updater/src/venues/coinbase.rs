@@ -2,12 +2,14 @@
 //! plus the `heartbeat` channel so a quiet market still shows the socket is alive. No
 //! authentication for either. Markets are `ETH-USD`.
 
+use std::time::SystemTime;
+
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::unwrap_alias;
+use crate::venues::{rfc3339_utc, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://ws-feed.exchange.coinbase.com";
 
@@ -33,14 +35,25 @@ struct Frame {
     best_bid: Option<String>,
     best_ask: Option<String>,
     message: Option<String>,
+    /// When the exchange made the ticker, RFC 3339 (`2022-10-19T23:28:22.061769Z`).
+    time: Option<String>,
 }
 
 pub fn parse(text: &str) -> Result<Option<Quote>> {
+    Ok(parse_stamped(text)?.map(|(quote, _)| quote))
+}
+
+/// [`parse`], with the ticker's `time`. One that does not read as RFC 3339 is taken as
+/// absent rather than refusing the price: the price is what the frame is for.
+pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     let frame: Frame =
         serde_json::from_str(text).map_err(|err| eyre!(err).wrap_err("not a coinbase frame"))?;
     match frame.kind.as_str() {
         "ticker" => match (frame.best_bid, frame.best_ask) {
-            (Some(bid), Some(ask)) => Ok(Some(Quote::Book { bid, ask })),
+            (Some(bid), Some(ask)) => Ok(Some((
+                Quote::Book { bid, ask },
+                frame.time.as_deref().and_then(rfc3339_utc),
+            ))),
             _ => Err(eyre!("ticker without best_bid/best_ask")),
         },
         "error" => Err(eyre!(
@@ -96,5 +109,17 @@ mod tests {
                 .contains("Failed to subscribe")
         );
         assert!(parse("nope").is_err());
+    }
+
+    #[test]
+    fn a_ticker_is_stamped_with_its_time() {
+        let push = r#"{"type":"ticker","product_id":"ETH-USD","best_bid":"1285.04","best_ask":"1285.27","time":"2022-10-19T23:28:22.061769Z"}"#;
+        assert_eq!(
+            parse_stamped(push).unwrap().unwrap().1,
+            rfc3339_utc("2022-10-19T23:28:22.061769Z")
+        );
+        let unstamped =
+            r#"{"type":"ticker","product_id":"ETH-USD","best_bid":"1285.04","best_ask":"1285.27"}"#;
+        assert_eq!(parse_stamped(unstamped).unwrap().unwrap().1, None);
     }
 }

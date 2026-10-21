@@ -158,6 +158,13 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
     let mut composite = Composite {
         sources: feeds.sources.clone(),
         min_sources: feeds.min_sources,
+        max_lag: feeds.checks.max_lag,
+        connected: venues.iter().map(|v| v.connected.clone()).collect(),
+        venue_metrics: venues
+            .iter()
+            .map(|v| Gated::new(v.metrics.clone(), adopted.clone()))
+            .collect(),
+        late: vec![false; feeds.sources.len()],
         latest: vec![None; feeds.sources.len()],
         decimals,
         invert,
@@ -196,6 +203,7 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
                         changed = changes.recv() => {
                             let Some((i, sample)) = changed else { break };
                             composite.latest[i] = sample;
+                            composite.judge_lateness(i);
                             composite.recompute(&tx);
                         }
                         _ = audit.tick() => composite.audit_freshness(),
@@ -242,6 +250,17 @@ pub async fn connect(feeds: &Feeds, params: Params<'_>) -> Result<Spawned> {
 struct Composite {
     sources: Vec<Source>,
     min_sources: usize,
+    /// `max_source_lag_ms`: how late a venue's price may arrive behind its exchange stamp
+    /// and still count as fresh. `None` leaves every venue judged by silence alone.
+    max_lag: Option<Duration>,
+    /// Each source's feed flag, where the feed task leaves how late its last price was.
+    connected: Vec<feed::Connected>,
+    /// Each source's series, for `late`.
+    venue_metrics: Vec<Gated<VenueMetrics>>,
+    /// Whether each source's latest price arrived later than `max_lag`, judged when that
+    /// price arrived ([`Self::judge_lateness`]), so a stale reading cannot flip between
+    /// frames. Always `false` without `max_lag` and for a venue whose frames carry no stamp.
+    late: Vec<bool>,
     latest: Vec<Option<PriceSample>>,
     decimals: u32,
     invert: bool,
@@ -295,16 +314,46 @@ impl Composite {
     fn trip(&self, source: &'static str, cause: Cause, reason: TripReason) {
         self.latch.trip(source, cause, reason);
     }
-    /// The sources whose latest sample is fresh at `(now, wall)`, with the gauges that
-    /// describe the count written.
+    /// Whether source `i`'s price, which just arrived, came later than `max_lag` behind
+    /// its exchange stamp, and the venue's `late` gauge. A venue late on one frame stays
+    /// out until a prompt frame arrives: a backlog delivers old frames one after another,
+    /// each late, and the first frame that is not is the one that says the queue drained.
+    fn judge_lateness(&mut self, i: usize) {
+        let late = match (self.max_lag, self.connected[i].price_lag()) {
+            (Some(limit), Some(feed::PriceLag::Stamped(lag))) => lag > limit,
+            _ => false,
+        };
+        if late != self.late[i] {
+            let venue = self.sources[i].venue;
+            if late {
+                tracing::warn!(
+                    "[{}] {venue} is delivering prices late behind its own timestamps; left \
+                     out of the average until a prompt one arrives",
+                    self.label
+                );
+            } else {
+                tracing::info!(
+                    "[{}] {venue} is delivering prices on time again",
+                    self.label
+                );
+            }
+        }
+        self.late[i] = late;
+        self.venue_metrics[i].record(|m| m.late.set(if late { 1.0 } else { 0.0 }));
+    }
+
+    /// The sources whose latest sample is fresh at `(now, wall)`: delivered within
+    /// [`MAX_PRICE_AGE`] and, under `max_lag`, not late behind its stamp. With the gauges
+    /// that describe the count written.
     fn fresh_sources(&self, now: Instant, wall: SystemTime) -> Vec<(&Source, PriceSample)> {
         let fresh: Vec<(&Source, PriceSample)> = self
             .sources
             .iter()
             .zip(&self.latest)
-            .filter_map(|(source, sample)| {
+            .zip(&self.late)
+            .filter_map(|((source, sample), late)| {
                 sample
-                    .filter(|s| s.age_at(now, wall) <= MAX_PRICE_AGE)
+                    .filter(|s| !late && s.age_at(now, wall) <= MAX_PRICE_AGE)
                     .map(|s| (source, s))
             })
             .collect();
@@ -609,6 +658,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -683,6 +733,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -747,6 +798,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -799,6 +851,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -853,6 +906,7 @@ mod tests {
         let feeds = Feeds {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -905,6 +959,7 @@ mod tests {
                 source(VenueId::Binance, "silent", "1"),
             ],
             min_sources: 2,
+            checks: Default::default(),
         };
         let mut spawned = spawn(
             &feeds,
@@ -948,6 +1003,7 @@ mod tests {
                 source(VenueId::Binance, "silent", "1"),
             ],
             min_sources: 2,
+            checks: Default::default(),
         };
         let spawned = spawn(
             &feeds,
@@ -1025,5 +1081,144 @@ mod tests {
             }
         });
         format!("ws://{addr}")
+    }
+
+    /// A venue delivering prices late behind its own timestamps is left out of the average
+    /// under `max_source_lag_ms`, as a silent one is, and `quote_updater_venue_late` says
+    /// so, until a prompt frame arrives. Through real sockets: two scripted venues, OKX
+    /// stamping its frames and Binance not.
+    #[tokio::test]
+    async fn a_venue_late_behind_its_stamps_is_left_out_until_a_prompt_frame() {
+        let (binance_url, binance) = scripted_venue().await;
+        let (okx_url, okx) = scripted_venue().await;
+        let table = std::collections::BTreeMap::from([
+            ("binance".to_owned(), binance_url),
+            ("okx".to_owned(), okx_url),
+        ]);
+        let endpoints = Endpoints::resolve(None, &table).unwrap();
+        let metrics = Metrics::new().unwrap();
+        let feeds = Feeds {
+            sources: vec![
+                source(VenueId::Binance, "ETHUSDT", "1"),
+                source(VenueId::Okx, "ETH-USDT", "1"),
+            ],
+            min_sources: 1,
+            checks: crate::config::SourceChecks {
+                max_lag: Some(Duration::from_millis(1_500)),
+            },
+        };
+        let mut spawned = spawn(
+            &feeds,
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        let mid_of = |px: u64| U256::from(px * 100_000_000);
+        let wait_for = |rx: &mut watch::Receiver<Option<PriceSample>>, mid: U256| {
+            let mut rx = rx.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    rx.wait_for(move |s| matches!(s, Some(p) if p.mid == mid)),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("no composite at {mid}"))
+                .unwrap();
+            }
+        };
+        let okx_late = metrics.for_venue("TEST", "okx").late.clone();
+
+        // Both venues on time: averaged, OKX not late.
+        binance.send(book_ticker("4000.00")).unwrap();
+        okx.send(okx_ticker("4100.00", now_ms())).unwrap();
+        wait_for(&mut spawned.rx, mid_of(4050)).await;
+        assert_eq!(okx_late.get(), 0.0);
+
+        // OKX's next frame was made 30s ago: it is behind, and drops out of the average.
+        okx.send(okx_ticker("4100.00", now_ms() - 30_000)).unwrap();
+        wait_for(&mut spawned.rx, mid_of(4000)).await;
+        assert_eq!(okx_late.get(), 1.0);
+        assert_eq!(metrics.for_pair("TEST").feed_sources_fresh.get(), 1.0);
+
+        // A prompt frame brings it back.
+        okx.send(okx_ticker("4200.00", now_ms())).unwrap();
+        wait_for(&mut spawned.rx, mid_of(4100)).await;
+        assert_eq!(okx_late.get(), 0.0);
+        assert_eq!(metrics.for_pair("TEST").feed_sources_fresh.get(), 2.0);
+    }
+
+    /// Without the key the same late frame is averaged as it always was.
+    #[tokio::test]
+    async fn without_the_key_a_late_frame_is_averaged_as_before() {
+        let (binance_url, binance) = scripted_venue().await;
+        let (okx_url, okx) = scripted_venue().await;
+        let table = std::collections::BTreeMap::from([
+            ("binance".to_owned(), binance_url),
+            ("okx".to_owned(), okx_url),
+        ]);
+        let endpoints = Endpoints::resolve(None, &table).unwrap();
+        let metrics = Metrics::new().unwrap();
+        let feeds = Feeds {
+            sources: vec![
+                source(VenueId::Binance, "ETHUSDT", "1"),
+                source(VenueId::Okx, "ETH-USDT", "1"),
+            ],
+            min_sources: 1,
+            checks: Default::default(),
+        };
+        let mut spawned = spawn(
+            &feeds,
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        binance.send(book_ticker("4000.00")).unwrap();
+        okx.send(okx_ticker("4100.00", now_ms() - 30_000)).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            spawned
+                .rx
+                .wait_for(|s| matches!(s, Some(p) if p.mid == U256::from(405_000_000_000u64))),
+        )
+        .await
+        .expect("the late frame is averaged in")
+        .unwrap();
+        assert_eq!(metrics.for_venue("TEST", "okx").late.get(), 0.0);
+    }
+
+    /// A websocket venue that sends exactly the frames it is handed, as text.
+    async fn scripted_venue() -> (String, tokio::sync::mpsc::UnboundedSender<String>) {
+        use futures_util::SinkExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut frames) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            while let Some(frame) = frames.recv().await {
+                let frame = tokio_tungstenite::tungstenite::Message::text(frame);
+                if ws.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (format!("ws://{addr}"), tx)
+    }
+
+    fn book_ticker(px: &str) -> String {
+        format!(r#"{{"u":1,"s":"ETHUSDT","b":"{px}","B":"1","a":"{px}","A":"1"}}"#)
+    }
+
+    fn okx_ticker(px: &str, ts_ms: u64) -> String {
+        format!(
+            r#"{{"arg":{{"channel":"tickers","instId":"ETH-USDT"}},"data":[{{"instId":"ETH-USDT","bidPx":"{px}","askPx":"{px}","ts":"{ts_ms}"}}]}}"#
+        )
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 }

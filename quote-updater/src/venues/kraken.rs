@@ -2,12 +2,14 @@
 //! as JSON numbers rather than strings. Heartbeats arrive every second on their own
 //! channel and the application-level ping is a JSON method. Markets are `ETH/USD`.
 
+use std::time::SystemTime;
+
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::unwrap_alias;
+use crate::venues::{rfc3339_utc, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://ws.kraken.com/v2";
 
@@ -44,9 +46,17 @@ struct Frame {
 struct Ticker {
     bid: Box<serde_json::value::RawValue>,
     ask: Box<serde_json::value::RawValue>,
+    /// When the exchange made the ticker, RFC 3339 (`2023-09-25T09:04:31.742648Z`).
+    timestamp: Option<String>,
 }
 
 pub fn parse(text: &str) -> Result<Option<Quote>> {
+    Ok(parse_stamped(text)?.map(|(quote, _)| quote))
+}
+
+/// [`parse`], with the ticker's `timestamp`. One that does not read as RFC 3339 is taken
+/// as absent rather than refusing the price: the price is what the frame is for.
+pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     let frame: Frame =
         serde_json::from_str(text).map_err(|err| eyre!(err).wrap_err("not a kraken frame"))?;
     if let Some(false) = frame.success {
@@ -67,10 +77,13 @@ pub fn parse(text: &str) -> Result<Option<Quote>> {
             let ticker = data
                 .pop()
                 .ok_or_else(|| eyre!("ticker frame without data"))?;
-            Ok(Some(Quote::Book {
-                bid: ticker.bid.get().trim_matches('"').to_owned(),
-                ask: ticker.ask.get().trim_matches('"').to_owned(),
-            }))
+            Ok(Some((
+                Quote::Book {
+                    bid: ticker.bid.get().trim_matches('"').to_owned(),
+                    ask: ticker.ask.get().trim_matches('"').to_owned(),
+                },
+                ticker.timestamp.as_deref().and_then(rfc3339_utc),
+            )))
         }
         // heartbeat, status, and method replies (subscribe ack, pong).
         _ => Ok(None),
@@ -140,5 +153,16 @@ mod tests {
                 .to_string()
                 .contains("not supported")
         );
+    }
+
+    #[test]
+    fn a_ticker_is_stamped_with_its_timestamp() {
+        let push = r#"{"channel":"ticker","type":"update","data":[{"symbol":"ETH/USD","bid":3999.5,"ask":4000.25,"timestamp":"2023-09-25T09:04:31.742648Z"}]}"#;
+        assert_eq!(
+            parse_stamped(push).unwrap().unwrap().1,
+            rfc3339_utc("2023-09-25T09:04:31.742648Z")
+        );
+        let unstamped = r#"{"channel":"ticker","type":"update","data":[{"symbol":"ETH/USD","bid":3999.5,"ask":4000.25}]}"#;
+        assert_eq!(parse_stamped(unstamped).unwrap().unwrap().1, None);
     }
 }

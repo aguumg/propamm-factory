@@ -2,12 +2,14 @@
 //! text `ping`, answered `pong`; Bitget drops a socket that sends none for two minutes.
 //! Markets are `ETHUSDC`.
 
+use std::time::SystemTime;
+
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::unwrap_alias;
+use crate::venues::{epoch_ms_value, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://ws.bitget.com/v2/ws/public";
 
@@ -38,9 +40,17 @@ struct Ticker {
     bid: String,
     #[serde(rename = "askPr")]
     ask: String,
+    /// When the exchange made the ticker, milliseconds since the epoch as a string.
+    ts: Option<serde_json::Value>,
 }
 
 pub fn parse(text: &str) -> Result<Option<Quote>> {
+    Ok(parse_stamped(text)?.map(|(quote, _)| quote))
+}
+
+/// [`parse`], with the ticker's `ts`. One that is not a millisecond stamp is taken as
+/// absent rather than refusing the price: the price is what the frame is for.
+pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     if text == "pong" {
         return Ok(None);
     }
@@ -50,10 +60,13 @@ pub fn parse(text: &str) -> Result<Option<Quote>> {
         Some("error") => Err(eyre!("bitget error: {}", frame.msg.unwrap_or_default())),
         Some(_) => Ok(None),
         None => match frame.data.and_then(|mut data| data.pop()) {
-            Some(ticker) => Ok(Some(Quote::Book {
-                bid: ticker.bid,
-                ask: ticker.ask,
-            })),
+            Some(ticker) => Ok(Some((
+                Quote::Book {
+                    bid: ticker.bid,
+                    ask: ticker.ask,
+                },
+                ticker.ts.as_ref().and_then(epoch_ms_value),
+            ))),
             None => Err(eyre!("bitget frame with neither event nor data")),
         },
     }
@@ -102,5 +115,16 @@ mod tests {
         assert!(
             parse(r#"{"event":"error","code":30001,"msg":"instId:NOPE doesn't exist"}"#).is_err()
         );
+    }
+
+    #[test]
+    fn a_ticker_push_is_stamped_with_its_ts() {
+        let push = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"ETHUSDC"},"data":[{"instId":"ETHUSDC","bidPr":"2000.0","askPr":"2000.2","ts":"1700000000000"}],"ts":1700000000000}"#;
+        assert_eq!(
+            parse_stamped(push).unwrap().unwrap().1,
+            Some(crate::venues::epoch_ms(1_700_000_000_000))
+        );
+        let unstamped = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"ETHUSDC"},"data":[{"instId":"ETHUSDC","bidPr":"2000.0","askPr":"2000.2"}]}"#;
+        assert_eq!(parse_stamped(unstamped).unwrap().unwrap().1, None);
     }
 }

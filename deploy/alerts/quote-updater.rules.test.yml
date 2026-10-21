@@ -4,7 +4,8 @@
 # ../compose.yaml globs `/etc/prometheus/rules/*.rules.yml`, and it must never load a file
 # of fixtures as live rules.
 #
-# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry. The first is a `predict_linear`, which is the only
+# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, and PusherVenueLate
+# (at the end). The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -138,3 +139,28 @@ tests:
             exp_annotations:
               summary: "EMPTY: signer has no ETH left"
               description: "The key that signs this pair's updates has a zero balance, so nothing it signs can land and the lane is dead until someone tops it up. PusherSignerNearlyDry cannot say this: a balance that is already flat at zero extrapolates to zero, not below it."
+
+  # PusherVenueLate: five minutes of a venue left out for lateness raises a ticket; a few
+  # late frames that clear inside that do not. Scrape-rate fixtures, like the level check
+  # above: the gauge holds its value between frames.
+  - interval: 1m
+    name: a venue left out for lateness for five minutes raises a ticket
+    input_series:
+      - series: 'quote_updater_venue_late{pair="ETH/USDT",venue="okx"}'
+        values: "0 1x10"
+      - series: 'quote_updater_venue_late{pair="ETH/USDT",venue="kucoin"}'
+        values: "0 1x3 0x6"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PusherVenueLate
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherVenueLate
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: ETH/USDT
+              venue: okx
+            exp_annotations:
+              summary: "ETH/USDT: okx has been delivering prices late for 5 minutes"
+              description: "This venue's prices have been arriving later behind the exchange's own timestamps than max_source_lag_ms allows for five minutes, so it is out of the pair's average. quote_updater_venue_source_lag_ms says how far behind; a steady quote_updater_venue_future_stamps_total, or every stamped venue late by about the same amount, points at this host's clock instead."

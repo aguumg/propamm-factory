@@ -1,12 +1,14 @@
 //! Gate spot WebSocket v4: the `spot.book_ticker` channel, one frame per best bid/ask
 //! change, with an application-level `spot.ping`. Markets are `ETH_USDC`.
 
+use std::time::SystemTime;
+
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::unwrap_alias;
+use crate::venues::{epoch_ms, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://api.gateio.ws/ws/v4/";
 
@@ -52,9 +54,16 @@ struct Frame {
 struct Ticker {
     b: Option<String>,
     a: Option<String>,
+    /// The book's update time, in milliseconds.
+    t: Option<u64>,
 }
 
 pub fn parse(text: &str) -> Result<Option<Quote>> {
+    Ok(parse_stamped(text)?.map(|(quote, _)| quote))
+}
+
+/// [`parse`], with the update's `t`.
+pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     let frame: Frame =
         serde_json::from_str(text).map_err(|err| eyre!(err).wrap_err("not a gate frame"))?;
     if let Some(error) = frame.error.filter(|e| !e.is_null()) {
@@ -65,7 +74,8 @@ pub fn parse(text: &str) -> Result<Option<Quote>> {
             Some(Ticker {
                 b: Some(bid),
                 a: Some(ask),
-            }) => Ok(Some(Quote::Book { bid, ask })),
+                t,
+            }) => Ok(Some((Quote::Book { bid, ask }, t.map(epoch_ms)))),
             _ => Err(eyre!("book_ticker update without b/a")),
         },
         // subscribe ack, spot.pong.
@@ -123,6 +133,15 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unknown currency pair")
+        );
+    }
+
+    #[test]
+    fn an_update_is_stamped_with_its_t() {
+        let update = r#"{"time":1606293275,"time_ms":1606293275723,"channel":"spot.book_ticker","event":"update","result":{"t":1606293275123,"u":48733182,"s":"BTC_USDT","b":"19177.79","B":"0.0003341504","a":"19179.38","A":"0.09"}}"#;
+        assert_eq!(
+            parse_stamped(update).unwrap().unwrap().1,
+            Some(epoch_ms(1_606_293_275_123))
         );
     }
 }

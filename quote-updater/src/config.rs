@@ -241,6 +241,11 @@ pub struct RawPair {
     /// How many of `sources` must have a fresh price for the pair to publish. Default 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_sources: Option<String>,
+    /// How late, in milliseconds, a venue's prices may arrive behind the exchange's own
+    /// timestamp before the venue is left out of the average. See [`SourceChecks`]. Blank:
+    /// no such check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_source_lag_ms: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_mid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,6 +324,28 @@ pub struct Source {
 pub struct Feeds {
     pub sources: Vec<Source>,
     pub min_sources: usize,
+    /// The late-venue check; off unless the stanza sets it.
+    pub checks: SourceChecks,
+}
+
+/// The largest `max_source_lag_ms`. A guard against the unit, not a bound the feed needs:
+/// a backlogged venue keeps delivering frames, so the silence rule never drops it and any
+/// limit would act, but a lane willing to average prices half a minute old has not set a
+/// lateness limit, it has written seconds (or microseconds) where milliseconds go.
+pub const MAX_SOURCE_LAG_MS: u64 = 30_000;
+
+/// How late a venue's price may arrive behind the exchange's own stamp before the
+/// composite leaves that venue out of the average: `max_source_lag_ms`, as a duration.
+///
+/// Off by default, and a pair that leaves it unset quotes exactly as before. Set, a venue
+/// whose latest price frame arrived more than this behind its stamp (over the venue's
+/// usual lag, see `feed::LagFloor`) is not fresh, like one that has gone silent, until a
+/// prompt frame arrives; the pair's `min_sources` then says whether it still publishes.
+/// A venue whose frames carry no stamp cannot be judged and is never left out for it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceChecks {
+    /// `max_source_lag_ms`.
+    pub max_lag: Option<std::time::Duration>,
 }
 
 impl Feeds {
@@ -331,6 +358,7 @@ impl Feeds {
                 weight: U256::exp10(WEIGHT_DECIMALS as usize),
             }],
             min_sources: 1,
+            checks: SourceChecks::default(),
         }
     }
 
@@ -536,12 +564,18 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
                 raw.min_sources.is_none(),
                 "{at}: min_sources needs sources to count"
             );
-            return Ok(Some(Feeds::single_binance(symbol)));
+            let mut feeds = Feeds::single_binance(symbol);
+            feeds.checks = parse_source_checks(raw, &feeds.sources, at)?;
+            return Ok(Some(feeds));
         }
         (None, true) => {
             ensure!(
                 raw.min_sources.is_none(),
                 "{at}: min_sources needs sources to count"
+            );
+            ensure!(
+                raw.max_source_lag_ms.is_none(),
+                "{at}: max_source_lag_ms judges a pair's venues, and this pair has none"
             );
             return Ok(None);
         }
@@ -602,10 +636,60 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
             n
         }
     };
+    let checks = parse_source_checks(raw, &sources, at)?;
     Ok(Some(Feeds {
         sources,
         min_sources,
+        checks,
     }))
+}
+
+/// Refuses a pair whose `max_source_lag_ms` the file parser would refuse, with the same
+/// message: for the backoffice, which checks an edit before writing it. A pair not setting
+/// it is not looked at, so nothing else changes there.
+pub(crate) fn check_source_keys(raw: &RawPair) -> Result<()> {
+    if raw.max_source_lag_ms.is_none() {
+        return Ok(());
+    }
+    parse_feeds(raw, "this pair").map(|_| ())
+}
+
+/// `max_source_lag_ms`: a whole number of milliseconds, above zero and at most
+/// [`MAX_SOURCE_LAG_MS`], on a pair at least one of whose `sources` stamps its frames.
+/// On one where none does there would be nothing to judge, so the key is refused rather
+/// than quietly doing nothing.
+fn parse_source_checks(raw: &RawPair, sources: &[Source], at: &str) -> Result<SourceChecks> {
+    let max_lag = match &raw.max_source_lag_ms {
+        None => None,
+        Some(text) => {
+            ensure!(
+                sources.iter().any(|source| source.venue.stamps_frames()),
+                "{at}: max_source_lag_ms judges how late a venue's prices arrive behind the \
+                 exchange's own timestamp, and none of this pair's venues ({}) stamps its \
+                 frames; add one that does, or leave the key unset",
+                sources
+                    .iter()
+                    .map(|source| source.venue.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let ms: u64 = text.trim().parse().wrap_err_with(|| {
+                format!("{at}: max_source_lag_ms {text:?} is not a whole number of milliseconds")
+            })?;
+            ensure!(
+                ms > 0,
+                "{at}: max_source_lag_ms is zero, so every stamped price would read late"
+            );
+            ensure!(
+                ms <= MAX_SOURCE_LAG_MS,
+                "{at}: max_source_lag_ms {ms} is above {MAX_SOURCE_LAG_MS}: that would keep \
+                 averaging a venue's prices until they are over half a minute old; it is \
+                 milliseconds, so write 1500 for 1.5 seconds"
+            );
+            Some(std::time::Duration::from_millis(ms))
+        }
+    };
+    Ok(SourceChecks { max_lag })
 }
 
 /// Parses one threshold fraction, applying every check that makes a threshold trustworthy.
@@ -1639,6 +1723,96 @@ sources = [{ venue = "binance", symbol = "ETHUSDT" }]
         );
         let err = parse_config(&text, 18).map(|_| ()).unwrap_err().to_string();
         assert!(err.contains("not both"), "{err}");
+    }
+
+    /// The late-venue key is off unless set, and read as written when it is.
+    #[test]
+    fn source_checks_default_off_and_parse_when_set() {
+        let two = r#"
+pricing = { kind = "feed", delta = "0.0005" }
+sources = [
+  { venue = "binance", symbol = "ETHUSDC" },
+  { venue = "okx", symbol = "ETH-USDC", weight = "2" },
+]
+"#;
+        let plain = parse_config(&pair_with(two), 18).unwrap();
+        let feeds = plain.pairs[0].feeds.as_ref().unwrap();
+        assert_eq!(feeds.checks, SourceChecks::default());
+        assert!(feeds.checks.max_lag.is_none());
+
+        let set = parse_config(
+            &pair_with(&format!("{two}max_source_lag_ms = \"1500\"\n")),
+            18,
+        )
+        .unwrap();
+        let checks = &set.pairs[0].feeds.as_ref().unwrap().checks;
+        assert_eq!(checks.max_lag, Some(std::time::Duration::from_millis(1500)));
+        assert_ne!(set.pairs, plain.pairs, "a reload sees the change");
+
+        // A single stamped source takes the key.
+        let single = parse_config(
+            &pair_with(
+                "sources = [{ venue = \"okx\", symbol = \"ETH-USDC\" }]\nmax_source_lag_ms = \"10000\"\n",
+            ),
+            18,
+        )
+        .unwrap();
+        let feeds = single.pairs[0].feeds.as_ref().unwrap();
+        assert_eq!(
+            feeds.checks.max_lag,
+            Some(std::time::Duration::from_secs(10))
+        );
+
+        // Written back only when set, and read back the same.
+        let raw: RawConfig =
+            toml::from_str(&pair_with(&format!("{two}max_source_lag_ms = \"1500\"\n"))).unwrap();
+        let written = render_raw(&raw).unwrap();
+        assert!(
+            written.contains("max_source_lag_ms = \"1500\""),
+            "{written}"
+        );
+        parse_config(&written, 18).expect("a rendered config must load");
+    }
+
+    #[test]
+    fn source_checks_refuse_what_cannot_be_trusted() {
+        let two = r#"
+pricing = { kind = "feed", delta = "0.0005" }
+sources = [{ venue = "okx", symbol = "ETH-USDC" }, { venue = "binance", symbol = "ETHUSDC" }]
+"#;
+        let cases = [
+            (format!("{two}max_source_lag_ms = \"0\""), "is zero"),
+            (
+                format!("{two}max_source_lag_ms = \"-5\""),
+                "not a whole number of milliseconds",
+            ),
+            (
+                format!("{two}max_source_lag_ms = \"1.5\""),
+                "not a whole number of milliseconds",
+            ),
+            (format!("{two}max_source_lag_ms = \"30001\""), "is above 30000"),
+            // No venue whose frames carry a time: the `symbol` form (Binance alone), and
+            // Binance beside a polled venue.
+            (
+                "symbol = \"ETHUSDC\"\nmax_source_lag_ms = \"1500\"".to_owned(),
+                "none of this pair's venues (binance) stamps its frames",
+            ),
+            (
+                "sources = [{ venue = \"binance\", symbol = \"ETHUSDC\" }, { venue = \"mexc\", symbol = \"ETHUSDC\" }]\nmax_source_lag_ms = \"1500\"".to_owned(),
+                "none of this pair's venues (binance, mexc) stamps its frames",
+            ),
+            (
+                "pricing = { kind = \"fixed\", mid = \"4000\", delta = \"0.0005\" }\nmax_source_lag_ms = \"1500\"".to_owned(),
+                "this pair has none",
+            ),
+        ];
+        for (body, expected) in cases {
+            let err = format!(
+                "{:#}",
+                parse_config(&pair_with(&body), 18).map(|_| ()).unwrap_err()
+            );
+            assert!(err.contains(expected), "{body}: {err}");
+        }
     }
 
     #[test]

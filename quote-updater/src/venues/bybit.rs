@@ -3,12 +3,14 @@
 //! every 10ms while it changes. Bybit's spot `tickers` topic carries no bid or ask, which
 //! is why this is not it. The keepalive is a JSON `ping` op. Markets are `ETHUSDC`.
 
+use std::time::SystemTime;
+
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::unwrap_alias;
+use crate::venues::{epoch_ms_value, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://stream.bybit.com/v5/public/spot";
 
@@ -28,6 +30,8 @@ struct Frame {
     success: Option<bool>,
     ret_msg: Option<String>,
     data: Option<Book>,
+    /// When the exchange made the frame, milliseconds since the epoch.
+    ts: Option<serde_json::Value>,
 }
 
 /// Each level is `[price, size]`; level 1 has at most one on each side, and an empty side
@@ -39,6 +43,12 @@ struct Book {
 }
 
 pub fn parse(text: &str) -> Result<Option<Quote>> {
+    Ok(parse_stamped(text)?.map(|(quote, _)| quote))
+}
+
+/// [`parse`], with the frame's `ts`. One that is not a millisecond stamp is taken as absent
+/// rather than refusing the price: the price is what the frame is for.
+pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     let frame: Frame =
         serde_json::from_str(text).map_err(|err| eyre!(err).wrap_err("not a bybit frame"))?;
     if let Some(false) = frame.success {
@@ -62,10 +72,13 @@ pub fn parse(text: &str) -> Result<Option<Quote>> {
             .and_then(|level| level.into_iter().next())
             .unwrap_or_else(|| "0".to_owned())
     };
-    Ok(Some(Quote::Book {
-        bid: side(book.b),
-        ask: side(book.a),
-    }))
+    Ok(Some((
+        Quote::Book {
+            bid: side(book.b),
+            ask: side(book.a),
+        },
+        frame.ts.as_ref().and_then(epoch_ms_value),
+    )))
 }
 
 pub fn expected_symbol(base: &str, quote: &str) -> String {
@@ -127,5 +140,16 @@ mod tests {
                 .to_string()
                 .contains("Invalid symbol")
         );
+    }
+
+    #[test]
+    fn a_book_push_is_stamped_with_its_ts() {
+        let push = r#"{"topic":"orderbook.1.BTCUSDT","ts":1772694601512,"type":"snapshot","data":{"s":"BTCUSDT","b":[["16493.50","0.006"]],"a":[["16611.00","0.029"]],"u":18521288,"seq":7961638724}}"#;
+        assert_eq!(
+            parse_stamped(push).unwrap().unwrap().1,
+            Some(crate::venues::epoch_ms(1_772_694_601_512))
+        );
+        let unstamped = r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","data":{"s":"BTCUSDT","b":[["16493.50","0.006"]],"a":[["16611.00","0.029"]],"u":1,"seq":1}}"#;
+        assert_eq!(parse_stamped(unstamped).unwrap().unwrap().1, None);
     }
 }

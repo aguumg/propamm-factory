@@ -295,6 +295,19 @@ max_deviation = "0.002"
 #   { venue = "binance", symbol = "ETHUSDC", weight = "2" },
 #   { venue = "binance", symbol = "ETHUSDT", weight = "1" },
 # ]
+#
+# Optional, and off unless set: how late a venue's prices may arrive behind the exchange's
+# own timestamp, in milliseconds, before the venue is left out of this pair's average. A
+# stream that is alive but running behind its exchange keeps delivering old prices on time,
+# which the freshness rule cannot see; this reads the lateness off each frame's own stamp
+# (over the venue's usual lag) and drops the venue until a prompt frame arrives, the way a
+# silent venue is dropped. `min_sources` then says whether the pair still publishes. It is
+# a measure of the stream, not the market: a quiet book whose last frame arrived promptly
+# reads as prompt. Needs a venue that stamps its frames (kraken, coinbase, okx, bybit,
+# kucoin, bitget, gate); binance's bookTicker carries no timestamp and mexc is polled, so
+# those are never left out for it. 1500 is a sensible value on any pair.
+# See "Late venues" in docs/manual.md.
+# max_source_lag_ms = "1500"
 
 # A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
 # the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its

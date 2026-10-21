@@ -176,6 +176,74 @@ venue with a wrong symbol, or one disagreeing with the others, shows up before a
 published. Each venue can be repointed (a mock, a regional endpoint) from
 `[settings.endpoints]`; `binance_ws` is the older spelling of its Binance entry.
 
+### Late venues: prices that arrive behind the exchange
+
+One optional key, `max_source_lag_ms`, leaves a venue out of a pair's average while its
+prices arrive later behind the exchange's own timestamps than the pair allows, and brings
+it back on the first prompt frame. Off unless set; a pair that leaves it unset quotes
+exactly as before.
+
+```toml
+[[pairs]]
+# ...
+sources = [
+  { venue = "kucoin", symbol = "ETH-USDT", weight = "2" },
+  { venue = "okx",    symbol = "ETH-USDT" },
+]
+min_sources = "1"
+max_source_lag_ms = "1500"
+```
+
+Why the freshness rule is not enough. A venue is fresh while frames keep arriving: its
+sample is re-stamped by every frame, and it is dropped only after 30 seconds with no frame
+at all. A stream that is alive but running behind its exchange never trips that: frames
+keep arriving on time, each one carrying a price from seconds or minutes ago. It happens on
+a lossy route to an exchange: the socket's queue falls tens of seconds behind for minutes
+at a time, then drains in seconds the way a queue does, while the exchange's other venues
+stay current. Frames keep arriving, so nothing drops out, and the pair quotes prices tens
+of seconds old.
+
+What the key measures is the stream, not the market. Most venues write the exchange's own
+clock reading into every price frame: Kraken (`timestamp`), Coinbase (`time`), OKX (`ts`),
+Bybit (`ts`), KuCoin (`time`), Bitget (`ts`) and Gate (`t`). The feed subtracts that from
+the frame's arrival, which gives how long the frame took to reach us. A backlog makes every
+frame late by seconds; a quiet book whose last frame arrived promptly reads as prompt
+however long ago that was, so a thin market is not read as a late one. That difference is
+the reason this is lateness and not the age of the price. "Usual" lag is subtracted first:
+the least lag the venue's frames have had over the last hour, taken only from minutes in
+which at least two frames arrived (so one odd frame cannot set it, and a venue sending
+under two frames a minute gets no baseline and has its whole offset counted). That absorbs
+the network's ordinary latency and this host's clock offset from the exchange's, within
+bounds that differ by direction: a host clock up to 1 second ahead of the exchange's is
+absorbed, since the baseline is capped there, and beyond it every frame reads late by the
+excess, which fails closed (the venue drops out); a host clock up to 2 seconds behind is
+absorbed, since a stamp more than 2 seconds ahead of its arrival is left out of the
+baseline and counted in `quote_updater_venue_future_stamps_total`, and beyond it every
+frame's lateness reads as zero, which fails open (a backlog goes unseen). Both are far
+outside what a host kept on NTP drifts, which is why the host must be. Because of the 1
+second cap a backlog always shows, even one that started before the feed was dialled or
+lasts longer than the hour. A step of the host clock (an NTP correction, a resume from
+sleep) restarts the baseline.
+
+A venue whose latest frame was late is treated exactly like one that has gone silent: out
+of the average, its weight spread over the rest, until a prompt frame arrives. The pair's
+`min_sources` then decides, as it already does, whether the pair keeps publishing on the
+venues left or withdraws (an empty-tx cancel at every builder, kept in force until enough
+venues are fresh again). Nothing latches. `quote_updater_venue_late{pair, venue}` reads 1
+while a venue is out for this, the updater logs a line when it drops out and when it comes
+back, and `PusherVenueLate` raises a ticket after five minutes of it.
+
+Binance's spot `bookTicker` carries no event time (its frame is `u s b B a A`) and MEXC is
+polled over REST, whose body carries none, so those two are never left out for lateness; a
+pair whose venues are only those is refused the key, since it would do nothing. Binance
+itself falling behind is therefore still not seen by anything in the updater.
+
+1500 ms is a sensible value on any pair: it is a statement about the network and the
+exchange's queue, not about the token. The backoffice's pair form has the field; blank
+clears it, and a form loaded before the field existed keeps whatever the file sets.
+Rolling back to a version without this key: the config parser refuses keys it does not
+know, so remove `max_source_lag_ms` from every pair before downgrading.
+
 ### What the updater charges a taker
 
 Every pair names how it is priced in its `pricing` table: a kind, and the keys that kind
@@ -856,7 +924,7 @@ so there is no pair a sample of it could belong to; the same is true of its poll
 and error count. In `--mode node` those three are absent rather than zero — nothing there
 starts a watcher.
 
-Five series are worth watching ahead of everything else the registry exposes:
+Seven series are worth watching ahead of everything else the registry exposes:
 
 - `quote_updater_breaker_tripped` — the circuit breaker latches (see "Circuit breaker"
   above): once this reads 1 for a pair it stays there until a human has looked at the feed
@@ -882,6 +950,15 @@ Five series are worth watching ahead of everything else the registry exposes:
   report it, one per lane, without any of them saying why. Read it as a rate — five blocks a
   minute on mainnet — since the number itself climbs too slowly to look like anything but a
   flat line.
+- `quote_updater_venue_source_lag_ms{pair, venue}` — how late the venue's latest price
+  arrived behind the exchange's own timestamp, over the venue's usual lag (see "Late
+  venues" above); NaN for a venue whose frames carry no timestamp.
+- `quote_updater_venue_late{pair, venue}` — 1 while the venue is left out of the pair's
+  average for arriving later than `max_source_lag_ms` (`PusherVenueLate` raises a ticket
+  after five minutes).
+- `quote_updater_venue_future_stamps_total{pair, venue}` — frames whose exchange timestamp
+  was more than 2 seconds ahead of their arrival, left out of the venue's usual lag; a
+  steady count means this host's clock is behind.
 
 `--mode node` records a smaller registry than builder mode — no builders, no head watcher, no
 landing tracker — but it now records the two series that matter for safety rather than for

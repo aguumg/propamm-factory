@@ -445,6 +445,25 @@ groups:
             becomes PusherFeedDown if the rest go too. A venue that has been renamed or
             delisted looks exactly like this.
 
+      # A venue left out of its pair's average by `max_source_lag_ms`: its prices arrive
+      # later behind its own timestamps than the pair allows, which is a stream running
+      # behind its exchange. A late frame or two is the check doing its job; five minutes
+      # is a venue persistently behind. Like PusherVenueFeedDown, a ticket: the pair keeps
+      # quoting from the rest while min_sources are fresh, and PusherFeedDown says when
+      # they are not.
+      - alert: PusherVenueLate
+        expr: quote_updater_venue_late == 1
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: {{ $labels.venue }} has been delivering prices late for 5 minutes"
+          description: >-
+            This venue's prices have been arriving later behind the exchange's own timestamps
+            than max_source_lag_ms allows for five minutes, so it is out of the pair's average.
+            quote_updater_venue_source_lag_ms says how far behind; a steady
+            quote_updater_venue_future_stamps_total, or every stamped venue late by about the
+            same amount, points at this host's clock instead.
+
       - alert: PusherFeedSampleNotCurrent
         expr: quote_updater_feed_sample_current == 0
         for: 5m

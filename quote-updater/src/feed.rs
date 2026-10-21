@@ -18,12 +18,195 @@ use crate::record::Recorder;
 use crate::venue::{Connection, Keepalive, Quote, VenueId};
 use crate::ws;
 
-/// Whether a venue is connected, held by its feed task, which is the one that knows, and
-/// read by the metrics when Prometheus scrapes (`Metrics::watch_venue`). Nothing about it is
-/// written ahead of time, so nothing about it can be lost: a restart, a reload, a write the
-/// gate dropped, none of them can leave `quote_updater_venue_feed_up` saying the wrong thing.
+/// Whether a venue is connected, and how late its last price arrived, held by its feed
+/// task, which is the one that knows, and read by the metrics when Prometheus scrapes
+/// (`Metrics::watch_venue`) and by the composite deciding which venues are fresh. Nothing
+/// about it is written ahead of time, so nothing about it can be lost: a restart, a reload,
+/// a write the gate dropped, none of them can leave `quote_updater_venue_feed_up` or
+/// `quote_updater_venue_source_lag_ms` saying the wrong thing.
 #[derive(Clone, Default)]
-pub struct Connected(Arc<AtomicU8>);
+pub struct Connected {
+    up: Arc<AtomicU8>,
+    /// How late the venue's latest accepted price arrived; see [`PriceLag`].
+    priced: Arc<std::sync::Mutex<Option<PriceLag>>>,
+}
+
+/// How late a venue's latest accepted price arrived behind the exchange's own stamp, over
+/// the least it has trailed it lately ([`LagFloor`]).
+///
+/// Separate from [`PriceSample::at`], and on purpose: the sample's stamp is refreshed by
+/// every ping a live socket answers, which is what keeps a quiet book publishable for
+/// [`crate::update::MAX_PRICE_AGE`]. That is also why it cannot see a stream that is alive
+/// but late: frames keep arriving, each one old, and each one re-stamps the sample as new.
+/// This moves only on a price, and reads the exchange's time off the frame when it carries
+/// one. It is a measure of the stream, not of the market: a quiet book whose last frame
+/// arrived promptly reads as prompt however long ago that was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PriceLag {
+    /// The frame carried no exchange time (Binance's bookTicker, a polled body), so there
+    /// is nothing to measure against.
+    Unstamped,
+    /// How much later than usual the frame arrived behind its stamp.
+    Stamped(Duration),
+}
+
+/// How long [`LagFloor`] remembers a venue's least lag.
+pub(crate) const LAG_FLOOR_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// The resolution of that memory: one minimum per this much time.
+const LAG_FLOOR_BUCKET: Duration = Duration::from_secs(60);
+
+/// The most [`LagFloor`] will ever subtract, in milliseconds: what a host clock kept by NTP
+/// and a network path to the venue plausibly add between them. Lag beyond it is always
+/// counted as lateness, so a venue that is already behind when it is dialled, or one that
+/// stays behind for longer than the window, cannot become its own baseline.
+pub(crate) const LAG_FLOOR_MAX_MS: i64 = 1_000;
+
+/// How far ahead of its arrival a stamp may be, in milliseconds, and still be taken as a
+/// reading of the venue's lag. A stamp further ahead says the venue's clock or ours is
+/// wrong; it is left out of the floor (and counted, `quote_updater_venue_future_stamps_total`)
+/// rather than allowed to drag the floor down and make every later frame look late.
+pub(crate) const FUTURE_STAMP_MS: i64 = 2_000;
+
+/// How far this host's wall clock may move against its monotonic clock between two frames,
+/// in milliseconds, before it is taken as a step (an NTP jump, a resume from sleep) and the
+/// floor, measured on the old wall clock, is dropped.
+const CLOCK_STEP_MS: i64 = 1_000;
+
+/// The baseline lag a venue's stamped frames arrive with over [`LAG_FLOOR_WINDOW`], at
+/// most [`LAG_FLOOR_MAX_MS`], and each new frame's lag over it.
+///
+/// `arrival wall clock - exchange stamp` is not a frame's lateness alone: it also carries
+/// our clock's offset from the exchange's and the network's ordinary latency. Subtracting
+/// the baseline seen lately takes those out, up to [`LAG_FLOOR_MAX_MS`]: a clock a few
+/// hundred milliseconds off does not age every OKX price by that much, while a backlog of
+/// seconds, however long it lasts and whenever the feed was dialled, is always counted. A
+/// host clock more than that ahead of the exchange's makes the venue's prices read late,
+/// which fails closed: the venue drops out of its pairs' averages, and
+/// `quote_updater_venue_source_lag_ms` shows every stamped venue sitting near the same
+/// excess.
+///
+/// The baseline is robust to a single bad frame: a lag is used only once two frames in some
+/// minute have reached it (the bucket's *second*-smallest), and the baseline is the least
+/// such value across the window's minutes. One frame stamped a second or two into the
+/// future — the kind a fitful exchange clock emits — would otherwise set the baseline that
+/// far below zero and make every ordinary frame read a second or two late for the whole
+/// window; now it does not, because no other frame joins it.
+#[derive(Debug, Default)]
+pub(crate) struct LagFloor {
+    /// Each minute's two smallest lags and how many frames it saw, oldest first; see
+    /// [`Bucket`]. A minute with one frame establishes no baseline.
+    buckets: std::collections::VecDeque<Bucket>,
+    /// The monotonic instant the wall clock is read against, and `wall - monotonic` at the
+    /// last frame, in ms: how a step of the wall clock is seen.
+    anchor: Option<(Instant, i64)>,
+}
+
+/// One minute of frames: when it began, its two smallest lags, and how many it saw. Its
+/// baseline is the second-smallest once it has two frames, so one outlier frame does not
+/// set it.
+#[derive(Debug)]
+struct Bucket {
+    start: Instant,
+    min1: i64,
+    min2: i64,
+    count: u32,
+}
+
+impl Bucket {
+    fn new(start: Instant, raw: i64) -> Self {
+        Self {
+            start,
+            min1: raw,
+            min2: i64::MAX,
+            count: 1,
+        }
+    }
+
+    fn observe(&mut self, raw: i64) {
+        if raw <= self.min1 {
+            self.min2 = self.min1;
+            self.min1 = raw;
+        } else if raw < self.min2 {
+            self.min2 = raw;
+        }
+        self.count += 1;
+    }
+
+    /// The baseline this minute vouches for: its second-smallest lag, once two frames have
+    /// reached it. `None` for a minute of one frame, which establishes nothing.
+    fn baseline(&self) -> Option<i64> {
+        (self.count >= 2).then_some(self.min2)
+    }
+}
+
+/// One frame's reading by [`LagFloor::lag`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Lag {
+    /// How much later than usual the frame arrived behind its stamp.
+    pub(crate) over_floor: Duration,
+    /// Whether the stamp was more than [`FUTURE_STAMP_MS`] ahead of the arrival, and so
+    /// left out of the floor.
+    pub(crate) future: bool,
+}
+
+impl LagFloor {
+    /// Records a frame stamped `event` that arrived at `(now, wall)`, and returns its lag
+    /// over the floor.
+    pub(crate) fn lag(&mut self, now: Instant, wall: SystemTime, event: SystemTime) -> Lag {
+        let wall_ms = signed_epoch_ms(wall);
+        // A step of the wall clock moves every later frame's lag by the step, against a
+        // floor measured before it: start the floor again.
+        let anchor = self.anchor.map_or(now, |(anchor, _)| anchor);
+        let offset = wall_ms
+            - i64::try_from(now.saturating_duration_since(anchor).as_millis()).unwrap_or(i64::MAX);
+        if let Some((_, last)) = self.anchor
+            && (offset - last).abs() > CLOCK_STEP_MS
+        {
+            self.buckets.clear();
+        }
+        self.anchor = Some((anchor, offset));
+
+        let raw = wall_ms - signed_epoch_ms(event);
+        let future = raw < -FUTURE_STAMP_MS;
+        if !future {
+            match self.buckets.back_mut() {
+                Some(bucket) if now.saturating_duration_since(bucket.start) < LAG_FLOOR_BUCKET => {
+                    bucket.observe(raw);
+                }
+                _ => self.buckets.push_back(Bucket::new(now, raw)),
+            }
+        }
+        while self
+            .buckets
+            .front()
+            .is_some_and(|b| now.saturating_duration_since(b.start) >= LAG_FLOOR_WINDOW)
+        {
+            self.buckets.pop_front();
+        }
+        // The least baseline any minute vouches for (a minute of one frame vouches for
+        // none), so the floor is backed by at least two frames. `0` until some minute has
+        // two: no baseline is subtracted, which reads a frame at most its true lateness.
+        let floor = self
+            .buckets
+            .iter()
+            .filter_map(Bucket::baseline)
+            .min()
+            .map_or(0, |least| least.min(LAG_FLOOR_MAX_MS));
+        Lag {
+            over_floor: Duration::from_millis(u64::try_from(raw - floor).unwrap_or(0)),
+            future,
+        }
+    }
+}
+
+/// Milliseconds since the epoch, negative before it.
+fn signed_epoch_ms(at: SystemTime) -> i64 {
+    match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
+        Err(before) => -i64::try_from(before.duration().as_millis()).unwrap_or(i64::MAX),
+    }
+}
 
 const DOWN: u8 = 0;
 const UP: u8 = 1;
@@ -33,18 +216,42 @@ const GONE: u8 = 2;
 
 impl Connected {
     fn set(&self, up: bool) {
-        self.0.store(if up { UP } else { DOWN }, Ordering::Relaxed);
+        self.up.store(if up { UP } else { DOWN }, Ordering::Relaxed);
     }
 
     fn gone(&self) {
-        self.0.store(GONE, Ordering::Relaxed);
+        self.up.store(GONE, Ordering::Relaxed);
     }
 
     /// What `quote_updater_venue_feed_up` reads: 1 connected, 0 not, NaN no feed task.
     pub fn gauge_value(&self) -> f64 {
-        match self.0.load(Ordering::Relaxed) {
+        match self.up.load(Ordering::Relaxed) {
             UP => 1.0,
             DOWN => 0.0,
+            _ => f64::NAN,
+        }
+    }
+
+    /// Records how late the price the feed just accepted arrived.
+    pub(crate) fn priced(&self, lag: PriceLag) {
+        *self.priced.lock().unwrap_or_else(|e| e.into_inner()) = Some(lag);
+    }
+
+    /// How late the venue's latest price arrived, or `None` before its first.
+    pub fn price_lag(&self) -> Option<PriceLag> {
+        *self.priced.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What `quote_updater_venue_source_lag_ms` reads: how late the latest price arrived
+    /// behind its exchange stamp, over the venue's usual lag, in milliseconds. NaN before
+    /// the first price, for a venue whose frames carry no stamp, and once the feed task is
+    /// gone.
+    pub fn source_lag_ms(&self) -> f64 {
+        if self.up.load(Ordering::Relaxed) == GONE {
+            return f64::NAN;
+        }
+        match self.price_lag() {
+            Some(PriceLag::Stamped(lag)) => lag.as_secs_f64() * 1000.0,
             _ => f64::NAN,
         }
     }
@@ -229,6 +436,7 @@ pub fn spawn_feed(
         metrics,
         recorder,
         connected,
+        lag_floor: Default::default(),
     };
     tokio::spawn(async move {
         let Feed {
@@ -328,6 +536,8 @@ struct Feed {
     recorder: Option<Recorder>,
     /// Whether this venue is connected right now; see [`Connected`].
     connected: Connected,
+    /// The venue's usual lag behind its own stamps, across reconnects; see [`LagFloor`].
+    lag_floor: std::sync::Mutex<LagFloor>,
 }
 
 impl Feed {
@@ -462,19 +672,34 @@ impl Feed {
             ..
         } = self;
         let (venue, decimals, invert) = (*venue, *decimals, *invert);
-        let parsed = venue.parse(text).map_err(Rejected::malformed);
-        let quote = match parsed {
+        let parsed = venue.parse_stamped(text).map_err(Rejected::malformed);
+        let (quote, event) = match parsed {
             // A frame that carries no price (an acknowledgement, a heartbeat, a text pong)
             // is a sign of life and nothing more: the same as a protocol Ping.
             Ok(None) => {
                 refresh_if_current(tx, *sample_is_current);
                 return;
             }
-            Ok(Some(quote)) => quote_from_book(quote, decimals, invert),
-            Err(err) => Err(err),
+            Ok(Some((quote, event))) => (quote_from_book(quote, decimals, invert), event),
+            Err(err) => (Err(err), None),
         };
         match quote {
             Ok((delta, mid)) => {
+                let (at, wall) = (Instant::now(), SystemTime::now());
+                // Before the sample is sent, so whoever wakes on the sample reads the clock
+                // that goes with it.
+                let lag = event.map_or(PriceLag::Unstamped, |event| {
+                    let lag = self
+                        .lag_floor
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .lag(at, wall, event);
+                    if lag.future {
+                        metrics.record(|m| m.future_stamps.inc());
+                    }
+                    PriceLag::Stamped(lag.over_floor)
+                });
+                self.connected.priced(lag);
                 *sample_is_current = true;
                 if let Some(recorder) = recorder {
                     // The market's own mid, whichever way this lane carries it, so two lanes
@@ -504,8 +729,8 @@ impl Feed {
                 tx.send_replace(Some(PriceSample {
                     delta,
                     mid,
-                    at: Instant::now(),
-                    wall: SystemTime::now(),
+                    at,
+                    wall,
                 }));
             }
             Err(err) => {

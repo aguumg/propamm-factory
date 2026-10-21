@@ -5,6 +5,8 @@
   <h1>{% if let Some(key) = editing %}Edit {{ key }}{% else %}New pair{% endif %}</h1>
 </header>
 
+{% if let Some(message) = error %}<p class=banner-err>{{ message }}</p>{% endif %}
+
 {% if editing.is_none() %}
   <p class=warn>Its <code>key_env</code> has to be in the environment already. The unit
   reads <code>.env</code> once, at start, so a brand new key needs a redeploy.</p>
