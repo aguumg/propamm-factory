@@ -5,9 +5,9 @@
 //!
 //! A venue whose latest sample is older than [`MAX_PRICE_AGE`] drops out of the average
 //! and its weight is spread over the rest; the pair keeps publishing as long as at least
-//! `min_sources` venues are fresh, and stops (by publishing nothing, so the last composite
-//! ages out downstream exactly like a stalled feed did) when fewer are. A single venue
-//! with weight 1 is exactly the feed the pusher had before venues were plural.
+//! `min_sources` venues are fresh, and stops (by withdrawing its sample, so the loop
+//! refuses the next tick) when fewer are. A single venue with weight 1 is exactly the feed
+//! the pusher had before venues were plural.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -384,8 +384,34 @@ impl Composite {
         let wall = SystemTime::now();
         let fresh = self.fresh_sources(now, wall);
         if fresh.len() < self.min_sources {
-            // Nothing is written to the channel: the last composite stays and ages out
-            // downstream, which is how a single stalled feed always behaved.
+            // The last composite is withdrawn, not left to age out. For venues that went
+            // silent that changes nothing: the last composite was published at the last
+            // frame, so by the time they are dropped it is as old as their silence and the
+            // loop already refuses it. For a venue dropped as late it is the whole point:
+            // the price it last gave was already behind, and the loop would otherwise keep
+            // quoting it for up to MAX_PRICE_AGE.
+            if tx.borrow().is_some() {
+                let late: Vec<&str> = self
+                    .sources
+                    .iter()
+                    .zip(&self.late)
+                    .filter(|(_, late)| **late)
+                    .map(|(source, _)| source.venue.as_str())
+                    .collect();
+                tracing::warn!(
+                    "[{}] {} of {} venues fresh, {} needed{}; withdrawing until enough are",
+                    self.label,
+                    fresh.len(),
+                    self.sources.len(),
+                    self.min_sources,
+                    if late.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} late)", late.join(", "))
+                    }
+                );
+                tx.send_replace(None);
+            }
             return;
         }
         let Some((delta, mid)) = weighted_average(&fresh) else {
@@ -1220,5 +1246,50 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+
+    /// With one venue, a late frame leaves no venue to average: the composite withdraws
+    /// its sample at once rather than leaving the last price to age out, and the next
+    /// prompt frame puts a price back.
+    #[tokio::test]
+    async fn a_late_sole_venue_withdraws_the_sample_at_once() {
+        let (okx_url, okx) = scripted_venue().await;
+        let table = std::collections::BTreeMap::from([("okx".to_owned(), okx_url)]);
+        let endpoints = Endpoints::resolve(None, &table).unwrap();
+        let metrics = Metrics::new().unwrap();
+        let feeds = Feeds {
+            sources: vec![source(VenueId::Okx, "ETH-USDT", "1")],
+            min_sources: 1,
+            checks: crate::config::SourceChecks {
+                max_lag: Some(Duration::from_millis(1_500)),
+            },
+        };
+        let mut spawned = spawn(
+            &feeds,
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        okx.send(okx_ticker("4100.00", now_ms())).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), spawned.rx.wait_for(|s| s.is_some()))
+            .await
+            .expect("a first composite")
+            .unwrap();
+
+        okx.send(okx_ticker("4100.00", now_ms() - 30_000)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), spawned.rx.wait_for(|s| s.is_none()))
+            .await
+            .expect("the late frame withdraws the sample at once")
+            .unwrap();
+        assert_eq!(metrics.for_pair("TEST").feed_up.get(), 0.0);
+
+        okx.send(okx_ticker("4200.00", now_ms())).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            spawned
+                .rx
+                .wait_for(|s| matches!(s, Some(p) if p.mid == U256::from(420_000_000_000u64))),
+        )
+        .await
+        .expect("a prompt frame puts a price back")
+        .unwrap();
     }
 }

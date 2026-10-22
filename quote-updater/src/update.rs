@@ -386,7 +386,7 @@ fn fresh_sample(
     let sample = (*rx.borrow()).ok_or_else(|| {
         Unusable::new(
             UnusableKind::NoSample,
-            "no price received from the feed yet".to_owned(),
+            "no usable price from the feed".to_owned(),
         )
     })?;
     let age = sample.age();
@@ -994,7 +994,7 @@ mod tests {
 
             let err = source.current_detailed(&band).unwrap_err();
             assert_eq!(err.kind(), Some(UnusableKind::NoSample));
-            assert_eq!(err.to_string(), "no price received from the feed yet");
+            assert_eq!(err.to_string(), "no usable price from the feed");
             assert!(latch.tripped().is_none());
 
             // A sample a minute old by the wall clock: stale.
@@ -1281,7 +1281,7 @@ mod tests {
         let (_tx, source) = feed_of_empty();
         let err = source.current(&MidBand::default()).unwrap_err();
         assert_eq!(err.kind(), Some(UnusableKind::NoSample));
-        assert_eq!(err.to_string(), "no price received from the feed yet");
+        assert_eq!(err.to_string(), "no usable price from the feed");
     }
 
     /// `Stale` is the one `Unusable` message this branch retyped by hand (`ensure!` ->

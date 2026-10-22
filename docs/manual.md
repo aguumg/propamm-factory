@@ -225,11 +225,14 @@ second cap a backlog always shows, even one that started before the feed was dia
 lasts longer than the hour. A step of the host clock (an NTP correction, a resume from
 sleep) restarts the baseline.
 
-A venue whose latest frame was late is treated exactly like one that has gone silent: out
-of the average, its weight spread over the rest, until a prompt frame arrives. The pair's
-`min_sources` then decides, as it already does, whether the pair keeps publishing on the
-venues left or withdraws (an empty-tx cancel at every builder, kept in force until enough
-venues are fresh again). Nothing latches. `quote_updater_venue_late{pair, venue}` reads 1
+A venue whose latest frame was late is out of the average, its weight spread over the
+rest, until a prompt frame arrives. The pair's `min_sources` then decides, as it already
+does, whether the pair keeps publishing on the venues left. When it cannot, the composite
+withdraws its price at once, so the next tick is refused and the quote is cancelled at
+every builder (an empty-tx update, kept in force until enough venues are fresh again); it
+does not leave the last price standing to age out, since with a late venue that price was
+already behind. With a single venue, a late frame is therefore an immediate withdrawal.
+Nothing latches. `quote_updater_venue_late{pair, venue}` reads 1
 while a venue is out for this, the updater logs a line when it drops out and when it comes
 back, and `PusherVenueLate` raises a ticket after five minutes of it.
 
