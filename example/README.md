@@ -17,6 +17,11 @@ What it adds, one per extension point the library offers:
 `main()` at the bottom registers the four and calls `run_from_env()`. Everything else is the
 library's. The smallest possible binary is 30 lines; see the library README.
 
+It also registers the library's tokenized-stock kinds in two lines, `.us_market_hours()` and
+`.stock_issuer(Ondo)`, so a stock pair is one more stanza: `config.stocks.toml` is one, and
+[docs/stocks.md](../docs/stocks.md) the guide. The two guards are factory structs rather
+than closures so the backoffice has a form for their knobs.
+
 ## Run it against a local chain with your own PropAMM
 
 From the repo root:

@@ -75,6 +75,31 @@ jobs:
           help=$(./e2e/downstream/target/debug/downstream --help)
           printf '%s\n' "$help" | head -1
 
+  stocks-smoke:
+    name: Stocks smoke test (example binary against anvil and a mock Ondo API)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # e2e/stocks/run.sh runs the example binary against anvil, the contracts' own mocks and
+    # a local mock of Ondo's API: --check and each refusal it names, one landed push, an
+    # event that withdraws the quote. Nothing in it touches the network, so the script
+    # builds --offline; the fetch and the forge build are what fill Cargo's and forge's
+    # caches for it on a runner, which has no crate and no solc until then.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: example
+      - run: cargo fetch --locked --manifest-path example/Cargo.toml
+      # One step, so the contracts are built before the script's offline build by the
+      # step's own order: a fresh runner has no solc until this forge build fetches one.
+      - run: (cd contracts && forge build) && bash e2e/stocks/run.sh
+
   alert-rules:
     name: Alert rules (promtool)
     runs-on: ubuntu-latest

@@ -573,3 +573,42 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: "{{ $labels.pair }}: {{ $labels.call }} p95 past the 50ms requote budget"
+
+      # A stock pair's trading calendar (`us_market_hours`, in the library's stocks module) running out:
+      # past its listed_through date the guard withdraws every quote, since it cannot tell a
+      # holiday from a trading day there. The guard publishes the days left every tick and
+      # warns in its log from 30 days out; this is the same 30 days (pinned by a test in
+      # quote-updater/src/stocks/hours.rs), for whoever does not read the log. Silent on every pair
+      # without the guard, which never publishes the series.
+      #
+      # `>= 0`: past the last listed day the number goes negative, and that is
+      # PusherStockCalendarEnded's below, not a notice counting down past zero.
+      - alert: PusherStockCalendarEnding
+        expr: >-
+          quote_updater_diagnostic{kind="us_market_hours",name="calendar_days_left"} < 30 >= 0
+        for: 1h
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: the trading calendar ends in {{ $value }} days"
+          description: >-
+            The us_market_hours guard withdraws every quote past its listed_through date,
+            since it cannot tell a holiday from a trading day there. List the next year's NYSE
+            holidays and early closes in the pair's guard stanza, move listed_through, and
+            reload.
+
+      # The same calendar past its end: from then on the guard withdraws every quote on the
+      # pair, and this is the only rule that says so. A withdrawn quote is not a halt, so
+      # PusherNothingQuoting never counts it and the pair looks idle rather than down. The
+      # series is negated so `$value` reads as days past the end, not days left below zero.
+      - alert: PusherStockCalendarEnded
+        expr: >-
+          -quote_updater_diagnostic{kind="us_market_hours",name="calendar_days_left"} > 0
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: {{ $value }} days past the end of its trading calendar, nothing is quoting"
+          description: >-
+            The pair's calendar ran past its listed_through date without being extended, so
+            the us_market_hours guard has withdrawn every quote since. List the next year's
+            NYSE holidays and early closes in the pair's guard stanza, move listed_through,
+            and reload.

@@ -1,5 +1,8 @@
 <label>
   <span class=key>{{ field.label }}</span>
+  {% if field.multiline %}
+  <textarea name="{{ field.name }}" placeholder="{{ field.placeholder }}" rows=6 spellcheck=false>{{ field.value }}</textarea>
+  {% else %}
   <input type="{% if field.secret %}password{% else %}text{% endif %}"
          name="{{ field.name }}"
          value="{{ field.value }}"
@@ -7,5 +10,6 @@
          spellcheck=false
                   autocomplete="{% if field.secret %}new-password{% else %}off{% endif %}"
          {% if field.readonly %}readonly{% endif %}>
+  {% endif %}
   <span class=fieldhint>{{ field.hint }}</span>
 </label>

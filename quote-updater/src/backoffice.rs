@@ -487,30 +487,197 @@ fn pricing_stanza(
             )
         }
     })?;
-    let existing_kind = existing
-        .and_then(|t| t.get("kind"))
-        .and_then(|k| k.as_str());
-    if fields.is_empty() && existing_kind == Some(kind) {
-        return Ok(existing.cloned().unwrap_or_default());
-    }
-    let mut table = toml::Table::new();
+    kind_stanza("pricing", fields, kind, existing, posted)
+}
+
+/// A kind's stanza from what the form posted: the stanza the pair has when it is of this
+/// kind, then each declared field the post carries, written by its type ([`field_toml`]) or
+/// removed when posted blank. Shared by the pricing section (`prefix` is `pricing`) and the
+/// guards section (`guard`), whose inputs are named `<prefix>_<kind>_<field>`.
+///
+/// Starting from the pair's own stanza is what keeps a key the kind accepts but does not
+/// declare as a field through a save, and what keeps a declared field's value when the post
+/// does not carry its input at all (a page rendered before the field existed, a scripted
+/// post): a missing input is not a blank one, which for a list would write `[]` over a
+/// required calendar. A kind that declares no fields keeps its stanza whole (the page
+/// cannot edit one, and says so); a kind the pair did not have gets a stanza naming it.
+pub(crate) fn kind_stanza(
+    prefix: &str,
+    fields: &'static [crate::pricing::FormField],
+    kind: &str,
+    existing: Option<&toml::Table>,
+    posted: &std::collections::HashMap<String, String>,
+) -> Result<toml::Table> {
+    let mut table = match existing {
+        Some(existing) if existing.get("kind").and_then(|k| k.as_str()) == Some(kind) => {
+            existing.clone()
+        }
+        _ => toml::Table::new(),
+    };
     table.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
     for field in fields {
-        let key = format!("pricing_{kind}_{}", field.name);
-        if let Some(value) = posted.get(&key).and_then(|v| optional(v)) {
-            let value = if field.number {
-                match (value.parse::<i64>(), value.parse::<f64>()) {
-                    (Ok(int), _) => toml::Value::Integer(int),
-                    (_, Ok(float)) if float.is_finite() => toml::Value::Float(float),
-                    _ => bail!("`{}` must be a number, got {value:?}", field.name),
-                }
-            } else {
-                toml::Value::String(value)
-            };
-            table.insert(field.name.to_owned(), value);
-        }
+        let key = format!("{prefix}_{kind}_{}", field.name);
+        let Some(text) = posted.get(&key) else {
+            continue;
+        };
+        match field_toml(field, text)? {
+            Some(value) => table.insert(field.name.to_owned(), value),
+            None => table.remove(field.name),
+        };
     }
     Ok(table)
+}
+
+/// The pair's `[[pairs.guards]]` stanzas from what the guards section posted. A pair holds
+/// one stanza per kind, so the section is one block per registered kind: its checkbox,
+/// `enabled_guard_<kind>`, and the kind's fields, named `guard_<kind>_<field>`. The checkbox
+/// is outside the fields' prefix, so no field a kind declares can be its name. The pair's existing stanzas
+/// come first, in their order: each is rebuilt from its block if its kind declares fields,
+/// kept as written if it declares none or nobody registered it (the page shows it as edited
+/// in the file), and dropped if its box is unchecked. Then every registered kind the pair
+/// did not have, if checked, appended; one unchecked but with text in its fields refuses the
+/// save, since its fields render blank and the text was typed for a guard that would be
+/// dropped without a word. A page rendered before the section existed posts no
+/// `guards_present`, and keeps the pair's guards as they were.
+fn guard_stanzas(
+    kinds: &crate::kinds::Kinds,
+    existing: &[toml::Table],
+    posted: &std::collections::HashMap<String, String>,
+) -> Result<Vec<toml::Table>> {
+    if !posted.contains_key("guards_present") {
+        return Ok(existing.to_vec());
+    }
+    let enabled = |kind: &str| posted.contains_key(&format!("enabled_guard_{kind}"));
+    let mut guards = Vec::with_capacity(existing.len());
+    let mut seen: Vec<&str> = Vec::with_capacity(existing.len());
+    for stanza in existing {
+        let Some(kind) = stanza.get("kind").and_then(|k| k.as_str()) else {
+            // A stanza no kind names: kept for the reload to refuse by name.
+            guards.push(stanza.clone());
+            continue;
+        };
+        seen.push(kind);
+        if !enabled(kind) {
+            continue;
+        }
+        match kinds.guard_fields(kind) {
+            Some(fields) if !fields.is_empty() => {
+                guards.push(kind_stanza("guard", fields, kind, Some(stanza), posted)?);
+            }
+            _ => guards.push(stanza.clone()),
+        }
+    }
+    for kind in kinds.guard_kinds() {
+        if seen.contains(&kind) {
+            continue;
+        }
+        let fields = kinds.guard_fields(kind).unwrap_or(&[]);
+        if !enabled(kind) {
+            let filled: Vec<&str> = fields
+                .iter()
+                .map(|field| field.name)
+                .filter(|name| {
+                    posted
+                        .get(&format!("guard_{kind}_{name}"))
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+                .collect();
+            if !filled.is_empty() {
+                bail!(
+                    "guard `{kind}` has {} filled in but its box is not ticked: tick it to \
+                     add the guard, or clear the fields",
+                    filled.join(", ")
+                );
+            }
+            continue;
+        }
+        guards.push(kind_stanza("guard", fields, kind, None, posted)?);
+    }
+    Ok(guards)
+}
+
+/// What an input's text writes into the stanza, by the field's type, or `None` for a blank,
+/// which is an absent key so the kind's default applies. A list is the exception: its empty
+/// textarea is an empty array, since the key is required where a list is used.
+fn field_toml(field: &crate::pricing::FormField, text: &str) -> Result<Option<toml::Value>> {
+    use crate::pricing::FieldKind;
+    Ok(match field.kind {
+        FieldKind::Text => optional(text).map(toml::Value::String),
+        FieldKind::Number => match optional(text) {
+            None => None,
+            Some(value) => Some(match (value.parse::<i64>(), value.parse::<f64>()) {
+                (Ok(int), _) => toml::Value::Integer(int),
+                (_, Ok(float)) if float.is_finite() => toml::Value::Float(float),
+                _ => bail!("`{}` must be a number, got {value:?}", field.name),
+            }),
+        },
+        FieldKind::List => Some(toml::Value::Array(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| toml::Value::String(line.to_owned()))
+                .collect(),
+        )),
+        FieldKind::Env => match optional(text) {
+            None => None,
+            Some(name) => {
+                // Not echoed: what is not a variable's name may be the secret itself.
+                if !is_variable_name(&name) {
+                    bail!(
+                        "`{}` must be the name of an environment variable (letters, digits \
+                         and underscores), never its value",
+                        field.name
+                    );
+                }
+                let mut env = toml::Table::new();
+                env.insert("env".to_owned(), toml::Value::String(name));
+                Some(toml::Value::Table(env))
+            }
+        },
+    })
+}
+
+/// Whether `name` is spelled like an environment variable: a letter or underscore, then
+/// letters, digits and underscores.
+fn is_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A stanza value as the edit page shows it in the field's input: a number as TOML writes
+/// it, a list one item per line, an env reference as the variable's name, a string as it
+/// is. A value of another shape than the field's type writes (a number written by hand for
+/// a text field, say) still shows, so a save does not drop it; what cannot show is blank.
+pub(crate) fn field_value(
+    field: &crate::pricing::FormField,
+    value: Option<&toml::Value>,
+) -> String {
+    use crate::pricing::FieldKind;
+    match (field.kind, value) {
+        (_, None) => String::new(),
+        (FieldKind::List, Some(toml::Value::Array(items))) => items
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        (FieldKind::Env, Some(toml::Value::Table(table))) => table
+            .get("env")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        (FieldKind::Env | FieldKind::List, Some(_)) => String::new(),
+        (FieldKind::Text | FieldKind::Number, Some(scalar)) => match scalar {
+            toml::Value::String(text) => text.clone(),
+            toml::Value::Integer(int) => int.to_string(),
+            // `{:?}` keeps a whole float a float (`1.0`), so it is written back as one.
+            toml::Value::Float(float) => format!("{float:?}"),
+            toml::Value::Boolean(flag) => flag.to_string(),
+            _ => String::new(),
+        },
+    }
 }
 
 async fn add_pair(
@@ -560,7 +727,7 @@ fn pair_from_form(form: &AddPair, kinds: &crate::kinds::Kinds) -> Result<RawPair
         halted: false,
         halt_reason: None,
         pricing: pricing_stanza(kinds, &form.pricing, None, &form.kind_fields)?,
-        guards: Vec::new(),
+        guards: guard_stanzas(kinds, &[], &form.kind_fields)?,
     };
     apply_sources(&mut pair, &form.sources, &form.symbol)?;
     Ok(pair)
@@ -1312,6 +1479,7 @@ async fn edit_pair(
 fn edit_from_form(pair: &mut RawPair, form: &EditPair, kinds: &crate::kinds::Kinds) -> Result<()> {
     apply_sources(pair, &form.sources, &form.symbol)?;
     pair.pricing = pricing_stanza(kinds, &form.pricing, Some(&pair.pricing), &form.kind_fields)?;
+    pair.guards = guard_stanzas(kinds, &pair.guards, &form.kind_fields)?;
     pair.min_mid = optional(&form.min_mid);
     pair.max_mid = optional(&form.max_mid);
     pair.max_deviation = optional(&form.max_deviation);
@@ -1720,6 +1888,8 @@ struct Filled {
     secret: bool,
     value: String,
     readonly: bool,
+    /// A textarea rather than an input: a list field, one item per line.
+    multiline: bool,
 }
 
 impl Filled {
@@ -1732,20 +1902,28 @@ impl Filled {
             secret: field.secret,
             value: value.unwrap_or_default().to_owned(),
             readonly: false,
+            multiline: false,
         }
     }
 
-    /// A pricing kind's declared field, posted as `pricing_<kind>_<field>` so every kind's
-    /// section can be on the page at once ([`pricing_stanza`] reads the chosen kind's).
-    fn kind_field(kind: &str, field: &crate::pricing::FormField, value: Option<&str>) -> Self {
+    /// A kind's declared field, posted as `<prefix>_<kind>_<field>` so every kind's section
+    /// can be on the page at once ([`kind_stanza`] reads the chosen kind's), its current
+    /// value read back by its type ([`field_value`]).
+    fn kind_field(
+        prefix: &str,
+        kind: &str,
+        field: &crate::pricing::FormField,
+        value: Option<&toml::Value>,
+    ) -> Self {
         Self {
-            name: format!("pricing_{kind}_{}", field.name),
+            name: format!("{prefix}_{kind}_{}", field.name),
             label: field.name,
             placeholder: field.placeholder,
             hint: field.hint,
             secret: false,
-            value: value.unwrap_or_default().to_owned(),
+            value: field_value(field, value),
             readonly: false,
+            multiline: field.kind == crate::pricing::FieldKind::List,
         }
     }
 
@@ -1994,6 +2172,8 @@ struct PairFormPage {
     min_sources: Filled,
     /// One section per registered pricing kind, the pair's own checked.
     kinds: Vec<KindSection>,
+    /// One block per guard kind; see [`GuardSection`].
+    guards: Vec<GuardSection>,
     allow_symbol_mismatch: bool,
 }
 
@@ -2099,6 +2279,19 @@ struct KindSection {
     in_file: bool,
 }
 
+/// One registered guard kind's block of the pair form (or a kind the pair uses that nobody
+/// registered): its checkbox, its help and its fields, filled from the pair's stanza of
+/// that kind when it has one.
+struct GuardSection {
+    name: String,
+    /// The pair has a stanza of this kind: the box is checked.
+    enabled: bool,
+    help: &'static str,
+    fields: Vec<Filled>,
+    /// A kind with no declared fields: the page says the stanza is edited in the file.
+    in_file: bool,
+}
+
 fn render_pair_form(pair: Option<&RawPair>, kinds: &crate::kinds::Kinds) -> String {
     render_pair_form_with(pair, kinds, None)
 }
@@ -2160,11 +2353,50 @@ fn render_pair_form_with(
                     .map(|field| {
                         let value = if mine {
                             pair.and_then(|p| p.pricing.get(field.name))
-                                .and_then(|v| v.as_str())
                         } else {
                             None
                         };
-                        Filled::kind_field(name, field, value)
+                        Filled::kind_field("pricing", name, field, value)
+                    })
+                    .collect(),
+                in_file: fields.is_empty(),
+            }
+        })
+        .collect();
+
+    // One block per registered guard kind, the pair's own checked and filled; a kind the
+    // pair uses that nobody registered is shown after them, so its stanza is not lost.
+    let stanza_of = |kind: &str| {
+        pair.and_then(|p| {
+            p.guards
+                .iter()
+                .find(|g| g.get("kind").and_then(|k| k.as_str()) == Some(kind))
+        })
+    };
+    let mut guard_names: Vec<String> = kinds.guard_kinds().iter().map(|k| k.to_string()).collect();
+    for kind in pair
+        .into_iter()
+        .flat_map(|p| p.guards.iter())
+        .filter_map(|g| g.get("kind").and_then(|k| k.as_str()))
+    {
+        if !guard_names.iter().any(|n| n == kind) {
+            guard_names.push(kind.to_owned());
+        }
+    }
+    let guard_sections: Vec<GuardSection> = guard_names
+        .iter()
+        .map(|name| {
+            let stanza = stanza_of(name);
+            let fields = kinds.guard_fields(name).unwrap_or(&[]);
+            GuardSection {
+                name: name.clone(),
+                enabled: stanza.is_some(),
+                help: kinds.guard_form_help(name).unwrap_or(""),
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        let value = stanza.and_then(|s| s.get(field.name));
+                        Filled::kind_field("guard", name, field, value)
                     })
                     .collect(),
                 in_file: fields.is_empty(),
@@ -2225,6 +2457,7 @@ fn render_pair_form_with(
             .collect(),
         min_sources: knob(&MIN_SOURCES_FIELD, |p| p.min_sources.as_deref()),
         kinds: kind_sections,
+        guards: guard_sections,
         allow_symbol_mismatch: pair.is_some_and(|pair| pair.allow_symbol_mismatch),
     }
     .render()
@@ -2326,6 +2559,54 @@ mod tests {
             crate::kinds::fn_factory(|_: Skewed, _: &mut crate::pricing::BuildCtx| {
                 Ok(SkewedPricer)
             }),
+        );
+        // Two guard kinds: `cap` declares a field, `plain` declares none.
+        #[derive(Clone, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Cap {
+            #[allow(dead_code)]
+            max_share: f64,
+        }
+        #[derive(Clone, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Nothing {}
+        struct Allow;
+        impl crate::guard::QuoteGuard for Allow {
+            fn check(
+                &mut self,
+                _: &crate::guard::Candidate<'_>,
+                _: &mut crate::pricing::Diagnostics,
+            ) -> crate::guard::Gate {
+                crate::guard::Gate::Allow
+            }
+        }
+        struct CapFactory;
+        impl crate::pricing::QuoteGuardFactory for CapFactory {
+            type Config = Cap;
+            type Guard = Allow;
+            fn fields(&self) -> &'static [crate::pricing::FormField] {
+                const FIELDS: &[crate::pricing::FormField] = &[crate::pricing::FormField::number(
+                    "max_share",
+                    "0.8",
+                    "withdraw while the base share is past this",
+                )];
+                FIELDS
+            }
+            fn form_help(&self) -> &'static str {
+                "<p class=explain>a cap on the vault's base share</p>"
+            }
+            fn build<'a>(
+                &'a self,
+                _: &'a Cap,
+                _: &'a mut crate::pricing::BuildCtx,
+            ) -> crate::pricing::BoxFuture<'a, eyre::Result<Allow>> {
+                Box::pin(std::future::ready(Ok(Allow)))
+            }
+        }
+        kinds.insert_guard("cap", crate::kinds::quote_guard_factory(CapFactory));
+        kinds.insert_guard(
+            "plain",
+            crate::kinds::quote_guard_fn(|_: Nothing, _: &mut crate::pricing::BuildCtx| Ok(Allow)),
         );
         Arc::new(kinds)
     }
@@ -3670,37 +3951,44 @@ api_key = "k"
     /// refused, and a kind with no fields keeps a stanza it already prices.
     /// A kind whose config reads numbers declares its fields as numbers, and the page writes
     /// them as TOML numbers; a value that is not one is refused rather than written.
+    /// A pricing kind with two number fields, for the tests of how numbers are written and
+    /// read back.
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Numeric {
+        #[allow(dead_code)]
+        half_spread: f64,
+        #[allow(dead_code)]
+        age_secs: u64,
+    }
+    struct NumericFactory;
+    impl crate::pricing::Factory for NumericFactory {
+        type Config = Numeric;
+        type Pricer = crate::pricing::FixedPricer;
+        fn fields(&self) -> &'static [crate::pricing::FormField] {
+            const FIELDS: &[crate::pricing::FormField] = &[
+                crate::pricing::FormField::number("half_spread", "0.0005", ""),
+                crate::pricing::FormField::number("age_secs", "60", ""),
+            ];
+            FIELDS
+        }
+        fn build<'a>(
+            &'a self,
+            _: &'a Numeric,
+            _: &'a mut crate::pricing::BuildCtx,
+        ) -> crate::pricing::BoxFuture<'a, eyre::Result<Self::Pricer>> {
+            Box::pin(std::future::ready(Err(eyre!("not built here"))))
+        }
+    }
+    fn numeric_kinds() -> crate::kinds::Kinds {
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert("numeric", Arc::new(NumericFactory));
+        kinds
+    }
+
     #[test]
     fn a_numeric_field_is_written_as_a_number() {
-        #[derive(Clone, serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Numeric {
-            #[allow(dead_code)]
-            half_spread: f64,
-            #[allow(dead_code)]
-            age_secs: u64,
-        }
-        struct Fields;
-        impl crate::pricing::Factory for Fields {
-            type Config = Numeric;
-            type Pricer = crate::pricing::FixedPricer;
-            fn fields(&self) -> &'static [crate::pricing::FormField] {
-                const FIELDS: &[crate::pricing::FormField] = &[
-                    crate::pricing::FormField::number("half_spread", "0.0005", ""),
-                    crate::pricing::FormField::number("age_secs", "60", ""),
-                ];
-                FIELDS
-            }
-            fn build<'a>(
-                &'a self,
-                _: &'a Numeric,
-                _: &'a mut crate::pricing::BuildCtx,
-            ) -> crate::pricing::BoxFuture<'a, eyre::Result<Self::Pricer>> {
-                Box::pin(std::future::ready(Err(eyre!("not built here"))))
-            }
-        }
-        let mut kinds = crate::kinds::Kinds::default();
-        kinds.insert("numeric", Arc::new(Fields));
+        let kinds = numeric_kinds();
         let posted = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
             pairs
                 .iter()
@@ -4422,5 +4710,628 @@ api_key = "k"
             "{form}"
         );
         assert!(!form.contains(r#"name="pricing_skewed_"#), "{form}");
+    }
+
+    /// A list field is a textarea, one item per line: trimmed, blank lines dropped, a
+    /// browser's `\r\n` taken, and an empty textarea an empty array with the key present.
+    #[test]
+    fn a_list_field_is_written_as_an_array_of_trimmed_lines() {
+        const FIELDS: &[crate::pricing::FormField] =
+            &[crate::pricing::FormField::list("holidays", "", "")];
+        let posted = |value: &str| -> std::collections::HashMap<String, String> {
+            [("guard_cal_holidays".to_owned(), value.to_owned())]
+                .into_iter()
+                .collect()
+        };
+        let table = kind_stanza(
+            "guard",
+            FIELDS,
+            "cal",
+            None,
+            &posted("2026-11-26\r\n\r\n 2026-12-25 \n"),
+        )
+        .unwrap();
+        assert_eq!(
+            table.get("holidays"),
+            Some(&toml::Value::Array(vec![
+                toml::Value::String("2026-11-26".to_owned()),
+                toml::Value::String("2026-12-25".to_owned()),
+            ]))
+        );
+        let table = kind_stanza("guard", FIELDS, "cal", None, &posted("")).unwrap();
+        assert_eq!(table.get("holidays"), Some(&toml::Value::Array(Vec::new())));
+    }
+
+    /// A declared field the post does not carry (a page rendered before the field existed,
+    /// a scripted post) keeps the value the stanza has rather than reading as blank: for a
+    /// list, blank writes `[]`, and a required calendar would be replaced with nothing. A
+    /// field posted blank is cleared, so the kind's default applies.
+    #[test]
+    fn a_declared_field_missing_from_the_post_keeps_the_stanzas_value() {
+        const FIELDS: &[crate::pricing::FormField] = &[
+            crate::pricing::FormField::list("holidays", "", ""),
+            crate::pricing::FormField::number("open_delay_secs", "", ""),
+        ];
+        let mut existing = guard_table("cal", None);
+        existing.insert(
+            "holidays".to_owned(),
+            toml::Value::Array(vec![toml::Value::String("2026-11-26".to_owned())]),
+        );
+        existing.insert("open_delay_secs".to_owned(), toml::Value::Integer(60));
+        let posted = posted_map(&[("guard_cal_open_delay_secs", "90")]);
+        let table = kind_stanza("guard", FIELDS, "cal", Some(&existing), &posted).unwrap();
+        assert_eq!(table.get("holidays"), existing.get("holidays"), "{table:?}");
+        assert_eq!(
+            table.get("open_delay_secs"),
+            Some(&toml::Value::Integer(90))
+        );
+        let posted = posted_map(&[("guard_cal_open_delay_secs", "")]);
+        let table = kind_stanza("guard", FIELDS, "cal", Some(&existing), &posted).unwrap();
+        assert_eq!(table.get("open_delay_secs"), None, "{table:?}");
+    }
+
+    /// A key the kind's config accepts but its form does not declare survives a save: the
+    /// rebuilt stanza starts from the one the pair has, when that is the same kind.
+    #[test]
+    fn a_key_the_kind_accepts_but_does_not_declare_survives_a_save() {
+        const FIELDS: &[crate::pricing::FormField] =
+            &[crate::pricing::FormField::number("max_share", "", "")];
+        let mut existing = guard_table("cap", Some(("max_share", 0.8)));
+        existing.insert("extra".to_owned(), toml::Value::Integer(1));
+        let posted = posted_map(&[("guard_cap_max_share", "0.7")]);
+        let table = kind_stanza("guard", FIELDS, "cap", Some(&existing), &posted).unwrap();
+        assert_eq!(
+            table.get("extra"),
+            Some(&toml::Value::Integer(1)),
+            "{table:?}"
+        );
+        assert_eq!(table.get("max_share"), Some(&toml::Value::Float(0.7)));
+        // A stanza of another kind is no base: its keys are that kind's.
+        let other = guard_table("other", Some(("max_share", 0.5)));
+        let table = kind_stanza("guard", FIELDS, "cap", Some(&other), &posted).unwrap();
+        assert_eq!(table.get("max_share"), Some(&toml::Value::Float(0.7)));
+        assert_eq!(table.len(), 2, "{table:?}");
+    }
+
+    /// An env field holds the name of a variable and is written as `{ env = "NAME" }`; a
+    /// value that is not a variable name (a pasted secret, say) is refused without being
+    /// echoed.
+    #[test]
+    fn an_env_field_is_written_as_an_env_table_and_refuses_what_is_not_a_variable_name() {
+        const FIELDS: &[crate::pricing::FormField] = &[crate::pricing::FormField::env(
+            "api_key",
+            "ONDO_API_KEY",
+            "",
+        )];
+        let posted = |value: &str| -> std::collections::HashMap<String, String> {
+            [("pricing_ondo_api_key".to_owned(), value.to_owned())]
+                .into_iter()
+                .collect()
+        };
+        let table =
+            kind_stanza("pricing", FIELDS, "ondo", None, &posted(" ONDO_API_KEY ")).unwrap();
+        let mut env = toml::Table::new();
+        env.insert(
+            "env".to_owned(),
+            toml::Value::String("ONDO_API_KEY".to_owned()),
+        );
+        assert_eq!(table.get("api_key"), Some(&toml::Value::Table(env)));
+        let err = format!(
+            "{:#}",
+            kind_stanza("pricing", FIELDS, "ondo", None, &posted("sk-live-123")).unwrap_err()
+        );
+        assert!(err.contains("variable"), "{err}");
+        assert!(
+            !err.contains("sk-live"),
+            "the value must not be echoed: {err}"
+        );
+    }
+
+    /// The edit page reads each field back by its type: a float as written, a list one
+    /// item per line, an env reference as the variable's name.
+    #[test]
+    fn every_field_type_reads_back_for_the_edit_page() {
+        use crate::pricing::FormField;
+        let number = FormField::number("gap", "", "");
+        assert_eq!(
+            field_value(&number, Some(&toml::Value::Float(0.001))),
+            "0.001"
+        );
+        assert_eq!(field_value(&number, Some(&toml::Value::Integer(60))), "60");
+        let list = FormField::list("holidays", "", "");
+        let dates = toml::Value::Array(vec![
+            toml::Value::String("2026-11-26".to_owned()),
+            toml::Value::String("2026-12-25".to_owned()),
+        ]);
+        assert_eq!(field_value(&list, Some(&dates)), "2026-11-26\n2026-12-25");
+        let env = FormField::env("api_key", "", "");
+        let mut table = toml::Table::new();
+        table.insert("env".to_owned(), toml::Value::String("K".to_owned()));
+        assert_eq!(field_value(&env, Some(&toml::Value::Table(table))), "K");
+        let text = FormField::new("symbol", "", "");
+        assert_eq!(field_value(&text, None), "");
+        assert_eq!(
+            field_value(&text, Some(&toml::Value::String("AAPLon".to_owned()))),
+            "AAPLon"
+        );
+    }
+
+    /// The edit page used to read every field as a string, so a number field rendered blank
+    /// and saving the page dropped the operator's value.
+    #[test]
+    fn a_number_field_shows_its_current_value_on_the_edit_page() {
+        let mut config: config::RawConfig = toml::from_str(CUSTOM_PAIR).unwrap();
+        let mut pricing = toml::Table::new();
+        pricing.insert("kind".to_owned(), toml::Value::String("numeric".to_owned()));
+        pricing.insert("half_spread".to_owned(), toml::Value::Float(0.0005));
+        pricing.insert("age_secs".to_owned(), toml::Value::Integer(60));
+        config.pairs[0].pricing = pricing;
+        let form = render_pair_form(Some(&config.pairs[0]), &numeric_kinds());
+        assert!(
+            form.contains("name=\"pricing_numeric_half_spread\"\n         value=\"0.0005\""),
+            "{form}"
+        );
+        assert!(
+            form.contains("name=\"pricing_numeric_age_secs\"\n         value=\"60\""),
+            "{form}"
+        );
+    }
+
+    fn posted_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn guard_table(kind: &str, number: Option<(&str, f64)>) -> toml::Table {
+        let mut table = toml::Table::new();
+        table.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
+        if let Some((key, value)) = number {
+            table.insert(key.to_owned(), toml::Value::Float(value));
+        }
+        table
+    }
+
+    /// The guards section: a registered kind's block is written when its box is checked and
+    /// removed when not; a kind that declares no fields is written as the kind alone; the
+    /// pair's existing stanzas keep their order and newly checked kinds append.
+    #[test]
+    fn enabled_guard_kinds_are_written_and_disabled_ones_removed() {
+        let kinds = test_kinds();
+        let existing = vec![guard_table("plain", None)];
+        let cap = guard_table("cap", Some(("max_share", 0.8)));
+        let written = guard_stanzas(
+            &kinds,
+            &existing,
+            &posted_map(&[
+                ("guards_present", "1"),
+                ("enabled_guard_cap", "on"),
+                ("guard_cap_max_share", "0.8"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(written, vec![cap.clone()]);
+        let written = guard_stanzas(
+            &kinds,
+            &existing,
+            &posted_map(&[
+                ("guards_present", "1"),
+                ("enabled_guard_plain", "on"),
+                ("enabled_guard_cap", "on"),
+                ("guard_cap_max_share", "0.8"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(written, vec![existing[0].clone(), cap]);
+        // A page rendered before the guards section existed posts no `guards_present`: the
+        // pair's guards are kept, not wiped.
+        let written =
+            guard_stanzas(&kinds, &existing, &posted_map(&[("pricing", "feed")])).unwrap();
+        assert_eq!(written, existing);
+    }
+
+    /// A registered guard the pair does not have, with text in its fields but its box not
+    /// ticked, refuses the save naming the fields; blank fields under an unticked box are
+    /// the page as rendered and pass. Unticking a guard the pair has removes it even though
+    /// its fields still carry the stanza's values.
+    #[test]
+    fn a_filled_but_unticked_guard_refuses_the_save() {
+        let kinds = test_kinds();
+        let err = guard_stanzas(
+            &kinds,
+            &[],
+            &posted_map(&[("guards_present", "1"), ("guard_cap_max_share", "0.8")]),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("guard `cap` has max_share filled in"),
+            "{message}"
+        );
+        assert!(message.contains("not ticked"), "{message}");
+        let written = guard_stanzas(
+            &kinds,
+            &[],
+            &posted_map(&[("guards_present", "1"), ("guard_cap_max_share", "  ")]),
+        )
+        .unwrap();
+        assert_eq!(written, Vec::<toml::Table>::new());
+        let existing = vec![guard_table("cap", Some(("max_share", 0.8)))];
+        let written = guard_stanzas(
+            &kinds,
+            &existing,
+            &posted_map(&[("guards_present", "1"), ("guard_cap_max_share", "0.8")]),
+        )
+        .unwrap();
+        assert_eq!(written, Vec::<toml::Table>::new());
+    }
+
+    /// A guard of a kind this binary does not register is shown as edited in the file and
+    /// kept as written while its box is checked.
+    #[test]
+    fn a_guard_of_a_kind_nobody_registered_passes_through_while_enabled() {
+        let kinds = test_kinds();
+        let mut exotic = guard_table("exotic", None);
+        exotic.insert("x".to_owned(), toml::Value::Integer(1));
+        let existing = vec![exotic];
+        let written = guard_stanzas(
+            &kinds,
+            &existing,
+            &posted_map(&[("guards_present", "1"), ("enabled_guard_exotic", "on")]),
+        )
+        .unwrap();
+        assert_eq!(written, existing);
+        let written =
+            guard_stanzas(&kinds, &existing, &posted_map(&[("guards_present", "1")])).unwrap();
+        assert_eq!(written, Vec::<toml::Table>::new());
+    }
+
+    /// The guards section: one block per registered guard kind, the pair's own checked and
+    /// filled, a kind without fields marked as edited in the file, and the hidden input that
+    /// tells the handler the page has the section.
+    #[test]
+    fn the_pair_form_shows_one_block_per_guard_kind_with_the_pairs_own_checked() {
+        let mut config = a_config();
+        config.pairs[0].guards = vec![guard_table("cap", Some(("max_share", 0.8)))];
+        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
+        assert!(
+            form.contains(r#"name="enabled_guard_cap" checked"#),
+            "{form}"
+        );
+        assert!(
+            form.contains("name=\"guard_cap_max_share\"\n         value=\"0.8\""),
+            "{form}"
+        );
+        assert!(
+            form.contains(r#"name="enabled_guard_plain">"#),
+            "plain is offered, unchecked: {form}"
+        );
+        assert_eq!(
+            form.matches("[[pairs.guards]]").count(),
+            1,
+            "plain alone is file-edited: {form}"
+        );
+        assert!(form.contains("name=guards_present"), "{form}");
+    }
+
+    /// Review focus: a pair priced by a kind this binary does not register, with a guard of
+    /// a kind it does not register either. Both show as edited in the file, and saving the
+    /// page as rendered changes neither stanza.
+    #[tokio::test]
+    async fn an_unregistered_guard_kind_and_an_unregistered_pricing_kind_both_show_as_file_edited_and_survive_a_save()
+     {
+        let (path, state, mut reloads) = config_on_disk("exotic-guard");
+        let with_guard = CUSTOM_PAIR.replace(
+            "\n[[builder]]",
+            "\n[[pairs.guards]]\nkind = \"exotic\"\nx = 1\n\n[[builder]]",
+        );
+        assert_ne!(with_guard, CUSTOM_PAIR);
+        std::fs::write(&path, with_guard).unwrap();
+        let raw = config::load_raw(&path).unwrap();
+        let (pricing_before, guards_before) =
+            (raw.pairs[0].pricing.clone(), raw.pairs[0].guards.clone());
+        assert_eq!(guards_before.len(), 1);
+        let page = render_pair_form(Some(&raw.pairs[0]), &test_kinds());
+        assert!(
+            page.contains(r#"name="enabled_guard_exotic" checked"#),
+            "{page}"
+        );
+        assert!(
+            page.contains("[[pairs.guards]]") && page.contains("[pairs.pricing]"),
+            "{page}"
+        );
+        let body = posted_fields(&page)
+            .iter()
+            .map(|(name, value)| format!("{}={}", urlencode(name), urlencode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
+        )
+        .await
+        .unwrap();
+        let service = tokio::spawn(async move {
+            let request = reloads.recv().await.expect("a reload must be requested");
+            let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
+        });
+        let posted = http(
+            local,
+            &format!(
+                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(posted.contains("303 See Other"), "{posted}");
+        service.await.unwrap();
+        let pair = &config::load_raw(&path).unwrap().pairs[0];
+        assert_eq!(pair.pricing, pricing_before);
+        assert_eq!(pair.guards, guards_before);
+    }
+
+    /// Through the real handler: checking a guard kind's box writes its stanza, and
+    /// unchecking it on the next save removes it.
+    #[tokio::test]
+    async fn a_guard_is_added_and_removed_from_the_edit_page() {
+        let (path, state, mut reloads) = config_on_disk("guards");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
+        )
+        .await
+        .unwrap();
+        let service = tokio::spawn(async move {
+            for _ in 0..2 {
+                let request = reloads.recv().await.expect("a reload must be requested");
+                let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
+            }
+        });
+        let post = |body: String| {
+            format!(
+                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let base = "key_env=UPDATER_KEY_WETH_USDC&symbol_binance=ETHUSDC&weight_binance=&min_sources=\
+                    &pricing=feed&pricing_feed_delta=0.0005&min_mid=&max_mid=&max_deviation=\
+                    &max_deviation_window=&max_deviation_window_blocks=&guards_present=1";
+        let posted = http(
+            local,
+            &post(format!(
+                "{base}&enabled_guard_cap=on&guard_cap_max_share=0.8"
+            )),
+        )
+        .await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        assert_eq!(
+            config::load_raw(&path).unwrap().pairs[0].guards,
+            vec![guard_table("cap", Some(("max_share", 0.8)))]
+        );
+        let posted = http(local, &post(base.to_owned())).await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        service.await.unwrap();
+        assert!(config::load_raw(&path).unwrap().pairs[0].guards.is_empty());
+    }
+
+    /// A stock pair added from the page with the `ondo` kind and both guards is the example
+    /// stanza, the one the smoke test runs: nothing about a stock pair needs the file.
+    #[tokio::test]
+    async fn a_stock_pair_added_from_the_page_is_the_example_stanza() {
+        use crate::stocks::{Issuer, hours::UsMarketHoursFactory, issuers::ondo::Ondo};
+        let example: config::RawConfig =
+            toml::from_str(include_str!("../../example/config.stocks.toml")).unwrap();
+        let want = example.pairs[0].clone();
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert("ondo", Arc::new(Ondo));
+        kinds.insert_guard(
+            "us_market_hours",
+            crate::kinds::quote_guard_factory(UsMarketHoursFactory),
+        );
+        kinds.insert_guard(
+            "ondo_token",
+            crate::kinds::quote_guard_factory(Ondo.token_guard()),
+        );
+        let (path, state, mut reloads) = config_on_disk("stock-pair");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(kinds),
+        )
+        .await
+        .unwrap();
+        let service = tokio::spawn(async move {
+            let request = reloads.recv().await.expect("a reload must be requested");
+            let _ = request.reply.send(Ok("reload: 1 started".to_owned()));
+        });
+        let (pricing, hours, token) = (&want.pricing, &want.guards[0], &want.guards[1]);
+        let text = |table: &toml::Table, key: &str| table[key].as_str().unwrap().to_owned();
+        let lines = |key: &str| {
+            hours[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let fields: Vec<(&str, String)> = vec![
+            ("token0", want.tokens[0].clone()),
+            ("token1", want.tokens[1].clone()),
+            ("key_env", want.key_env.clone()),
+            ("min_mid", want.min_mid.clone().unwrap()),
+            ("max_mid", want.max_mid.clone().unwrap()),
+            ("max_deviation", String::new()),
+            ("max_deviation_window", String::new()),
+            ("max_deviation_window_blocks", String::new()),
+            ("allow_symbol_mismatch", "on".to_owned()),
+            ("pricing", "ondo".to_owned()),
+            ("pricing_ondo_symbol", text(pricing, "symbol")),
+            (
+                "pricing_ondo_api_key",
+                pricing["api_key"]["env"].as_str().unwrap().to_owned(),
+            ),
+            ("pricing_ondo_delta", text(pricing, "delta")),
+            ("guards_present", "1".to_owned()),
+            ("enabled_guard_us_market_hours", "on".to_owned()),
+            (
+                "guard_us_market_hours_open_delay_secs",
+                hours["open_delay_secs"].to_string(),
+            ),
+            (
+                "guard_us_market_hours_close_margin_secs",
+                hours["close_margin_secs"].to_string(),
+            ),
+            ("guard_us_market_hours_holidays", lines("holidays")),
+            ("guard_us_market_hours_early_closes", lines("early_closes")),
+            (
+                "guard_us_market_hours_listed_through",
+                text(hours, "listed_through"),
+            ),
+            ("enabled_guard_ondo_token", "on".to_owned()),
+            ("guard_ondo_token_poll_secs", token["poll_secs"].to_string()),
+            (
+                "guard_ondo_token_max_age_secs",
+                token["max_age_secs"].to_string(),
+            ),
+        ];
+        let body = fields
+            .iter()
+            .map(|(name, value)| format!("{}={}", urlencode(name), urlencode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let (ok, message) = post(local, "/pairs/add", &body).await;
+        assert!(ok, "{message}");
+        service.await.unwrap();
+        let written = config::load_raw(&path).unwrap();
+        let pair = written
+            .pairs
+            .iter()
+            .find(|p| p.key_env == want.key_env)
+            .expect("the stock pair was added");
+        assert_eq!(pair.tokens, want.tokens);
+        assert_eq!(pair.min_mid, want.min_mid);
+        assert_eq!(pair.max_mid, want.max_mid);
+        assert!(pair.allow_symbol_mismatch);
+        assert_eq!(pair.pricing, want.pricing);
+        // Every guard runs and the most severe answer wins, so the order of the stanzas
+        // carries nothing: a new pair's follow the registry's order, the example's its own.
+        let by_kind = |guards: &[toml::Table]| {
+            let mut sorted = guards.to_vec();
+            sorted.sort_by_key(|g| g["kind"].as_str().unwrap_or_default().to_owned());
+            sorted
+        };
+        assert_eq!(by_kind(&pair.guards), by_kind(&want.guards));
+    }
+
+    /// A pair priced by a kind that sources its own mid (a stock pair) lists no venue, and
+    /// the add page takes it that way: no symbol, no sources.
+    #[tokio::test]
+    async fn a_pair_whose_pricing_kind_sources_its_own_mid_saves_with_no_venue() {
+        let (path, state, mut reloads) = config_on_disk("no-venue");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
+        )
+        .await
+        .unwrap();
+        let service = tokio::spawn(async move {
+            let request = reloads.recv().await.expect("a reload must be requested");
+            let _ = request.reply.send(Ok("reload: 1 started".to_owned()));
+        });
+        let body = "token0=0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c\
+                    &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\
+                    &key_env=UPDATER_KEY_AAPLON_USDC&symbol_binance=&weight_binance=&min_sources=\
+                    &min_mid=150&max_mid=400&max_deviation=&max_deviation_window=\
+                    &max_deviation_window_blocks=&pricing=skewed&pricing_skewed_half_spread=0.001";
+        let (ok, message) = post(local, "/pairs/add", body).await;
+        assert!(ok, "{message}");
+        service.await.unwrap();
+        let written = config::load_raw(&path).unwrap();
+        let pair = written
+            .pairs
+            .iter()
+            .find(|p| p.key_env == "UPDATER_KEY_AAPLON_USDC")
+            .expect("the pair was added");
+        assert_eq!(pair.symbol, None);
+        assert!(pair.sources.is_empty());
+        assert_eq!(pair.min_sources, None);
+    }
+
+    /// A list field renders as a textarea holding the stanza's items one per line, so the
+    /// calendar is edited as it is written.
+    #[test]
+    fn a_list_field_renders_as_a_textarea_with_one_item_per_line() {
+        use crate::stocks::hours::UsMarketHoursFactory;
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert_guard(
+            "us_market_hours",
+            crate::kinds::quote_guard_factory(UsMarketHoursFactory),
+        );
+        let mut config = a_config();
+        let mut hours = guard_table("us_market_hours", None);
+        hours.insert(
+            "holidays".to_owned(),
+            toml::Value::Array(vec![
+                toml::Value::String("2026-11-26".to_owned()),
+                toml::Value::String("2026-12-25".to_owned()),
+            ]),
+        );
+        config.pairs[0].guards = vec![hours];
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert!(
+            form.contains(r#"<textarea name="guard_us_market_hours_holidays""#),
+            "{form}"
+        );
+        assert!(
+            form.contains(">2026-11-26\n2026-12-25</textarea>"),
+            "{form}"
+        );
+        assert!(
+            form.contains(r#"<textarea name="guard_us_market_hours_early_closes""#)
+                && form.contains("spellcheck=false></textarea>"),
+            "an absent list is an empty textarea: {form}"
+        );
+    }
+
+    /// A float with no fraction reads back as a float (`1.0`), so an unrelated save does
+    /// not rewrite `max_multiplier_gap = 1.0` as the integer `1`.
+    #[test]
+    fn a_whole_float_reads_back_as_a_float_and_is_written_back_as_one() {
+        let number = crate::pricing::FormField::number("gap", "", "");
+        let shown = field_value(&number, Some(&toml::Value::Float(1.0)));
+        assert_eq!(shown, "1.0");
+        assert_eq!(
+            field_toml(&number, &shown).unwrap(),
+            Some(toml::Value::Float(1.0))
+        );
+        assert_eq!(
+            field_value(&number, Some(&toml::Value::Float(0.001))),
+            "0.001"
+        );
     }
 }

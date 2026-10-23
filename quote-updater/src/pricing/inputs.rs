@@ -55,6 +55,43 @@ impl Chain {
             .map_err(|err| eyre::eyre!("encoding `{signature}`: {err}"))?;
         self.call(to, calldata).await
     }
+
+    /// [`Self::call`] as if `from` sent it, telling a call the contract refused from one
+    /// that could not be made: what a guard needs to ask whether a contract would let an
+    /// account do something, by trying it (a token transfer the PropAMM would make, say).
+    /// `Ok(CallOutcome::Reverted)` when the node ran the call and it reverted; `Err` only
+    /// when no answer came back: the node unreachable or slow, or an error that is not a
+    /// revert.
+    pub async fn call_as(
+        &self,
+        from: Address,
+        to: Address,
+        calldata: Vec<u8>,
+    ) -> eyre::Result<CallOutcome> {
+        crate::rpc::call_as(&self.client, from, to, calldata).await
+    }
+
+    /// [`Self::call_as`] with the calldata encoded here, as [`Self::call_sig`] does.
+    pub async fn call_sig_as(
+        &self,
+        from: Address,
+        to: Address,
+        signature: &str,
+        args: &[crate::calldata::Value],
+    ) -> eyre::Result<CallOutcome> {
+        let calldata = crate::calldata::encode_calldata(signature, args)
+            .map_err(|err| eyre::eyre!("encoding `{signature}`: {err}"))?;
+        self.call_as(from, to, calldata).await
+    }
+}
+
+/// What a call made with [`Chain::call_as`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallOutcome {
+    /// It ran to the end: its return data, undecoded.
+    Returned(Vec<u8>),
+    /// It reverted: the data it reverted with (a custom error, `Error(string)`, or none).
+    Reverted(Vec<u8>),
 }
 
 impl std::fmt::Debug for Chain {
@@ -183,5 +220,89 @@ impl LandingFeed {
 impl std::fmt::Debug for LandingFeed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "LandingFeed({:?})", self.latest())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ethrex_common::U256;
+    use ethrex_l2_common::calldata::Value;
+
+    use super::*;
+    use crate::rpc_mock::MockRpc;
+
+    async fn chain_on(rpc: &MockRpc) -> Chain {
+        let client = EthClient::new(url::Url::parse(&rpc.url).unwrap()).unwrap();
+        Chain::new(client, Address::repeat_byte(0x77))
+    }
+
+    /// Ondo's `UserBlocked(address)` custom error for 0x01…01: what a token answers a
+    /// transfer it refuses, as revert data.
+    fn user_blocked() -> Vec<u8> {
+        crate::calldata::encode_calldata(
+            "UserBlocked(address)",
+            &[Value::Address(Address::repeat_byte(0x01))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_call_the_contract_refuses_is_told_apart_from_one_that_fails() {
+        let rpc = MockRpc::spawn(100).await;
+        rpc.set_revert("transferFrom(address,address,uint256)", user_blocked());
+        let chain = chain_on(&rpc).await;
+        let (spender, token, vault) = (
+            Address::repeat_byte(0x77),
+            Address::repeat_byte(0x14),
+            Address::repeat_byte(0x01),
+        );
+        let transfer = [
+            Value::Address(vault),
+            Value::Address(vault),
+            Value::Uint(U256::zero()),
+        ];
+
+        let refused = chain
+            .call_sig_as(
+                spender,
+                token,
+                "transferFrom(address,address,uint256)",
+                &transfer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused, CallOutcome::Reverted(user_blocked()));
+
+        let answered = chain
+            .call_sig_as(spender, token, "decimals()", &[])
+            .await
+            .unwrap();
+        let mut eighteen = [0u8; 32];
+        eighteen[31] = 18;
+        assert_eq!(answered, CallOutcome::Returned(eighteen.to_vec()));
+
+        // An error that is not a revert is a read that failed, not a refusal.
+        rpc.set_failing("eth_call", true);
+        let failed = chain
+            .call_sig_as(
+                spender,
+                token,
+                "transferFrom(address,address,uint256)",
+                &transfer,
+            )
+            .await;
+        assert!(failed.is_err(), "{failed:?}");
+    }
+
+    #[tokio::test]
+    async fn the_call_is_made_as_the_account_named() {
+        let rpc = MockRpc::spawn(100).await;
+        let chain = chain_on(&rpc).await;
+        let spender = Address::repeat_byte(0x77);
+        chain
+            .call_sig_as(spender, Address::repeat_byte(0x14), "decimals()", &[])
+            .await
+            .unwrap();
+        assert_eq!(rpc.call_froms(), vec![spender]);
     }
 }

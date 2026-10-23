@@ -432,3 +432,97 @@ pub fn assert_rejects_unknown_fields<C: DeserializeOwned>(valid_stanza: &str) {
         ),
     }
 }
+
+// ----------------------------------------------------------------------------------------
+// A stock design's adapters: an HTTP API on this machine, and a chain answering only what
+// it was told to.
+// ----------------------------------------------------------------------------------------
+
+mod mock_http;
+pub use mock_http::MockApi;
+
+use std::collections::HashMap;
+
+use crate::{
+    Address,
+    calldata::{Value, encode_calldata},
+    pricing::{BoxFuture, CallOutcome},
+    stocks::chain::Calls,
+};
+
+/// `values` ABI-encoded as a call's return data: calldata without its selector.
+pub fn returned(types: &str, values: &[Value]) -> Vec<u8> {
+    encode_calldata(&format!("f({types})"), values).unwrap()[4..].to_vec()
+}
+
+/// Answers each call it was given, by contract and exact calldata (and, for a call made
+/// as an account, that account), and nothing else: a call to another contract, another
+/// function, with other arguments or as another account fails, as a read that could
+/// not be made.
+#[derive(Debug, Default)]
+pub struct FakeChain {
+    answers: HashMap<(Address, Vec<u8>), Vec<u8>>,
+    outcomes: HashMap<(Address, Address, Vec<u8>), CallOutcome>,
+}
+
+impl FakeChain {
+    /// `to.sig(args)` answers `values`, of the return types `types` (as `address`).
+    pub fn answer(
+        mut self,
+        to: Address,
+        sig: &str,
+        args: &[Value],
+        types: &str,
+        values: &[Value],
+    ) -> FakeChain {
+        let calldata = encode_calldata(sig, args).unwrap();
+        self.answers.insert((to, calldata), returned(types, values));
+        self
+    }
+
+    /// `to.sig(args)`, made as `from`, ends in `outcome`.
+    pub fn outcome(
+        mut self,
+        from: Address,
+        to: Address,
+        sig: &str,
+        args: &[Value],
+        outcome: CallOutcome,
+    ) -> FakeChain {
+        let calldata = encode_calldata(sig, args).unwrap();
+        self.outcomes.insert((from, to, calldata), outcome);
+        self
+    }
+}
+
+impl Calls for FakeChain {
+    fn call_sig<'a>(
+        &'a self,
+        to: Address,
+        sig: &'a str,
+        args: &'a [Value],
+    ) -> BoxFuture<'a, eyre::Result<Vec<u8>>> {
+        let answer = encode_calldata(sig, args)
+            .ok()
+            .and_then(|calldata| self.answers.get(&(to, calldata)).cloned());
+        Box::pin(async move {
+            answer.ok_or_else(|| eyre::eyre!("no contract at {to:#x} answers {sig} so called"))
+        })
+    }
+
+    fn call_sig_as<'a>(
+        &'a self,
+        from: Address,
+        to: Address,
+        sig: &'a str,
+        args: &'a [Value],
+    ) -> BoxFuture<'a, eyre::Result<CallOutcome>> {
+        let outcome = encode_calldata(sig, args)
+            .ok()
+            .and_then(|calldata| self.outcomes.get(&(from, to, calldata)).cloned());
+        Box::pin(async move {
+            outcome
+                .ok_or_else(|| eyre::eyre!("no call of {sig} on {to:#x} as {from:#x} was expected"))
+        })
+    }
+}

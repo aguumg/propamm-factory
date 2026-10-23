@@ -5,7 +5,8 @@
 //!   the side our vault is long, so fills rebalance us. It reads the vault through the
 //!   library (`ctx.inventory()`), so it is a `Factory` (its build is async).
 //! - A market guard, `venue_spread`: trips the lane when the venues behind the composite
-//!   price disagree by more than a limit. Runs on every composite sample.
+//!   price disagree by more than a limit. Runs on every composite sample. A factory, like
+//!   the quote guard below, so the backoffice has a form for its knob.
 //! - A quote guard, `share_cap`: withdraws our quote while the vault is more lopsided than a
 //!   cap, and halts the lane if the pricer reports a share that cannot exist.
 //! - An observer, `block_log`: logs lifecycle events (a lane starting, stopping, tripping,
@@ -209,6 +210,53 @@ impl MarketGuard for VenueSpread {
     }
 }
 
+/// Registered as `venue_spread`: a factory rather than a closure, so the guard declares its
+/// knob for the backoffice and checks it under `--check`.
+struct VenueSpreadFactory;
+
+impl MarketGuardFactory for VenueSpreadFactory {
+    type Config = VenueSpreadCfg;
+    type Guard = VenueSpread;
+
+    fn validate(&self, cfg: &VenueSpreadCfg, _pair: &PairShape) -> eyre::Result<()> {
+        eyre::ensure!(cfg.max_dispersion > 0.0, "max_dispersion must be positive");
+        Ok(())
+    }
+
+    fn fields(&self) -> &'static [FormField] {
+        const FIELDS: &[FormField] = &[FormField::number(
+            "max_dispersion",
+            "0.01",
+            "trip when the venues' mids disagree by more than this fraction of the composite: \
+             0.01 is 1%.",
+        )];
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>Trips the lane while the venues behind the composite price disagree \
+         by more than a limit.</p>"
+    }
+
+    fn summary(&self, cfg: &VenueSpreadCfg) -> String {
+        format!("max_dispersion {:.2}%", cfg.max_dispersion * 100.0)
+    }
+
+    fn build<'a>(
+        &'a self,
+        cfg: &'a VenueSpreadCfg,
+        ctx: &'a mut BuildCtx,
+    ) -> BoxFuture<'a, eyre::Result<VenueSpread>> {
+        Box::pin(async move {
+            let dispersion = ctx.diagnostic("venue_dispersion")?;
+            Ok(VenueSpread {
+                cfg: cfg.clone(),
+                dispersion,
+            })
+        })
+    }
+}
+
 // ----------------------------------------------------------------------------------------
 // 3. A quote guard: the last word on every tick, after the pricer and the core's bounds
 // ----------------------------------------------------------------------------------------
@@ -252,6 +300,56 @@ impl QuoteGuard for ShareCap {
             ));
         }
         Gate::Allow
+    }
+}
+
+/// Registered as `share_cap`; a factory for the same reasons as [`VenueSpreadFactory`].
+struct ShareCapFactory;
+
+impl QuoteGuardFactory for ShareCapFactory {
+    type Config = ShareCapCfg;
+    type Guard = ShareCap;
+
+    fn validate(&self, cfg: &ShareCapCfg, _pair: &PairShape) -> eyre::Result<()> {
+        eyre::ensure!(
+            (0.5..=1.0).contains(&cfg.max_share),
+            "max_share {} is not in 0.5..=1.0",
+            cfg.max_share
+        );
+        Ok(())
+    }
+
+    fn fields(&self) -> &'static [FormField] {
+        const FIELDS: &[FormField] = &[FormField::number(
+            "max_share",
+            "0.8",
+            "withdraw while the vault's base share is outside [1 − max_share, max_share]: \
+             0.8 allows 20/80 either way.",
+        )];
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>Withdraws the quote while the vault is more lopsided than the cap, \
+         and halts the lane if the pricer reports a share that cannot exist.</p>"
+    }
+
+    fn summary(&self, cfg: &ShareCapCfg) -> String {
+        format!("max_share {:.2}", cfg.max_share)
+    }
+
+    fn build<'a>(
+        &'a self,
+        cfg: &'a ShareCapCfg,
+        ctx: &'a mut BuildCtx,
+    ) -> BoxFuture<'a, eyre::Result<ShareCap>> {
+        Box::pin(async move {
+            Ok(ShareCap {
+                cfg: cfg.clone(),
+                base_share: ctx.read_diagnostic("base_share")?,
+                lopsided: ctx.refusal("lopsided")?,
+            })
+        })
     }
 }
 
@@ -329,25 +427,28 @@ fn main() -> std::process::ExitCode {
         .pricer("feed", quote_updater::pricers::Feed)
         .pricer("volatile", quote_updater::pricers::Volatile)
         .pricer("inventory_skew", InventorySkewFactory)
-        .market_guard_fn("venue_spread", |cfg: VenueSpreadCfg, ctx: &mut BuildCtx| {
-            eyre::ensure!(cfg.max_dispersion > 0.0, "max_dispersion must be positive");
-            let dispersion = ctx.diagnostic("venue_dispersion")?;
-            Ok(VenueSpread { cfg, dispersion })
-        })
-        .quote_guard_fn("share_cap", |cfg: ShareCapCfg, ctx: &mut BuildCtx| {
-            eyre::ensure!(
-                (0.5..=1.0).contains(&cfg.max_share),
-                "max_share {} is not in 0.5..=1.0",
-                cfg.max_share
-            );
-            Ok(ShareCap {
-                cfg,
-                base_share: ctx.read_diagnostic("base_share")?,
-                lopsided: ctx.refusal("lopsided")?,
-            })
-        })
+        // Tokenized stocks, from the library: the NYSE calendar guard, then each issuer's
+        // pricer and token guard under the issuer's own names (docs/stocks.md).
+        .us_market_hours()
+        .stock_issuer(quote_updater::stocks::issuers::ondo::Ondo)
+        .market_guard("venue_spread", VenueSpreadFactory)
+        .quote_guard("share_cap", ShareCapFactory)
         .observer(BlockLog)
         // A whole `main`: parses the command line and the environment, runs, maps the
         // outcome to an exit code. Nothing in the library calls process::exit.
         .run_from_env()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example's guards declare their one knob each, so WETH/USDC's guards are edited
+    /// from the backoffice like its pricing.
+    #[test]
+    fn the_examples_guards_declare_their_one_knob_each() {
+        let names = |fields: &[FormField]| fields.iter().map(|f| f.name).collect::<Vec<_>>();
+        assert_eq!(names(VenueSpreadFactory.fields()), ["max_dispersion"]);
+        assert_eq!(names(ShareCapFactory.fields()), ["max_share"]);
+    }
 }

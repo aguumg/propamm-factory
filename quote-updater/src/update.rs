@@ -4,7 +4,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use ethrex_common::{
@@ -114,10 +114,7 @@ impl UpdateStamp {
 
 /// Seconds since the epoch on the wall clock.
 pub fn wall_clock_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    (crate::poll::wall_clock_ms() / 1_000) as u64
 }
 
 /// max_fee_per_gas for a transaction that must land in the very next block: twice the
@@ -794,6 +791,8 @@ pub(crate) fn stamped_ts(raw_tx: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use ethrex_common::Bytes;
     use ethrex_l2_sdk::calldata::decode_calldata;
 

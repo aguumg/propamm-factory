@@ -527,8 +527,12 @@ Some things still need a restart, and the updater refuses the reload and says wh
 
 Set `[settings] backoffice_addr` and the updater serves a small web page for the changes an
 operator actually makes: add or remove a pair, choose which venues its mid is averaged over
-and with what weights, edit a band or a `delta`, add or remove a builder, repoint a venue's
-endpoint, halt a pair (or all of them), and resume a halted pair. It is server-rendered HTML with
+and with what weights, edit its band and every knob its pricing kind declares, add or remove
+its guards and edit theirs (one block per registered guard kind, with an "enabled" box), add
+or remove a builder, repoint a venue's endpoint, halt a pair (or all of them), and resume a
+halted pair. A kind that declares no form, one registered through the closure helpers, shows
+as edited in the file and is kept as written. A field that holds a key, Ondo's API key say,
+takes the name of the environment variable holding it, never the value. It is server-rendered HTML with
 plain form posts, and every change does exactly what an operator would have done over SSH:
 rewrite `config.toml` and reload. The one piece of JavaScript is on the pair form: it looks up
 which venues list a pair (`GET /pairs/lookup`, which asks each exchange) and shows each ticked

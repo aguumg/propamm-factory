@@ -27,7 +27,8 @@ mod inputs;
 mod volatile;
 
 pub use self::inputs::{
-    Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport,
+    CallOutcome, Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome,
+    LandingReport,
 };
 pub use self::{feed::Feed, fixed::Fixed, volatile::Volatile};
 #[cfg(test)]
@@ -46,10 +47,11 @@ use crate::{
 /// guard reading a [`super::guard::SourceSample`]'s own `mid` and `delta`.
 pub use crate::feed::scaled_to_f64;
 
-/// One input of a pricing kind on the backoffice's pair form: the stanza key it writes, the
-/// placeholder the empty input shows, and the hint under it. A kind that declares its fields
-/// ([`Factory::fields`]) is editable from the page; one that declares none is edited in the
-/// config file, and the page says so.
+/// One input of a kind on the backoffice's pair form: the stanza key it writes, the
+/// placeholder the empty input shows, the hint under it, and its type, which decides how
+/// the input's text is written into the stanza and read back from it. A kind that declares
+/// its fields ([`Factory::fields`], and the guard factories' `fields`) is editable from the
+/// page; one that declares none is edited in the config file, and the page says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormField {
     /// The stanza key the input writes, e.g. `half_spread`.
@@ -58,32 +60,65 @@ pub struct FormField {
     pub placeholder: &'static str,
     /// One or two sentences under the input: what the key means and what blank means.
     pub hint: &'static str,
-    /// Written into the stanza as a TOML number rather than a string, for a config type
-    /// with `f64`/`u64` fields; the page refuses a value that is not one.
-    pub number: bool,
+    /// How the input's text is written into the stanza, and read back.
+    pub kind: FieldKind,
+}
+
+/// How a [`FormField`]'s input is written into the stanza, and read back from it. More
+/// kinds may come, so a match outside this crate needs a wildcard arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FieldKind {
+    /// A string, as typed. Blank is an absent key.
+    Text,
+    /// A TOML number, integer or float, for a config type with `f64` or integer fields; the
+    /// page refuses a value that is not one. Blank is an absent key.
+    Number,
+    /// A textarea, one item per line, written as an array of strings: blank lines are
+    /// dropped, and an empty textarea is an empty array with the key present.
+    List,
+    /// The name of an environment variable, written as `{ env = "NAME" }`, the shape
+    /// [`EnvSecret`] reads. The variable's value never reaches the page, in either direction.
+    Env,
 }
 
 impl FormField {
-    /// A field whose value is written as a string, as a `const` so a kind declares its list
-    /// as a `&'static [FormField]`.
-    pub const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+    const fn of(
+        kind: FieldKind,
+        name: &'static str,
+        placeholder: &'static str,
+        hint: &'static str,
+    ) -> Self {
         FormField {
             name,
             placeholder,
             hint,
-            number: false,
+            kind,
         }
+    }
+
+    /// A field whose value is written as a string, as a `const` so a kind declares its list
+    /// as a `&'static [FormField]`.
+    pub const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::Text, name, placeholder, hint)
     }
 
     /// A field whose value is written as a number (`half_spread = 0.0005`), for a config
     /// type that reads `f64` or integer fields.
     pub const fn number(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
-        FormField {
-            name,
-            placeholder,
-            hint,
-            number: true,
-        }
+        Self::of(FieldKind::Number, name, placeholder, hint)
+    }
+
+    /// A field whose value is a list, one item per line, written as an array of strings
+    /// (`holidays = ["2026-11-26", ...]`).
+    pub const fn list(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::List, name, placeholder, hint)
+    }
+
+    /// A field holding the name of an environment variable, written as `{ env = "NAME" }`
+    /// for a config type with an [`EnvSecret`] field.
+    pub const fn env(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::Env, name, placeholder, hint)
     }
 }
 
@@ -160,9 +195,9 @@ pub trait Factory: Send + Sync + 'static {
     }
 
     /// The stanza's keys as inputs on the backoffice's pair form, in the order shown. The
-    /// page posts each as text and writes it into the stanza as a string, so a kind that
-    /// declares fields reads its config as strings (the kinds this crate ships do). Empty, the default,
-    /// means the stanza is edited in the file and the page says so.
+    /// page posts each as text and writes it into the stanza as the field's [`FieldKind`]
+    /// says: a string, a number, a list or an env reference. Empty, the default, means the
+    /// stanza is edited in the file and the page says so.
     fn fields(&self) -> &'static [FormField] {
         &[]
     }
@@ -207,6 +242,18 @@ pub trait MarketGuardFactory: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The stanza's keys as inputs on the backoffice's pair form, in the order shown, as
+    /// [`Factory::fields`] for a pricing kind. Empty, the default, means the stanza is edited
+    /// in the file and the page says so.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML the pair form shows above this kind's fields; see [`Factory::form_help`].
+    fn form_help(&self) -> &'static str {
+        ""
+    }
+
     /// One short line for `--check`'s `guards` column, e.g. `max_spread 0.3%`. The kind's
     /// name is shown either way; this is the settings after it. Empty shows the name alone.
     fn summary(&self, _cfg: &Self::Config) -> String {
@@ -236,6 +283,18 @@ pub trait QuoteGuardFactory: Send + Sync + 'static {
     /// Checks a stanza against the pair it would judge. Synchronous and without I/O.
     fn validate(&self, _cfg: &Self::Config, _pair: &PairShape) -> eyre::Result<()> {
         Ok(())
+    }
+
+    /// The stanza's keys as inputs on the backoffice's pair form, in the order shown, as
+    /// [`Factory::fields`] for a pricing kind. Empty, the default, means the stanza is edited
+    /// in the file and the page says so.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML the pair form shows above this kind's fields; see [`Factory::form_help`].
+    fn form_help(&self) -> &'static str {
+        ""
     }
 
     /// One short line for `--check`'s `guards` column; see [`MarketGuardFactory::summary`].

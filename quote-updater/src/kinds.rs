@@ -67,7 +67,7 @@ pub(crate) trait ErasedPricer: Send + Sync {
 }
 
 /// The stanza minus its `kind`, as the kind's own config type.
-fn typed<C: DeserializeOwned>(table: &toml::Table) -> Result<C> {
+pub(crate) fn typed<C: DeserializeOwned>(table: &toml::Table) -> Result<C> {
     let mut table = table.clone();
     table.remove("kind");
     toml::Value::Table(table)
@@ -146,6 +146,8 @@ pub(crate) trait ErasedGuard: Send + Sync {
     fn side(&self) -> GuardSide;
     fn check(&self, table: &toml::Table) -> Result<()>;
     fn validate(&self, table: &toml::Table, pair: &PairShape) -> Result<()>;
+    fn fields(&self) -> &'static [FormField];
+    fn form_help(&self) -> &'static str;
     fn summary(&self, table: &toml::Table) -> Result<String>;
     fn build<'a>(
         &'a self,
@@ -169,6 +171,14 @@ impl<F: MarketGuardFactory> ErasedGuard for MarketErased<F> {
     fn validate(&self, table: &toml::Table, pair: &PairShape) -> Result<()> {
         let cfg = typed::<F::Config>(table)?;
         self.0.validate(&cfg, pair)
+    }
+
+    fn fields(&self) -> &'static [FormField] {
+        self.0.fields()
+    }
+
+    fn form_help(&self) -> &'static str {
+        self.0.form_help()
     }
 
     fn summary(&self, table: &toml::Table) -> Result<String> {
@@ -203,6 +213,14 @@ impl<F: QuoteGuardFactory> ErasedGuard for QuoteErased<F> {
     fn validate(&self, table: &toml::Table, pair: &PairShape) -> Result<()> {
         let cfg = typed::<F::Config>(table)?;
         self.0.validate(&cfg, pair)
+    }
+
+    fn fields(&self) -> &'static [FormField] {
+        self.0.fields()
+    }
+
+    fn form_help(&self) -> &'static str {
+        self.0.form_help()
     }
 
     fn summary(&self, table: &toml::Table) -> Result<String> {
@@ -393,6 +411,22 @@ impl Kinds {
     /// lane labels its guard with.
     pub(crate) fn guard_name(&self, kind: &str) -> Option<&'static str> {
         self.guards.get_key_value(kind).map(|(name, _)| *name)
+    }
+
+    /// The registered guard kinds, by name, in order: what the backoffice's form offers,
+    /// market and quote guards together.
+    pub(crate) fn guard_kinds(&self) -> Vec<&'static str> {
+        self.guards.keys().copied().collect()
+    }
+
+    /// A registered guard kind's form fields, or `None` for a kind nobody registered.
+    pub(crate) fn guard_fields(&self, kind: &str) -> Option<&'static [FormField]> {
+        self.guards.get(kind).map(|factory| factory.fields())
+    }
+
+    /// A registered guard kind's form help, or `None` for a kind nobody registered.
+    pub(crate) fn guard_form_help(&self, kind: &str) -> Option<&'static str> {
+        self.guards.get(kind).map(|factory| factory.form_help())
     }
 
     /// The registered name of a pricing kind, as the `&'static str` a trip names it by.
@@ -1118,5 +1152,49 @@ api_key = "k"
             err.contains("`fragile` panicked") && err.contains("validate blew up"),
             "{err}"
         );
+    }
+
+    /// Guard kinds declare their form fields and help as pricing kinds do, so the backoffice
+    /// can edit a guard stanza; a closure-registered kind declares none.
+    #[test]
+    fn guard_kinds_declare_fields_and_help_like_pricers() {
+        #[derive(Clone, serde::Deserialize)]
+        struct Capped {
+            #[allow(dead_code)]
+            max_share: f64,
+        }
+        struct CappedFactory;
+        impl QuoteGuardFactory for CappedFactory {
+            type Config = Capped;
+            type Guard = AllowAll;
+            fn fields(&self) -> &'static [FormField] {
+                const FIELDS: &[FormField] = &[FormField::number("max_share", "0.8", "")];
+                FIELDS
+            }
+            fn form_help(&self) -> &'static str {
+                "<p>cap</p>"
+            }
+            fn build<'a>(
+                &'a self,
+                _: &'a Capped,
+                _: &'a mut BuildCtx,
+            ) -> BoxFuture<'a, Result<AllowAll>> {
+                Box::pin(std::future::ready(Ok(AllowAll)))
+            }
+        }
+        let mut kinds = Kinds::default();
+        kinds.insert_guard("cap", quote_guard_factory(CappedFactory));
+        kinds.insert_guard(
+            "plain",
+            quote_guard_fn(|_: Empty, _: &mut BuildCtx| Ok(AllowAll)),
+        );
+        assert_eq!(kinds.guard_kinds(), vec!["cap", "plain"]);
+        assert_eq!(
+            kinds.guard_fields("cap").map(|f| f[0].name),
+            Some("max_share")
+        );
+        assert_eq!(kinds.guard_form_help("cap"), Some("<p>cap</p>"));
+        assert!(kinds.guard_fields("plain").is_some_and(|f| f.is_empty()));
+        assert_eq!(kinds.guard_fields("nobody"), None);
     }
 }

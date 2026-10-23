@@ -141,16 +141,17 @@ table.venues td.volume { font-size: .78rem; color: var(--dim); white-space: nowr
 label { display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
 .key { font-size: .72rem; color: var(--dim); }
 .fieldhint { font-size: .68rem; color: var(--faint); line-height: 1.35; }
-input[type=text], input[type=password] {
+input[type=text], input[type=password], textarea {
+  font: inherit; resize: vertical;
   font-size: .82rem; width: 100%; padding: .38rem .5rem;
   background: var(--sunk); color: var(--ink);
   border: 1px solid var(--line-strong); border-radius: 6px;
 }
-input:focus-visible {
+input:focus-visible, textarea:focus-visible {
   outline: none; border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
-input::placeholder { color: var(--faint); opacity: .6; }
+input::placeholder, textarea::placeholder { color: var(--faint); opacity: .6; }
 input[readonly] { color: var(--dim); border-style: dashed; cursor: not-allowed; }
 
 .actions {
@@ -210,3 +211,7 @@ pre.err {
   tbody td { border: none; padding: .15rem .8rem; }
   .rowactions { text-align: left; padding-top: .5rem; }
 }
+
+/* The pair form's guards section: one block per kind. */
+.guards { display: flex; flex-direction: column; gap: .5rem; }
+.guard { padding: .5rem 0; border-top: 1px solid var(--line, #ddd); }

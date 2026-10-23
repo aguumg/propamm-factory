@@ -42,3 +42,4 @@ builders, signer balance).
 
 - [Deep dive into the internals](docs/components.md)
 - [Pricing models: the shipped ones, and writing your own](docs/pricing.md)
+- [Tokenized stocks: Ondo's pairs, and adding an issuer](docs/stocks.md)

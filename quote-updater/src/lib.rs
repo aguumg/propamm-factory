@@ -54,10 +54,10 @@ pub mod prelude {
         },
         observe::{BlockOutcome, Event, Observer, ReloadOutcome},
         pricing::{
-            BoxFuture, BuildCtx, Chain, DiagHandle, Diagnostics, EnvSecret, Factory, FormField,
-            History, Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport, Market,
-            MarketGuardFactory, PairShape, Pricer, PricerOutput, QuoteGuardFactory, Refusal,
-            RefusalHandle, TickCtx,
+            BoxFuture, BuildCtx, CallOutcome, Chain, DiagHandle, Diagnostics, EnvSecret, Factory,
+            FormField, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome,
+            LandingReport, Market, MarketGuardFactory, PairShape, Pricer, PricerOutput,
+            QuoteGuardFactory, Refusal, RefusalHandle, TickCtx,
         },
     };
 }
@@ -81,6 +81,9 @@ mod node;
 pub mod observe;
 pub mod output;
 mod pair;
+// Documented in the module itself: an outer doc here would have its links resolved in
+// this scope rather than the module's.
+pub mod poll;
 mod preflight;
 pub mod pricing;
 /// The pricing kinds this crate ships, each an ordinary [`pricing::Factory`] a binary
@@ -98,6 +101,7 @@ mod rpc;
 #[cfg(test)]
 mod rpc_mock;
 mod service;
+pub mod stocks;
 mod supervisor;
 mod tasks;
 pub mod testing;
