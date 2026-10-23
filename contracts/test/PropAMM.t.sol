@@ -6,6 +6,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {PropAMM, NoVault, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
+import {MockERC20} from "./mocks/MockERC20.sol";
 
 contract PropAMMTest is Test {
     address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
@@ -195,6 +196,63 @@ contract PropAMMTest is Test {
         propAmm.setPairVault(USDC, USDT, rando);
         vm.expectRevert();
         propAmm.removePair(USDC, USDT);
+        vm.stopPrank();
+    }
+
+    //------------------------------
+    // setOracle, addUpdater, removeUpdater, withdrawERC20
+    //------------------------------
+
+    function test_setOracle_storesTheNewOracleAndEmits() public {
+        address newOracle = makeAddr("new-oracle");
+        vm.expectEmit(true, false, false, true, address(propAmm));
+        emit PropAMM.OracleChanged(newOracle);
+        vm.prank(owner);
+        propAmm.setOracle(newOracle);
+        assertEq(address(propAmm.oracle()), newOracle);
+    }
+
+    function test_addUpdater_registersWithTheOracleAndEmits() public {
+        address another = makeAddr("another-updater");
+        vm.expectEmit(true, false, false, true, address(propAmm));
+        emit PropAMM.UpdaterAdded(another);
+        vm.prank(owner);
+        propAmm.addUpdater(another);
+        assertTrue(MockPUR(ORACLE).isUpdater(another));
+    }
+
+    function test_removeUpdater_unregistersFromTheOracleAndEmits() public {
+        vm.expectEmit(true, false, false, true, address(propAmm));
+        emit PropAMM.UpdaterRemoved(updater);
+        vm.prank(owner);
+        propAmm.removeUpdater(updater);
+        assertFalse(MockPUR(ORACLE).isUpdater(updater));
+    }
+
+    function test_withdrawERC20_movesTheTokensAndEmits() public {
+        MockERC20 token = new MockERC20();
+        token.mint(address(propAmm), 1_000);
+        address to = makeAddr("recipient");
+
+        vm.expectEmit(true, true, false, true, address(propAmm));
+        emit PropAMM.ERC20Withdrawn(address(token), to, 400);
+        vm.prank(owner);
+        propAmm.withdrawERC20(address(token), to, 400);
+        assertEq(token.balanceOf(to), 400);
+        assertEq(token.balanceOf(address(propAmm)), 600);
+    }
+
+    function test_nonOwnerCannotManageOracleUpdatersOrFunds() public {
+        address rando = makeAddr("rando");
+        vm.startPrank(rando);
+        vm.expectRevert();
+        propAmm.setOracle(rando);
+        vm.expectRevert();
+        propAmm.addUpdater(rando);
+        vm.expectRevert();
+        propAmm.removeUpdater(updater);
+        vm.expectRevert();
+        propAmm.withdrawERC20(USDC, rando, 1);
         vm.stopPrank();
     }
 

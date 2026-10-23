@@ -63,6 +63,10 @@ contract PropAMM is
     event PairAdded(address indexed token0, address indexed token1, address indexed vault);
     event PairRemoved(address indexed token0, address indexed token1);
     event PairVaultChanged(address indexed token0, address indexed token1, address indexed vault);
+    event OracleChanged(address indexed newOracle);
+    event UpdaterAdded(address indexed updater);
+    event UpdaterRemoved(address indexed updater);
+    event ERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
 
     /// @dev Fixed-point scale the oracle publishes `mid` in. A `mid` of 1e18 means one whole
     /// token0 is worth one whole token1, whatever decimals the two tokens use, so `_quote`
@@ -457,18 +461,21 @@ contract PropAMM is
     /// @param newOracle The new oracle address.
     function setOracle(address newOracle) external onlyOwner {
         oracle = IPrioUpdateRegistry(newOracle);
+        emit OracleChanged(newOracle);
     }
 
     /// @notice Adds a new updater to the oracle registry.
     /// @param updater The address of the new updater.
     function addUpdater(address updater) external onlyOwner {
         oracle.addUpdater(updater);
+        emit UpdaterAdded(updater);
     }
 
     /// @notice Removes an updater from the oracle registry.
     /// @param updater The address of the updater to remove.
     function removeUpdater(address updater) external onlyOwner {
         oracle.removeUpdater(updater);
+        emit UpdaterRemoved(updater);
     }
 
     /// @notice Withdraws ERC20 tokens from the contract to a specified address.
@@ -478,6 +485,7 @@ contract PropAMM is
     /// @param amount The amount of tokens to withdraw.
     function withdrawERC20(address token, address to, uint256 amount) external onlyOwner {
         IERC20(token).safeTransfer(to, amount);
+        emit ERC20Withdrawn(token, to, amount);
     }
 
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
