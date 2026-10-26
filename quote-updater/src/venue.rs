@@ -128,7 +128,7 @@ impl VenueId {
 
     /// [`Self::parse`], plus the exchange's own time for the price when the frame carries
     /// one: Kraken's `timestamp` and Coinbase's `time` (RFC 3339), OKX's `ts`, Bybit's `ts`,
-    /// KuCoin's `time`, Bitget's `ts` and Gate's `t` (epoch milliseconds), and Binance's `E`
+    /// KuCoin's `timestamp`, Bitget's `ts` and Gate's `t` (epoch milliseconds), and Binance's `E`
     /// on a stream that sends it (its spot bookTicker does not). `None` where there is none,
     /// and for MEXC, which is polled: those prices are aged by when they arrived. Kept
     /// beside `parse` rather than replacing it so a venue that carries no time needs

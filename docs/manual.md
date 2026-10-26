@@ -145,7 +145,7 @@ The venues, and how each spells a market (wrapped tokens are spelled as the unde
 | `kraken` | `ETH/USD` | ticker stream (v2) |
 | `okx` | `ETH-USDC` | tickers stream |
 | `bybit` | `ETHUSDC` | level-1 order book stream |
-| `kucoin` | `ETH-USDC` | ticker stream, socket URL fetched over HTTP first |
+| `kucoin` | `ETH-USDC` | level-1 order book stream, socket URL fetched over HTTP first |
 | `bitget` | `ETHUSDC` | ticker stream |
 | `gate` | `ETH_USDC` | book_ticker stream |
 | `mexc` | `ETHUSDC` | REST, polled every second (its stream is protobuf-only) |
@@ -205,7 +205,7 @@ of seconds old.
 
 What the key measures is the stream, not the market. Most venues write the exchange's own
 clock reading into every price frame: Kraken (`timestamp`), Coinbase (`time`), OKX (`ts`),
-Bybit (`ts`), KuCoin (`time`), Bitget (`ts`) and Gate (`t`). The feed subtracts that from
+Bybit (`ts`), KuCoin (`timestamp`), Bitget (`ts`) and Gate (`t`). The feed subtracts that from
 the frame's arrival, which gives how long the frame took to reach us. A backlog makes every
 frame late by seconds; a quiet book whose last frame arrived promptly reads as prompt
 however long ago that was, so a thin market is not read as a late one. That difference is

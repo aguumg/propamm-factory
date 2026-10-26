@@ -19,7 +19,7 @@ pub fn epoch_ms(ms: u64) -> std::time::SystemTime {
 }
 
 /// [`epoch_ms`] read off a frame, where a venue sends its millisecond stamp as a number
-/// (KuCoin's `time`, Bitget's top-level `ts`) or as a string of digits (Bybit's `ts`,
+/// (KuCoin's `timestamp`, Bitget's top-level `ts`) or as a string of digits (Bybit's `ts`,
 /// Bitget's per-ticker `ts`). Anything else reads as no stamp rather than refusing the
 /// price: the price is what the frame is for.
 pub fn epoch_ms_value(value: &serde_json::Value) -> Option<std::time::SystemTime> {

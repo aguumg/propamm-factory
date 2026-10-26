@@ -1,8 +1,14 @@
 //! KuCoin spot public WebSocket. The socket URL is not fixed: a `bullet-public` POST hands
 //! out a token and an endpoint, and the socket is dialled at `endpoint?token=…`, so the
 //! configured endpoint is the REST host and the connection step needs the HTTP client.
-//! Then the `/market/ticker:<symbol>` topic, one frame per best bid/ask change, and a
-//! JSON ping. Markets are `ETH-USDC`.
+//! Then the `/spotMarket/level1:<symbol>` topic, one frame per best bid/ask change, each
+//! stamped with the book's own time, and a JSON ping. Markets are `ETH-USDC`.
+//!
+//! Not `/market/ticker`: that frame's `time` is the last trade's, not the book's. The book
+//! moves without a trade and the frame repeats the old stamp, so on a market that trades
+//! every few seconds the stamp reads seconds behind the price and a lateness check on it
+//! measures how long since the last trade rather than how late the price is. `level1`
+//! stamps the book change itself.
 
 use std::time::SystemTime;
 
@@ -69,7 +75,7 @@ pub async fn connection(
             json!({
                 "id": "1",
                 "type": "subscribe",
-                "topic": format!("/market/ticker:{symbol}"),
+                "topic": format!("/spotMarket/level1:{symbol}"),
                 "privateChannel": false,
                 "response": true,
             })
@@ -83,39 +89,43 @@ pub async fn connection(
 struct Frame {
     #[serde(rename = "type")]
     kind: String,
-    data: Option<Ticker>,
+    data: Option<Level1>,
 }
 
+/// The best level of each side as `[price, size]`, empty when the side is. A missing side
+/// is passed on as a zero price, which the shared book check rejects as one-sided.
 #[derive(Deserialize)]
-struct Ticker {
-    #[serde(rename = "bestBid")]
-    bid: String,
-    #[serde(rename = "bestAsk")]
-    ask: String,
-    /// When the exchange made the ticker, milliseconds since the epoch.
-    time: Option<serde_json::Value>,
+struct Level1 {
+    #[serde(default)]
+    bids: Vec<String>,
+    #[serde(default)]
+    asks: Vec<String>,
+    /// When the book changed, milliseconds since the epoch.
+    timestamp: Option<serde_json::Value>,
 }
 
 pub fn parse(text: &str) -> Result<Option<Quote>> {
     Ok(parse_stamped(text)?.map(|(quote, _)| quote))
 }
 
-/// [`parse`], with the ticker's `time`. One that is not a millisecond stamp is taken as
+/// [`parse`], with the book's `timestamp`. One that is not a millisecond stamp is taken as
 /// absent rather than refusing the price: the price is what the frame is for.
 pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> {
     let frame: Frame =
         serde_json::from_str(text).map_err(|err| eyre!(err).wrap_err("not a kucoin frame"))?;
     match frame.kind.as_str() {
         "message" => {
-            let ticker = frame
+            let book = frame
                 .data
-                .ok_or_else(|| eyre!("kucoin message without ticker data"))?;
+                .ok_or_else(|| eyre!("kucoin message without level1 data"))?;
+            let side =
+                |level: Vec<String>| level.into_iter().next().unwrap_or_else(|| "0".to_owned());
             Ok(Some((
                 Quote::Book {
-                    bid: ticker.bid,
-                    ask: ticker.ask,
+                    bid: side(book.bids),
+                    ask: side(book.asks),
                 },
-                ticker.time.as_ref().and_then(epoch_ms_value),
+                book.timestamp.as_ref().and_then(epoch_ms_value),
             )))
         }
         "error" => Err(eyre!("kucoin error: {text}")),
@@ -133,13 +143,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_a_ticker_message_and_ignores_the_handshake() {
-        let push = r#"{"type":"message","topic":"/market/ticker:BTC-USDT","subject":"trade.ticker","data":{"sequence":"1545896668986","price":"0.08","size":"0.011","bestAsk":"0.08","bestAskSize":"0.18","bestBid":"0.049","bestBidSize":"0.036","time":1704873323416}}"#;
+    fn reads_a_level1_message_and_ignores_the_handshake() {
+        let push = r#"{"type":"message","topic":"/spotMarket/level1:BTC-USDT","subject":"level1","data":{"asks":["0.08","0.18"],"bids":["0.049","0.036"],"timestamp":1704873323416}}"#;
         assert_eq!(
             parse(push).unwrap(),
             Some(Quote::Book {
                 bid: "0.049".into(),
                 ask: "0.08".into()
+            })
+        );
+        // A side the book does not have is an empty array: a zero price, for the shared
+        // one-sided check, not a refused frame.
+        let one_sided = r#"{"type":"message","topic":"/spotMarket/level1:BTC-USDT","subject":"level1","data":{"asks":[],"bids":["0.049","0.036"],"timestamp":1704873323416}}"#;
+        assert_eq!(
+            parse(one_sided).unwrap(),
+            Some(Quote::Book {
+                bid: "0.049".into(),
+                ask: "0".into()
             })
         );
         assert_eq!(
@@ -148,7 +168,7 @@ mod tests {
         );
         assert_eq!(parse(r#"{"id":"1","type":"ack"}"#).unwrap(), None);
         assert_eq!(parse(r#"{"id":"1","type":"pong"}"#).unwrap(), None);
-        assert!(parse(r#"{"id":"1","type":"error","code":404,"data":"topic /market/ticker:NOPE is not found"}"#).is_err());
+        assert!(parse(r#"{"id":"1","type":"error","code":404,"data":"topic /spotMarket/level1:NOPE is not found"}"#).is_err());
     }
 
     /// The bullet call is the one venue step that needs a server; a local one that answers
@@ -176,17 +196,17 @@ mod tests {
         };
         assert_eq!(url, "wss://ws-api-spot.kucoin.com/?token=tok123");
         let sub: serde_json::Value = serde_json::from_str(&subscribe.unwrap()).unwrap();
-        assert_eq!(sub["topic"], "/market/ticker:ETH-USDC");
+        assert_eq!(sub["topic"], "/spotMarket/level1:ETH-USDC");
     }
 
     #[test]
-    fn a_ticker_is_stamped_with_its_time() {
-        let push = r#"{"type":"message","topic":"/market/ticker:BTC-USDT","subject":"trade.ticker","data":{"bestAsk":"0.08","bestBid":"0.049","time":1704873323416}}"#;
+    fn a_book_is_stamped_with_its_timestamp() {
+        let push = r#"{"type":"message","topic":"/spotMarket/level1:BTC-USDT","subject":"level1","data":{"asks":["0.08","0.18"],"bids":["0.049","0.036"],"timestamp":1704873323416}}"#;
         assert_eq!(
             parse_stamped(push).unwrap().unwrap().1,
             Some(crate::venues::epoch_ms(1_704_873_323_416))
         );
-        let unstamped = r#"{"type":"message","topic":"/market/ticker:BTC-USDT","subject":"trade.ticker","data":{"bestAsk":"0.08","bestBid":"0.049"}}"#;
+        let unstamped = r#"{"type":"message","topic":"/spotMarket/level1:BTC-USDT","subject":"level1","data":{"asks":["0.08","0.18"],"bids":["0.049","0.036"]}}"#;
         assert_eq!(parse_stamped(unstamped).unwrap().unwrap().1, None);
     }
 }
