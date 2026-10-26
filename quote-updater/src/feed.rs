@@ -349,9 +349,14 @@ impl Adoption {
     }
 }
 
-/// How long a connection may stay silent before it is probed with a ping. bookTicker
-/// emits only when the best bid/ask changes, so silence alone does not mean the
-/// connection is dead — a quiet book on an illiquid pair is healthy.
+/// How often a connection is pinged, in the venue's own keepalive dialect, whether or not
+/// frames are arriving. Two jobs. On a quiet book the answer is the only sign the socket is
+/// alive: bookTicker emits only when the best bid/ask changes, so silence alone does not
+/// mean the connection is dead — a quiet book on an illiquid pair is healthy. And several
+/// venues drop a socket that has not pinged them lately however busy it is: KuCoin's
+/// `bullet` answer sets an 18s ping interval and closes with `ping timeout` past it,
+/// Bitget closes after two minutes without one, Bybit asks for one every 20s. So the ping
+/// has to go out on a clock, not only after a silence; 10s sits under every venue's limit.
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long a connection may go without any inbound frame (price, ping, or pong) before
@@ -574,16 +579,22 @@ impl Feed {
         // in place, and from that moment on it no longer describes a book anyone can trade —
         // so it must be allowed to age out. See the Ping/Pong arm below.
         let mut sample_is_current = false;
+        // On a clock rather than after a silence: a busy stream never goes quiet, and the
+        // venues that require a ping would close the socket while frames were still
+        // arriving. See PING_INTERVAL. The first tick completes at once and is skipped: the
+        // subscribe just went out and the venue has nothing to answer yet.
+        let mut ping_ticker = tokio::time::interval(PING_INTERVAL);
+        ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_ticker.tick().await;
         loop {
-            let msg = match tokio::time::timeout(PING_INTERVAL, ws.next()).await {
-                Ok(msg) => msg,
-                Err(_) => {
+            let msg = tokio::select! {
+                msg = ws.next() => msg,
+                _ = ping_ticker.tick() => {
                     ensure!(
                         last_inbound.elapsed() < MAX_QUIET,
                         "no message in {MAX_QUIET:?}"
                     );
-                    // A quiet book emits nothing, so probe the socket instead of assuming
-                    // the worst; any answering frame below counts as feed liveness.
+                    // Any answering frame below counts as feed liveness.
                     let probe = match keepalive.frame() {
                         None => Message::Ping(Vec::new().into()),
                         Some(text) => Message::text(text),
@@ -1294,6 +1305,69 @@ mod tests {
         // page the breaker already sent.
         assert!(metrics.last_tick.get().is_nan(), "feed_last_tick");
         assert!(metrics.sample_current.get().is_nan(), "feed_sample_current");
+    }
+
+    /// A stream that never goes quiet is still pinged, in the venue's dialect, every
+    /// PING_INTERVAL. The venues that require a client ping on a cadence close the socket
+    /// otherwise, while frames are still arriving, so a ping sent only after a silence is
+    /// a ping those venues never see on a busy market. The mock streams a ticker every
+    /// 200ms, well inside PING_INTERVAL, and must still receive the venue's text ping.
+    /// Real time, so the test takes a PING_INTERVAL: a paused clock races ahead of the
+    /// socket handshake and cuts it off.
+    #[tokio::test]
+    async fn a_busy_stream_is_still_pinged_on_the_cadence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (pinged_tx, pinged_rx) = tokio::sync::oneshot::channel::<Duration>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let started = Instant::now();
+            let mut pinged_tx = Some(pinged_tx);
+            let mut frames = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = frames.tick() => {
+                        let ticker = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"1.0000","bidPx":"0.9998","ts":"1597026383085"}]}"#;
+                        if ws.send(Message::text(ticker)).await.is_err() {
+                            return;
+                        }
+                    }
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Text(text))) if text.as_str() == "ping" => {
+                            if let Some(tx) = pinged_tx.take() {
+                                let _ = tx.send(started.elapsed());
+                            }
+                            if ws.send(Message::text("pong")).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    }
+                }
+            }
+        });
+
+        let _rx = spawn_feed(
+            Arc::new(http_client()),
+            VenueId::Okx,
+            &format!("ws://{addr}/ws"),
+            "ETH-USDC",
+            8,
+            false,
+            adopted(&test_metrics()),
+            None,
+            Default::default(),
+        );
+        let after = tokio::time::timeout(PING_INTERVAL * 2, pinged_rx)
+            .await
+            .expect("a busy stream was never pinged")
+            .expect("the mock went away before a ping arrived");
+        assert!(
+            after >= PING_INTERVAL && after < PING_INTERVAL * 2,
+            "the ping must follow the cadence, not the silence: arrived after {after:?}"
+        );
     }
 
     /// End-to-end over a local mock server: the feed delivers the first connection's
