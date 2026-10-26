@@ -256,8 +256,9 @@ impl Endpoints {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Connection {
     /// A WebSocket the venue pushes prices over. `subscribe`, when given, is the text frame
-    /// sent right after connecting; `keepalive` is what to send when the socket has been
-    /// quiet long enough to be probed.
+    /// sent right after connecting; `keepalive` is the ping sent on a fixed cadence for as
+    /// long as the socket is open, whether or not frames are arriving (see
+    /// `feed::PING_INTERVAL`).
     Stream {
         url: String,
         subscribe: Option<String>,
@@ -272,7 +273,9 @@ pub enum Connection {
     },
 }
 
-/// What a quiet stream is probed with.
+/// What a stream is pinged with, on a fixed cadence whether or not frames are arriving:
+/// the answer is the sign of life on a quiet book, and several venues drop a socket that
+/// stops pinging them however busy it is.
 #[derive(Clone, Debug)]
 pub enum Keepalive {
     /// A protocol-level ping frame, which every server answers with a pong.
