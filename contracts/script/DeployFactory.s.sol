@@ -9,9 +9,14 @@ import {PropAMMFactory} from "../src/PropAMMFactory.sol";
 /// created by their owners through the factory afterwards. See DEPLOYMENT.md.
 contract DeployFactory is Script {
     function run() external {
+        // The account that can disable creation on this factory, for good. Defaults to the
+        // deployer: `FACTORY_OWNER=0x... make deploy-factory ...`.
+        address factoryOwner = vm.envOr("FACTORY_OWNER", msg.sender);
+
         vm.startBroadcast();
-        PropAMMFactory factory = new PropAMMFactory();
+        PropAMMFactory factory = new PropAMMFactory(factoryOwner);
         vm.stopBroadcast();
         console.log("PropAMMFactory deployed at:", address(factory));
+        console.log("factory owner:", factoryOwner);
     }
 }

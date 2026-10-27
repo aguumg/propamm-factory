@@ -13,6 +13,11 @@ prices from, `updaters` are the addresses allowed to publish prices, and `pairs`
 `(token0, token1, vault)`: the two tokens and the wallet that holds the inventory for that
 pair. Each pair can have its own vault.
 
+The factory has an owner of its own, set when it is deployed, whose one power is
+`disableCreation`: it stops `createPropAMM` for good and emits `CreationDisabled`. Nothing turns
+creation back on. Instances already created keep working, and the factory's owner has no say
+over them.
+
 `PropAMM` is the instance. The owner can add and remove pairs (`addPair`, `setPairVault`),
 add and remove updaters (`addUpdater`, `removeUpdater`) and pause it. Traders call `swap`;
 anyone can call `quote` and `isActive` to see what a trade would get.
