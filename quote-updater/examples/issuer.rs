@@ -81,8 +81,8 @@ impl PriceSource for ConstPrices {
 struct OneShare;
 
 impl Valuation for OneShare {
-    fn read(&self) -> BoxFuture<'_, eyre::Result<Shares>> {
-        Box::pin(async { Ok(Shares::new(1.0)) })
+    fn read(&self) -> BoxFuture<'_, eyre::Result<Option<Shares>>> {
+        Box::pin(async { Ok(Some(Shares::new(1.0))) })
     }
 }
 

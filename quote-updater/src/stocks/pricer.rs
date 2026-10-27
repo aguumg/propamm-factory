@@ -23,6 +23,12 @@
 //!   matches the token's `k` within `max_multiplier_gap`. A gap means one of the two has
 //!   applied a corporate action the other has not.
 //!
+//! The last two read the token's `k` from the design's [`Valuation`], which lists some
+//! tokens and not others (Ondo's oracle holds entries for a few of its GM tokens). A pair
+//! whose token it does not list quotes on the price source alone, without those two gates:
+//! the build says so, and reads the valuation again on the next reload. The issuer's
+//! status still reports the asset's events, corporate actions included.
+//!
 //! The stock token is listed first (`tokens = [stock, USDC]`), and the build checks it is the
 //! token the stanza's `symbol` names by the token's own `symbol()`. The price is USDC per
 //! token, USDC taken at $1, and the library publishes it the way the lane carries it: the
@@ -416,6 +422,10 @@ pub struct StockPricer {
     /// ticker when the price source names it.
     names: Vec<String>,
     feeds: Arc<Mutex<Feeds>>,
+    /// Whether the valuation source lists the token, decided at the build. When it does
+    /// not, the multiplier gates (its freshness, its corporate-action pause, its agreement
+    /// with the price source) do not run and nothing reads it.
+    checks_multiplier: bool,
     /// The issuer's status, for a design whose issuer reports one.
     status: Option<Box<dyn MarketStatus>>,
     /// The vault, read only when `skew` is on.
@@ -498,6 +508,67 @@ impl StockPricer {
         Ok(())
     }
 
+    /// The multiplier gates, for a token the valuation source lists: its reading is fresh,
+    /// no corporate action is on or within the lead, and the price source prices with the
+    /// same `k`.
+    fn check_multiplier(
+        &self,
+        tick: &TickCtx,
+        out: &mut Diagnostics,
+        gated: bool,
+        now_ms: i64,
+        price: Price,
+        shares: Option<Stamped<Shares>>,
+    ) -> Result<(), Refusal> {
+        let s = &self.settings;
+        let h = &self.h;
+        let reading = self.fresh(
+            shares.as_ref(),
+            "share multiplier",
+            &h.multiplier_stale,
+            tick.now(),
+            gated,
+        )?;
+        let shares = reading.value;
+        out.set(&h.svalue, shares.k);
+        let now_secs = now_ms.div_euclid(1_000);
+        let stops = |action: &Action| gated && action.stops_quoting(now_secs, s.pause_lead_secs);
+        if let Some(action) = shares.action.filter(stops) {
+            let when = if action.is_on(now_secs) {
+                "is on"
+            } else {
+                "starts within the lead"
+            };
+            return Err(Refusal::new(
+                &h.multiplier_paused,
+                format!(
+                    "a corporate-action pause on {} {when} (from {}, lead {}s)",
+                    s.symbol, action.starts, s.pause_lead_secs
+                ),
+            ));
+        }
+        let gap = price.token / price.stock / shares.k - 1.0;
+        out.set(&h.multiplier_gap, gap);
+        // Not `gap.abs() > max`, which a gap that is not a number passes: this is false for one.
+        let agrees = gap.abs() <= s.max_multiplier_gap;
+        if gated && !agrees {
+            return Err(Refusal::new(
+                &h.multiplier_mismatch,
+                format!(
+                    "{} prices {} at {:.6} times the stock, the chain's multiplier is {:.6}: \
+                     a {:.3}% gap (limit {:.3}%)",
+                    s.source,
+                    s.symbol,
+                    price.token / price.stock,
+                    shares.k,
+                    gap * 100.0,
+                    s.max_multiplier_gap * 100.0
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// The quote, with every gate when `gated`, or from whatever was read when not (a preview).
     fn quote(
         &self,
@@ -561,49 +632,8 @@ impl StockPricer {
         }
 
         self.check_status(tick.now(), now_ms, gated)?;
-        let reading = self.fresh(
-            shares.as_ref(),
-            "share multiplier",
-            &h.multiplier_stale,
-            tick.now(),
-            gated,
-        )?;
-        let shares = reading.value;
-        out.set(&h.svalue, shares.k);
-        let now_secs = now_ms.div_euclid(1_000);
-        let stops = |action: &Action| gated && action.stops_quoting(now_secs, s.pause_lead_secs);
-        if let Some(action) = shares.action.filter(stops) {
-            let when = if action.is_on(now_secs) {
-                "is on"
-            } else {
-                "starts within the lead"
-            };
-            return Err(Refusal::new(
-                &h.multiplier_paused,
-                format!(
-                    "a corporate-action pause on {} {when} (from {}, lead {}s)",
-                    s.symbol, action.starts, s.pause_lead_secs
-                ),
-            ));
-        }
-        let gap = price.token / price.stock / shares.k - 1.0;
-        out.set(&h.multiplier_gap, gap);
-        // Not `gap.abs() > max`, which a gap that is not a number passes: this is false for one.
-        let agrees = gap.abs() <= s.max_multiplier_gap;
-        if gated && !agrees {
-            return Err(Refusal::new(
-                &h.multiplier_mismatch,
-                format!(
-                    "{} prices {} at {:.6} times the stock, the chain's multiplier is {:.6}: \
-                     a {:.3}% gap (limit {:.3}%)",
-                    s.source,
-                    s.symbol,
-                    price.token / price.stock,
-                    shares.k,
-                    gap * 100.0,
-                    s.max_multiplier_gap * 100.0
-                ),
-            ));
+        if self.checks_multiplier {
+            self.check_multiplier(tick, out, gated, now_ms, price, shares)?;
         }
 
         let mut mid = price.token;
@@ -709,11 +739,27 @@ pub async fn build(
     let shares = valuation
         .read()
         .await
-        .and_then(check_shares)
+        .and_then(|listed| listed.map(check_shares).transpose())
         .map_err(first_token("the share multiplier"))?;
+    // Not a failed build: the valuation source lists some tokens and not others, and a
+    // pair whose token it does not list quotes on the price source alone. Said here so
+    // `--check` and the startup log show it.
+    if shares.is_none() {
+        tracing::warn!(
+            "[{}] {}: the valuation source does not list {}, so its share multiplier is not \
+             checked against {}'s and no corporate-action pause is read from it; {}'s own \
+             status still reports the asset's events. Read again on the next reload.",
+            pair.label,
+            settings.kind,
+            settings.symbol,
+            settings.source,
+            settings.source
+        );
+    }
+    let checks_multiplier = shares.is_some();
     let feeds = Arc::new(Mutex::new(Feeds {
         price: Some(hold(None, first.price)),
-        shares: Some(Stamped::now(shares)),
+        shares: shares.map(Stamped::now),
     }));
     let inventory = if settings.skew > 0.0 {
         Some(ctx.inventory().await?)
@@ -725,11 +771,14 @@ pub async fn build(
         .collect();
 
     ctx.spawn(poll_prices(prices, settings.clone(), Arc::clone(&feeds)));
-    ctx.spawn(poll_shares(valuation, token, Arc::clone(&feeds)));
+    if checks_multiplier {
+        ctx.spawn(poll_shares(valuation, token, Arc::clone(&feeds)));
+    }
     Ok(StockPricer {
         settings,
         names,
         feeds,
+        checks_multiplier,
         status,
         inventory,
         h,
@@ -765,7 +814,15 @@ async fn poll_shares(valuation: Box<dyn Valuation>, token: Address, feeds: Arc<M
     let mut ticks = poll::every(SHARES_POLL);
     loop {
         ticks.tick().await;
-        match valuation.read().await.and_then(check_shares) {
+        // A token the source listed at the build and no longer does is read as a failed
+        // read: the last reading ages out and the pair withdraws, as on any outage, until
+        // a reload decides afresh.
+        let read = valuation.read().await.and_then(|listed| {
+            listed
+                .ok_or_else(|| eyre::eyre!("the valuation source no longer lists the token"))
+                .and_then(check_shares)
+        });
+        match read {
             Ok(shares) => {
                 lock(&feeds).shares = Some(Stamped::now(shares));
                 failures.succeeded();
@@ -885,6 +942,8 @@ pub mod testkit {
         /// Since when the source has priced it the same: the price's own stamp if `None`.
         pub price_since_ms: Option<i64>,
         pub shares: Option<Stamped<Shares>>,
+        /// Whether the valuation source lists the token, as the build decided.
+        pub listed: bool,
         pub status: Option<Box<dyn MarketStatus>>,
     }
 
@@ -906,6 +965,7 @@ pub mod testkit {
                     action: None,
                 },
             }),
+            listed: true,
             status,
         }
     }
@@ -967,6 +1027,7 @@ pub mod testkit {
                     }),
                     shares: reads.shares,
                 })),
+                checks_multiplier: reads.listed,
                 status: reads.status,
                 inventory,
                 h,
@@ -1211,6 +1272,34 @@ mod tests {
         let mut rounded = reads();
         rounded.price.as_mut().unwrap().stock *= 1.0009;
         assert!(priced(rounded).is_ok());
+    }
+
+    /// The valuation source lists some tokens and not others. For one it does not list
+    /// the build reads no multiplier, and nothing that needs one withdraws the quote: not
+    /// its absence, not a price source whose `k` could not be compared.
+    #[test]
+    fn a_token_the_valuation_source_does_not_list_quotes_without_the_multiplier_gates() {
+        let unlisted = || {
+            let mut reads = reads();
+            reads.listed = false;
+            reads.shares = None;
+            reads
+        };
+        assert!(priced(unlisted()).is_ok());
+        // What would be a mismatch on a listed token: the source prices at twice the stock.
+        let mut split = unlisted();
+        let price = split.price.as_mut().unwrap();
+        price.stock = price.token / 2.0;
+        assert!(priced(split).is_ok());
+        // The other gates stand.
+        let mut old = unlisted();
+        old.price.as_mut().unwrap().at_ms = NOW_MS - 15_001;
+        assert_eq!(priced(old).unwrap_err().reason(), "price_stale");
+        let mut closed = unlisted();
+        let mut status = in_session();
+        status.session.as_mut().unwrap().value = Err("closed".to_owned());
+        closed.status = Some(Box::new(status));
+        assert_eq!(priced(closed).unwrap_err().reason(), "market_session");
     }
 
     #[test]

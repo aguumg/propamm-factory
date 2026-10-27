@@ -9,8 +9,8 @@
 #
 # 1. `--check` on a full builder-mode config (pricer and both guards) passes, and passes with
 #    the pair halted, which the library labels by its lane.
-# 2. `--check` fails, naming why, on a wrong API key, and on a token the oracle has no
-#    multiplier for.
+# 2. `--check` fails, naming why, on a wrong API key; and passes on a token the oracle does
+#    not list, saying the multiplier is not checked.
 # 3. `--check` names each refusal Ondo's stack holds for the pair, found where Ondo keeps it:
 #    the token paused, the vault blocklisted, the PropAMM sanctioned. Each mock contract
 #    answers only for what it holds, so a lookup under the wrong id or of the wrong list
@@ -155,19 +155,20 @@ ONDO_API_KEY=$API_KEY run --config "$WORK/halted.toml" --check >"$WORK/halted.ou
   || { cat "$WORK/halted.out"; fail "--check refused the pair halted"; }
 echo "  halted: --check passes"
 
-echo "== 2. --check refuses a wrong key and an unknown token"
+echo "== 2. --check refuses a wrong key, and says so on a token the oracle does not list"
 if ONDO_API_KEY=wrong run --config "$WORK/builder.toml" --check >"$WORK/badkey.out" 2>&1; then
   fail "--check passed with a wrong API key"
 fi
 # The error's own words: a bare 401 also matches whatever base fee the chain reports.
 grep -q "HTTP 401" "$WORK/badkey.out" || { cat "$WORK/badkey.out"; fail "a wrong key was not reported as a 401"; }
 grep -m1 "HTTP 401" "$WORK/badkey.out" | sed 's/^ */  wrong key: /'
+# The oracle lists some tokens and not others: one it does not list is quoted on Ondo's
+# price alone, and the check passes saying so.
 send "$ORACLE" 'setMultiplier(address,uint128,uint256)' "$AAPLON" 0 0 --private-key "$DEPLOYER_KEY"
-if ONDO_API_KEY=$API_KEY run --config "$WORK/builder.toml" --check >"$WORK/nosv.out" 2>&1; then
-  fail "--check passed with no multiplier on chain"
-fi
-grep -q "no multiplier" "$WORK/nosv.out" || { cat "$WORK/nosv.out"; fail "a missing multiplier was not named"; }
-grep -m1 "no multiplier" "$WORK/nosv.out" | sed 's/^ */  no multiplier: /'
+ONDO_API_KEY=$API_KEY run --config "$WORK/builder.toml" --check >"$WORK/nosv.out" 2>&1 \
+  || { cat "$WORK/nosv.out"; fail "--check failed on a token the oracle does not list"; }
+grep -q "does not list" "$WORK/nosv.out" || { cat "$WORK/nosv.out"; fail "an unlisted token was not said to be"; }
+grep -m1 "does not list" "$WORK/nosv.out" | sed 's/^ */  unlisted: /'
 send "$ORACLE" 'setMultiplier(address,uint128,uint256)' "$AAPLON" "$SVALUE" 0 --private-key "$DEPLOYER_KEY"
 
 echo "== 3. --check names what Ondo's stack would refuse"

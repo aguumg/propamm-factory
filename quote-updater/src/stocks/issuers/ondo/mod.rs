@@ -4,7 +4,9 @@
 //! - **`ondo`**, the stock pricer ([`crate::stocks::pricer`]) over Ondo's adapters: the price
 //!   from Ondo's own API ([`api::OndoPrices`]), the price Ondo itself mints and redeems
 //!   around; the share multiplier and its corporate-action pause from the chain's
-//!   `SyntheticSharesOracle` ([`oracle::OndoOracle`]); and Ondo's market session and asset
+//!   `SyntheticSharesOracle` ([`oracle::OndoOracle`]), for a token that oracle lists (it
+//!   holds entries for some GM tokens and not others; one it does not list is quoted on
+//!   Ondo's price alone, without the multiplier gates); and Ondo's market session and asset
 //!   events ([`status::OndoStatus`]), which withdraw on any session but `regular`, on an
 //!   active pause or size limit under the token's symbol or the stock's ticker, and on an
 //!   upcoming event that will move the share multiplier.
@@ -202,7 +204,8 @@ const FIELDS: &[FormField] = &[
         "multiplier_oracle",
         oracle::MAINNET_MULTIPLIER_ORACLE,
         "the SyntheticSharesOracle the share multiplier is read from. Blank is Ethereum \
-         mainnet's.",
+         mainnet's. A token it does not list is quoted on Ondo's price alone, without the \
+         multiplier checks.",
     ),
     FormField::number(
         "poll_ms",
@@ -260,7 +263,8 @@ impl Factory for Ondo {
         "<p class=explain>Ondo's own price for the token is the mid, less and plus a fixed \
          half-spread. The quote is withdrawn while the price is stale or frozen, outside \
          Ondo's regular session, around an asset event or a corporate action, and when \
-         Ondo's share multiplier and the chain's disagree. The band above is in the lane's \
+         Ondo's share multiplier and the chain's disagree (for a token the oracle lists; \
+         one it does not list skips that check). The band above is in the lane's \
          orientation: USDC per token when the stock token's address sorts before USDC's, \
          token per USDC (1/price) when it sorts after.</p>"
     }

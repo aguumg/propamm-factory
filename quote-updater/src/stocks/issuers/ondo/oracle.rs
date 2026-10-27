@@ -49,8 +49,9 @@ impl Multiplier {
 
 /// `assetData(token)` as `(uint128 sValue, uint128 pendingSValue, uint256 lastUpdate,
 /// uint256 pauseStartTime, uint16 allowedDriftBps, uint48 driftCooldown)`. A zero `sValue` is
-/// a token the oracle does not know, which `getSValue` reverts on too.
-pub fn decode_asset_data(values: &[Value]) -> Result<Multiplier, String> {
+/// a token the oracle does not list (`getSValue` reverts on it, `AssetNotFound`), answered
+/// as `None`: the oracle holds entries for some GM tokens and not others.
+pub fn decode_asset_data(values: &[Value]) -> Result<Option<Multiplier>, String> {
     let [
         Value::Uint(s_value),
         Value::Uint(_pending),
@@ -66,23 +67,23 @@ pub fn decode_asset_data(values: &[Value]) -> Result<Multiplier, String> {
         ));
     };
     if s_value.is_zero() {
-        return Err("the oracle holds no multiplier for this token: is it a GM token?".to_owned());
+        return Ok(None);
     }
     if *s_value > U256::from(u128::MAX) || *pause_start > U256::from(u64::MAX) {
         return Err("answered values outside their declared types".to_owned());
     }
-    Ok(Multiplier {
+    Ok(Some(Multiplier {
         s_value: *s_value,
         pause_start: pause_start.as_u64(),
-    })
+    }))
 }
 
-/// The oracle's multiplier for `token`.
+/// The oracle's multiplier for `token`, or `None` for a token it does not list.
 pub async fn read_multiplier(
     chain: &dyn Calls,
     oracle: Address,
     token: Address,
-) -> eyre::Result<Multiplier> {
+) -> eyre::Result<Option<Multiplier>> {
     let sig = "assetData(address)";
     let answer = chain
         .call_sig(oracle, sig, &[Value::Address(token)])
@@ -104,11 +105,11 @@ pub struct OndoOracle {
 }
 
 impl Valuation for OndoOracle {
-    fn read(&self) -> BoxFuture<'_, eyre::Result<Shares>> {
+    fn read(&self) -> BoxFuture<'_, eyre::Result<Option<Shares>>> {
         Box::pin(async move {
             read_multiplier(&*self.chain, self.oracle, self.token)
                 .await
-                .map(|multiplier| multiplier.shares())
+                .map(|multiplier| multiplier.map(|multiplier| multiplier.shares()))
         })
     }
 }
@@ -133,7 +134,7 @@ mod tests {
             oracle,
             token,
         };
-        let shares = ondo.read().await.unwrap();
+        let shares = ondo.read().await.unwrap().expect("listed");
         assert!((shares.k - 1.002124).abs() < 1e-15, "{}", shares.k);
         assert_eq!(shares.action.map(|a| a.starts), Some(1_791_500_000));
         // Another token's is not asked for.
@@ -160,20 +161,23 @@ mod tests {
         let one_and_a_bit = U256::from(1_002_124_000_000_000_000u64);
         assert_eq!(
             decode_asset_data(&asset_data(one_and_a_bit, 0)),
-            Ok(Multiplier {
+            Ok(Some(Multiplier {
                 s_value: one_and_a_bit,
                 pause_start: 0
-            })
+            }))
         );
-        let m = decode_asset_data(&asset_data(one_and_a_bit, 1_791_500_000)).unwrap();
+        let m = decode_asset_data(&asset_data(one_and_a_bit, 1_791_500_000))
+            .unwrap()
+            .unwrap();
         assert_eq!(m.pause_start, 1_791_500_000);
         assert!((m.as_f64() - 1.002124).abs() < 1e-15, "{}", m.as_f64());
     }
 
+    /// A zero `sValue` is the oracle's answer for a token it was never given, as distinct
+    /// from an answer that does not decode, which is a failed read.
     #[test]
-    fn a_token_the_oracle_does_not_know_is_refused() {
-        let err = decode_asset_data(&asset_data(U256::zero(), 0)).unwrap_err();
-        assert!(err.contains("no multiplier"), "{err}");
+    fn a_token_the_oracle_does_not_list_is_none_and_a_broken_answer_is_an_error() {
+        assert_eq!(decode_asset_data(&asset_data(U256::zero(), 0)), Ok(None));
         assert!(decode_asset_data(&asset_data(U256::exp10(18), 0)[..5]).is_err());
     }
 

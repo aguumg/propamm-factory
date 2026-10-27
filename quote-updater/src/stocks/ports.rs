@@ -124,7 +124,10 @@ impl Action {
 /// the core's, a block apart.
 pub trait Valuation: Send + Sync + 'static {
     /// The shares one token is worth now, and the corporate action scheduled on it, if any.
-    fn read(&self) -> BoxFuture<'_, eyre::Result<Shares>>;
+    /// `None` for a token the source does not list: the core then quotes the pair on the
+    /// price source alone, without the multiplier gates, and says so at the build. An
+    /// `Err` is a read that failed, which the build refuses and a running pair ages out.
+    fn read(&self) -> BoxFuture<'_, eyre::Result<Option<Shares>>>;
 }
 
 /// Something the issuer reports on the asset that stops quoting: a pause, a size limit, a

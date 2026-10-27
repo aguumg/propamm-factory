@@ -18,7 +18,10 @@ everything around the price, which is what the stock kinds add:
   of an upcoming event that will move the share multiplier (from the moment Ondo lists it if
   it gives no start), from the start of any other upcoming event, from `pause_lead_secs`
   before a corporate action Ondo has scheduled on chain, and when Ondo's multiplier and the
-  chain's disagree. The spread is a fixed `delta`. Ondo's market-wide status is read once
+  chain's disagree. The last two read the `SyntheticSharesOracle`, which lists some GM
+  tokens and not others: a pair whose token it does not list is quoted on Ondo's price
+  alone, without those two checks, which the build says at startup and under `--check`,
+  and reads again on the next reload. The spread is a fixed `delta`. Ondo's market-wide status is read once
   per API, key and poll period, however many stock pairs share them, by the pairs' own
   tasks. The stock's ticker comes from Ondo's price answer, or from the stanza's `ticker`
   when the answer names none; with neither, the build fails, since events Ondo files under the
@@ -124,8 +127,8 @@ with the workspace, so that path cannot close unnoticed. An issuer is:
 
 1. its adapters, one per port it answers, under `quote-updater/src/stocks/issuers/<issuer>/`
    or in a crate of your own: a `PriceSource` answering `Fetched::new(Price::new(..))`, a
-   `Valuation` answering `Shares::new(k)` (its `action` set for a scheduled corporate
-   action), a `MarketStatus` if the issuer reports one, whose reader a task of yours keeps
+   `Valuation` answering `Some(Shares::new(k))` (its `action` set for a scheduled corporate
+   action), or `None` for a token it does not list, a `MarketStatus` if the issuer reports one, whose reader a task of yours keeps
    current (built from `quote_updater::poll`'s `every` and `Failures`, so it reads and logs
    like the core's own), and `Restrictions` answering the token's rules. Reads of the chain
    go through `stocks::chain::Calls` and its helpers; a test answers them with
@@ -166,7 +169,7 @@ only the stock.
 it holds) and a mock of Ondo's API (`e2e/stocks/ondo_api.py`). It checks that:
 
 1. `--check` passes on the example stanza, and with the pair halted;
-2. it fails on a wrong key and on a token with no multiplier;
+2. it fails on a wrong key, and passes, saying so, on a token the oracle does not list;
 3. it names each refusal Ondo's stack holds (the token paused, the vault blocklisted, the
    PropAMM sanctioned), found where Ondo keeps them, and withdraws on a refusal none of
    them holds, which only the transfer the guard tries finds;
