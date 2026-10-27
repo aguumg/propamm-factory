@@ -5191,6 +5191,16 @@ api_key = "k"
                 pricing["api_key"]["env"].as_str().unwrap().to_owned(),
             ),
             ("pricing_ondo_delta", text(pricing, "delta")),
+            (
+                "pricing_ondo_sessions",
+                pricing["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             ("guards_present", "1".to_owned()),
             ("enabled_guard_us_market_hours", "on".to_owned()),
             (

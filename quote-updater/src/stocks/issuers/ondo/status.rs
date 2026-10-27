@@ -147,6 +147,8 @@ pub async fn keep_fresh(status: Arc<Status>) {
 /// reading, since a tick runs far more often than Ondo is read.
 pub struct OndoStatus {
     status: Arc<Status>,
+    /// The sessions the pair quotes in, lower case (`regular`, `postmarket`, ...).
+    sessions: Vec<String>,
     judged: Mutex<Option<Judged>>,
 }
 
@@ -159,20 +161,21 @@ struct Judged {
 }
 
 impl OndoStatus {
-    /// The adapter over a shared reader of Ondo's status.
-    pub fn new(status: Arc<Status>) -> OndoStatus {
+    /// The adapter over a shared reader of Ondo's status, quoting in `sessions`.
+    pub fn new(status: Arc<Status>, sessions: Vec<String>) -> OndoStatus {
         OndoStatus {
             status,
+            sessions,
             judged: Mutex::new(None),
         }
     }
 }
 
 impl MarketStatus for OndoStatus {
-    /// The session must be `regular` (in any case): every other (pre-market, overnight,
-    /// weekend, paused) withdraws. The `us_market_hours` guard says the same from the
-    /// calendar; the two are independent on purpose. The events are judged by
-    /// [`api::events_for`], under the token's symbol or the stock's ticker.
+    /// The session must be one of the stanza's `sessions` (in any case; `regular` alone
+    /// by default): every other withdraws. The `us_market_hours` guard judges the regular
+    /// session from the calendar; the two are independent on purpose. The events are
+    /// judged by [`api::events_for`], under the token's symbol or the stock's ticker.
     fn read(&self, names: &[String]) -> StatusReading {
         let readings = self.status.readings();
         let at = readings.session.as_ref().map(|session| session.at);
@@ -186,7 +189,11 @@ impl MarketStatus for OndoStatus {
         let reading = StatusReading {
             session: readings.session.as_ref().map(|session| Stamped {
                 at: session.at,
-                value: if session.value.eq_ignore_ascii_case("regular") {
+                value: if self
+                    .sessions
+                    .iter()
+                    .any(|quoted| quoted.eq_ignore_ascii_case(&session.value))
+                {
                     Ok(())
                 } else {
                     Err(format!("Ondo reports the market {}", session.value))
@@ -342,7 +349,7 @@ mod tests {
                 value: api::parse_asset_events(halted).unwrap(),
             }),
         });
-        let view = OndoStatus::new(Arc::clone(&status));
+        let view = OndoStatus::new(Arc::clone(&status), vec!["regular".to_owned()]);
         let events = |view: &OndoStatus| view.read(&names).asset.unwrap().value.len();
         assert_eq!(events(&view), 1);
         // A tick between two reads reuses the judgment, whatever it would find now.

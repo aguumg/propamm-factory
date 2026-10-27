@@ -42,6 +42,9 @@ kind    = "ondo"
 symbol  = "AAPLon"
 api_key = { env = "ONDO_API_KEY" }
 delta   = "0.003"               # 30 bp half-spread: fixed, so sized for the open, not lunch
+# The Ondo sessions to quote in: any of regular, premarket, postmarket, overnight, offhours.
+# Ondo trades the tokens in all of them; the default is the regular session alone.
+sessions = ["regular"]
 # Defaults, written out:
 # ticker             = "AAPL"   # unset: Ondo's price answer names it (the build fails if not)
 # api                = "https://api.gm.ondo.finance"

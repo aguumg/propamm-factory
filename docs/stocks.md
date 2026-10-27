@@ -13,7 +13,9 @@ everything around the price, which is what the stock kinds add:
   GM API: the price Ondo mints and redeems around, already including the token's share
   multiplier. It withdraws the quote when the price is older than its limit, when it has not
   moved for `max_unchanged_secs` (a halted stock's price stops while Ondo may keep stamping
-  it current), when Ondo reports any session but `regular`, during an active asset event
+  it current), when Ondo reports a session the stanza's `sessions` does not list (`regular`
+  alone by default; Ondo also trades in `premarket`, `postmarket`, `overnight` and, for some
+  assets, `offhours`), during an active asset event
   (under the token's symbol or the stock's ticker), from `pause_lead_secs` before the start
   of an upcoming event that will move the share multiplier (from the moment Ondo lists it if
   it gives no start), from the start of any other upcoming event, from `pause_lead_secs`
@@ -38,8 +40,9 @@ everything around the price, which is what the stock kinds add:
   the revert data it answers. PropAMM can't see any of it, so its `isActive` stays true until
   the quote is withdrawn.
 
-It quotes the US regular session only, about a fifth of the week; the tokens trade on chain
-around the clock.
+By default it quotes the US regular session only, about a fifth of the week, while the
+tokens trade on chain around the clock. A stanza that lists more `sessions`, with the
+`us_market_hours` guard left off, quotes whenever Ondo reports one of them.
 
 ## Registering the kinds
 

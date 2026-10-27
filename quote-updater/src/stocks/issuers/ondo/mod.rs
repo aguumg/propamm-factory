@@ -63,6 +63,12 @@ pub struct OndoCfg {
     pub api_key: EnvSecret,
     /// Published as the delta: the half-spread as a fraction of the mid (`"0.003"` = 30 bp).
     pub delta: String,
+    /// The sessions Ondo reports (`/v1/status/market`'s `marketStatus`) in which the pair
+    /// quotes: any of `regular`, `premarket`, `postmarket`, `overnight` and `offhours`, in
+    /// any case. Default `regular` only, and an empty list means the default. Ondo's
+    /// `paused` and `closed` are never quoted in: nothing trades then.
+    #[serde(default = "default_sessions")]
+    pub sessions: Vec<String>,
     /// Ondo's GM API.
     #[serde(default = "default_api")]
     pub api: String,
@@ -101,6 +107,18 @@ pub struct OndoCfg {
 fn default_api() -> String {
     "https://api.gm.ondo.finance".to_owned()
 }
+fn default_sessions() -> Vec<String> {
+    vec!["regular".to_owned()]
+}
+
+/// The sessions Ondo reports in which a token trades. `paused` and `closed` are the others.
+const TRADING_SESSIONS: [&str; 5] = [
+    "regular",
+    "premarket",
+    "postmarket",
+    "overnight",
+    "offhours",
+];
 fn default_poll_ms() -> u64 {
     1_000
 }
@@ -124,6 +142,30 @@ fn default_max_multiplier_gap() -> f64 {
 }
 
 impl OndoCfg {
+    /// The sessions the pair quotes in, lower case, each one Ondo reports a token trading
+    /// in; an empty list is the default, `regular` alone, so a blank form field means that.
+    fn sessions(&self) -> eyre::Result<Vec<String>> {
+        let mut sessions = Vec::new();
+        for written in &self.sessions {
+            let session = written.trim().to_ascii_lowercase();
+            if session.is_empty() {
+                continue;
+            }
+            eyre::ensure!(
+                TRADING_SESSIONS.contains(&session.as_str()),
+                "sessions: {written:?} is not a session Ondo trades in; one of {}",
+                TRADING_SESSIONS.join(", ")
+            );
+            if !sessions.contains(&session) {
+                sessions.push(session);
+            }
+        }
+        if sessions.is_empty() {
+            sessions = default_sessions();
+        }
+        Ok(sessions)
+    }
+
     /// The keys the core reads, as the core reads them.
     fn stanza(&self) -> Stanza<'_> {
         Stanza {
@@ -146,6 +188,7 @@ impl OndoCfg {
     /// core's settings and the oracle the multiplier is read from.
     fn check(&self, pair: &PairShape) -> eyre::Result<(Settings, Address)> {
         let settings = Settings::new(&self.stanza(), pair)?;
+        self.sessions()?;
         api::check_api(&self.api).map_err(|err| eyre::eyre!(err))?;
         eyre::ensure!(
             (250..=60_000).contains(&self.poll_ms),
@@ -194,6 +237,12 @@ const FIELDS: &[FormField] = &[
         "delta",
         "0.003",
         "the half-spread as a fraction of the mid: 0.003 is 30 bp.",
+    ),
+    FormField::list(
+        "sessions",
+        "regular",
+        "the sessions Ondo reports in which the pair quotes, one per line: regular, \
+         premarket, postmarket, overnight, offhours. Blank is regular only.",
     ),
     FormField::new(
         "api",
@@ -262,7 +311,8 @@ impl Factory for Ondo {
     fn form_help(&self) -> &'static str {
         "<p class=explain>Ondo's own price for the token is the mid, less and plus a fixed \
          half-spread. The quote is withdrawn while the price is stale or frozen, outside \
-         Ondo's regular session, around an asset event or a corporate action, and when \
+         the Ondo sessions listed (the regular session alone unless the stanza says \
+         otherwise), around an asset event or a corporate action, and when \
          Ondo's share multiplier and the chain's disagree (for a token the oracle lists; \
          one it does not list skips that check). The band above is in the lane's \
          orientation: USDC per token when the stock token's address sorts before USDC's, \
@@ -274,7 +324,11 @@ impl Factory for Ondo {
     }
 
     fn summary(&self, cfg: &OndoCfg) -> String {
-        format!("{} delta {} skew {}", cfg.symbol, cfg.delta, cfg.skew)
+        let sessions = cfg.sessions().unwrap_or_default().join("+");
+        format!(
+            "{} delta {} skew {} in {sessions}",
+            cfg.symbol, cfg.delta, cfg.skew
+        )
     }
 
     fn build<'a>(
@@ -284,6 +338,7 @@ impl Factory for Ondo {
     ) -> BoxFuture<'a, eyre::Result<StockPricer>> {
         Box::pin(async move {
             let (settings, oracle) = cfg.check(ctx.pair())?;
+            let sessions = cfg.sessions()?;
             let key = cfg.api_key.resolve()?;
             let chain = ctx.chain()?;
             let token = ctx.pair().tokens.0;
@@ -305,7 +360,7 @@ impl Factory for Ondo {
                 status: Some(Box::pin(async move {
                     let shared = status::Status::shared(&api, &status_key, every).await?;
                     Ok(StatusFeed {
-                        reader: Box::new(status::OndoStatus::new(Arc::clone(&shared))),
+                        reader: Box::new(status::OndoStatus::new(Arc::clone(&shared), sessions)),
                         refresh: Box::pin(status::keep_fresh(shared)),
                     })
                 })),
@@ -385,9 +440,15 @@ mod tests {
     /// The `ondo` pricer as its build leaves it, over the status Ondo reports, for AAPLon,
     /// whose stock Ondo's price answer names AAPL.
     fn built(status: Arc<Status>) -> Built {
+        built_with(cfg(serde_json::json!({})), status)
+    }
+
+    /// [`built`], from `cfg`'s stanza.
+    fn built_with(cfg: OndoCfg, status: Arc<Status>) -> Built {
         let pair = testkit::pair();
-        let (settings, _) = cfg(serde_json::json!({})).check(&pair).unwrap();
-        let reads = testkit::healthy(Some(Box::new(OndoStatus::new(status))));
+        let (settings, _) = cfg.check(&pair).unwrap();
+        let sessions = cfg.sessions().unwrap();
+        let reads = testkit::healthy(Some(Box::new(OndoStatus::new(status, sessions))));
         testkit::built(pair, settings, reads, None)
     }
 
@@ -452,6 +513,45 @@ mod tests {
         );
         // With no start there is nothing to withdraw from until Ondo says it is on.
         assert!(at(None).price().is_ok());
+    }
+
+    /// Ondo trades its tokens outside the regular session too; a stanza lists the sessions
+    /// it quotes in, and the market-session gate follows the list.
+    #[test]
+    fn the_stanza_lists_the_sessions_the_pair_quotes_in() {
+        let extended =
+            || cfg(serde_json::json!({"sessions": ["regular", "Postmarket", " overnight "]}));
+        for session in ["regular", "postmarket", "overnight", "OVERNIGHT"] {
+            assert!(
+                built_with(extended(), ondo_reports(session, "[]"))
+                    .price()
+                    .is_ok(),
+                "{session}"
+            );
+        }
+        for session in ["premarket", "offhours", "paused", "closed"] {
+            let refusal = built_with(extended(), ondo_reports(session, "[]")).refusal();
+            assert_eq!(refusal.reason(), "market_session", "{session}");
+        }
+        assert_eq!(
+            extended().sessions().unwrap(),
+            ["regular", "postmarket", "overnight"]
+        );
+        // An empty list (a blank form field) is the default.
+        let blank = cfg(serde_json::json!({"sessions": []}));
+        assert_eq!(blank.sessions().unwrap(), ["regular"]);
+        assert!(
+            built_with(blank, ondo_reports("postmarket", "[]"))
+                .price()
+                .is_err()
+        );
+        // A session nothing trades in, or a word Ondo does not report, fails the stanza.
+        for bad in ["paused", "closed", "post-market", "after hours"] {
+            let err = cfg(serde_json::json!({"sessions": ["regular", bad]}))
+                .check(&testkit::pair())
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("sessions"), "{bad}: {err:#}");
+        }
     }
 
     #[test]
