@@ -123,8 +123,8 @@ td.addr { color: var(--dim); font-size: .74rem; overflow-wrap: anywhere; }
 .card hr { border: none; border-top: 1px solid var(--line); margin: 1.1rem 0; }
 .sources { display: flex; flex-direction: column; gap: .7rem; }
 .sources .explain { margin: 0; }
-table.venues { font-size: .8rem; }
-table.venues td input[type=text] { min-width: 8rem; }
+table.venues, table.fx-venues { font-size: .8rem; }
+table.venues td input[type=text], table.fx-venues td input[type=text] { min-width: 8rem; }
 table.venues td.note { font-size: .68rem; color: var(--faint); }
 .venue-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .6rem; }
 .venue-buttons { display: flex; align-items: center; gap: .6rem; }

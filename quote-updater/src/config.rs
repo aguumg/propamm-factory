@@ -277,6 +277,10 @@ pub struct RawPair {
     /// it has no form for, and reload compares it as written. A table, so the serializer
     /// writes it after the pair's plain keys.
     pub pricing: toml::Table,
+    /// `[pairs.fx]`: the rate the pair's `quote = "USD"` sources are converted by. See
+    /// [`Fx`]. A table, so after the plain keys like `pricing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fx: Option<RawFx>,
     /// The pair's registered guards, `[[pairs.guards]]` stanzas in file order: each names a
     /// `kind` the binary registered and carries that kind's own config. Kept as written for
     /// the same reasons `pricing` is. An array of tables, so last of all.
@@ -294,6 +298,36 @@ pub struct RawSource {
     /// `1` mean the same as `0.667` and `0.333`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weight: Option<String>,
+    /// The currency the market is quoted in when it is not the pair's quote token: only
+    /// `"USD"`, which the pair's `[pairs.fx]` converts. Blank is the pair's quote token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
+}
+
+/// A pair's `[pairs.fx]` stanza, as written. See [`Fx`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RawFx {
+    pub sources: Vec<RawFxSource>,
+    /// How many of `sources` must be fresh for the rate to be used. Blank is all of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_sources: Option<String>,
+    /// How far the rate may sit from 1, as a fraction. Blank is [`DEFAULT_FX_MAX_DEPEG`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_depeg: Option<String>,
+    /// How far apart the fresh legs may read, as a fraction of their mean. Blank is
+    /// [`DEFAULT_FX_MAX_DISAGREEMENT`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_disagreement: Option<String>,
+}
+
+/// One entry of `[pairs.fx]`'s `sources`, as written: a market of the pair's quote token
+/// in USD. No weight: the rate is the plain mean of the fresh ones.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RawFxSource {
+    pub venue: String,
+    pub symbol: String,
 }
 
 /// Weights are relative, so their scale cancels out of the average; six decimals is more
@@ -313,6 +347,76 @@ pub struct Source {
     pub symbol: String,
     /// Scaled by 10^[`WEIGHT_DECIMALS`].
     pub weight: U256,
+    /// What the market is quoted in, when it is not the pair's quote token; `None` is the
+    /// pair's quote token, averaged as read.
+    pub quote: Option<Quote>,
+}
+
+/// A currency a source may be quoted in other than the pair's quote token, which the
+/// pair's [`Fx`] converts from. One today; an enum so another is a variant, not a rewrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quote {
+    Usd,
+}
+
+impl Quote {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Quote::Usd => "USD",
+        }
+    }
+}
+
+impl std::str::FromStr for Quote {
+    type Err = eyre::Report;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if s.trim().eq_ignore_ascii_case("USD") {
+            Ok(Quote::Usd)
+        } else {
+            bail!("quote {s:?} is not one the pusher converts; the only one is \"USD\"")
+        }
+    }
+}
+
+/// `max_depeg` when the stanza leaves it blank: a rate more than 50 bp from 1.
+pub const DEFAULT_FX_MAX_DEPEG: &str = "0.005";
+
+/// `max_disagreement` when the stanza leaves it blank: legs more than 5 bp apart.
+pub const DEFAULT_FX_MAX_DISAGREEMENT: &str = "0.0005";
+
+/// The largest `max_depeg` or `max_disagreement`. A quote token 5% off the dollar is not a
+/// peg a price should be converted through, and a larger value is a percent written where
+/// a fraction goes.
+pub const MAX_FX_FRACTION: &str = "0.05";
+
+/// The scale of `max_depeg` and `max_disagreement`: finer than anyone sets a peg tolerance.
+pub const FX_DECIMALS: u32 = 18;
+
+/// One market of the pair's quote token in USD (USDT/USD on a USDT pair), read for [`Fx`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FxLeg {
+    pub venue: VenueId,
+    pub symbol: String,
+}
+
+/// `[pairs.fx]`: how a pair's `quote = "USD"` sources are converted into its quote token.
+///
+/// The rate is the price of one quote token in USD, the plain mean of the legs that are
+/// fresh by the same rules as a source (`MAX_PRICE_AGE`, `max_source_lag_ms`). A USD mid
+/// is divided by it. The legs carry no weight and do not count toward `min_sources`.
+/// While fewer than `min_sources` legs are fresh, or their mean is more than `max_depeg`
+/// from 1, or they sit more than `max_disagreement` apart, the rate is not used and every
+/// USD source is left out of the average; the pair's `min_sources` then says whether the
+/// sources that need no conversion still publish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fx {
+    pub legs: Vec<FxLeg>,
+    pub min_sources: usize,
+    /// Scaled by 10^[`FX_DECIMALS`].
+    pub max_depeg: U256,
+    /// Scaled by 10^[`FX_DECIMALS`].
+    pub max_disagreement: U256,
 }
 
 /// Where a streamed pair's mid comes from: one or more venues, averaged by weight over the
@@ -326,6 +430,8 @@ pub struct Feeds {
     pub min_sources: usize,
     /// The late-venue check; off unless the stanza sets it.
     pub checks: SourceChecks,
+    /// The conversion for sources quoted in USD; `None` on a pair that has none.
+    pub fx: Option<Fx>,
 }
 
 /// The largest `max_source_lag_ms`. A guard against the unit, not a bound the feed needs:
@@ -356,16 +462,26 @@ impl Feeds {
                 venue: VenueId::Binance,
                 symbol: symbol.to_owned(),
                 weight: U256::exp10(WEIGHT_DECIMALS as usize),
+                quote: None,
             }],
             min_sources: 1,
             checks: SourceChecks::default(),
+            fx: None,
         }
+    }
+
+    /// How many sources are averaged as read, with no conversion: the most that stay in
+    /// when the FX rate cannot be used.
+    pub fn unconverted(&self) -> usize {
+        self.sources.iter().filter(|s| s.quote.is_none()).count()
     }
 
     /// The one-line description the report and the backoffice print: `binance:ETHUSDC`, or
     /// `binance:ETHUSDC ×2 + coinbase:ETH-USD ×1` when there is more than one.
     pub fn describe(&self) -> String {
-        if let [only] = self.sources.as_slice() {
+        if let [only] = self.sources.as_slice()
+            && self.fx.is_none()
+        {
             return format!("{}:{}", only.venue, only.symbol);
         }
         let parts: Vec<String> = self
@@ -373,16 +489,26 @@ impl Feeds {
             .iter()
             .map(|s| {
                 format!(
-                    "{}:{} ×{}",
+                    "{}:{} ×{}{}",
                     s.venue,
                     s.symbol,
-                    format_scaled(s.weight, WEIGHT_DECIMALS)
+                    format_scaled(s.weight, WEIGHT_DECIMALS),
+                    s.quote
+                        .map_or(String::new(), |q| format!(" in {}", q.as_str()))
                 )
             })
             .collect();
         let mut text = parts.join(" + ");
         if self.min_sources > 1 {
             text.push_str(&format!(" (min {})", self.min_sources));
+        }
+        if let Some(fx) = &self.fx {
+            let legs: Vec<String> = fx
+                .legs
+                .iter()
+                .map(|leg| format!("{}:{}", leg.venue, leg.symbol))
+                .collect();
+            text.push_str(&format!(", fx {}", legs.join(" + ")));
         }
         text
     }
@@ -559,6 +685,10 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
             "{at}: set symbol or sources, not both; symbol is the short form of one binance \
              source"
         ),
+        (Some(_), true) | (None, true) if raw.fx.is_some() => bail!(
+            "{at}: [pairs.fx] converts the sources set quote = \"USD\", and this pair has no \
+             sources"
+        ),
         (Some(symbol), true) => {
             ensure!(
                 raw.min_sources.is_none(),
@@ -615,10 +745,17 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
             "{at}: sources[{i}] repeats {venue}:{}; one entry per market",
             source.symbol
         );
+        let quote = source
+            .quote
+            .as_deref()
+            .map(str::parse::<Quote>)
+            .transpose()
+            .wrap_err_with(|| format!("{at}: sources[{i}] ({venue})"))?;
         sources.push(Source {
             venue,
             symbol: source.symbol.clone(),
             weight,
+            quote,
         });
     }
     let min_sources = match &raw.min_sources {
@@ -637,18 +774,114 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
         }
     };
     let checks = parse_source_checks(raw, &sources, at)?;
+    let fx = parse_fx(raw, &sources, at)?;
     Ok(Some(Feeds {
         sources,
         min_sources,
         checks,
+        fx,
     }))
 }
 
-/// Refuses a pair whose `max_source_lag_ms` the file parser would refuse, with the same
-/// message: for the backoffice, which checks an edit before writing it. A pair not setting
-/// it is not looked at, so nothing else changes there.
+/// `[pairs.fx]`, on a pair whose `sources` are parsed: required exactly when one of them
+/// is quoted in USD, so a USD price is never averaged unconverted and a stanza is never
+/// left converting nothing.
+fn parse_fx(raw: &RawPair, sources: &[Source], at: &str) -> Result<Option<Fx>> {
+    let usd = sources.iter().find(|s| s.quote == Some(Quote::Usd));
+    let raw_fx = match (&raw.fx, usd) {
+        (None, None) => return Ok(None),
+        (None, Some(source)) => bail!(
+            "{at}: {}:{} is quoted in USD, and the pair has no [pairs.fx] to convert it by; \
+             add one, or drop quote to average it as if USD were the quote token",
+            source.venue,
+            source.symbol
+        ),
+        (Some(_), None) => bail!(
+            "{at}: [pairs.fx] converts the sources set quote = \"USD\", and none of this \
+             pair's is; drop the stanza or mark the USD markets"
+        ),
+        (Some(raw_fx), Some(_)) => raw_fx,
+    };
+    ensure!(
+        !raw_fx.sources.is_empty(),
+        "{at}: [pairs.fx] has no sources; list the quote token's USD markets the rate is read from"
+    );
+    let mut legs: Vec<FxLeg> = Vec::with_capacity(raw_fx.sources.len());
+    for (i, leg) in raw_fx.sources.iter().enumerate() {
+        let venue: VenueId = leg
+            .venue
+            .parse()
+            .wrap_err_with(|| format!("{at}: fx sources[{i}]"))?;
+        ensure!(
+            !leg.symbol.trim().is_empty(),
+            "{at}: fx sources[{i}] ({venue}) has no symbol"
+        );
+        ensure!(
+            !legs
+                .iter()
+                .any(|l| l.venue == venue && l.symbol.eq_ignore_ascii_case(&leg.symbol)),
+            "{at}: fx sources[{i}] repeats {venue}:{}; one entry per market",
+            leg.symbol
+        );
+        legs.push(FxLeg {
+            venue,
+            symbol: leg.symbol.clone(),
+        });
+    }
+    let min_sources = match &raw_fx.min_sources {
+        None => legs.len(),
+        Some(text) => {
+            let n: usize = text
+                .parse()
+                .wrap_err_with(|| format!("{at}: fx min_sources {text:?} is not a whole number"))?;
+            ensure!(
+                (1..=legs.len()).contains(&n),
+                "{at}: fx min_sources is {n} but there are {} fx sources; it must be between 1 \
+                 and that",
+                legs.len()
+            );
+            n
+        }
+    };
+    let fraction = |text: Option<&str>, default: &str, key: &str| -> Result<U256> {
+        let text = text.unwrap_or(default);
+        let value = parse_decimal_scaled(text, FX_DECIMALS)
+            .wrap_err_with(|| format!("{at}: invalid fx {key}"))?;
+        ensure!(
+            !value.is_zero(),
+            "{at}: fx {key} {text} is zero, so the USD sources would never be averaged"
+        );
+        ensure!(
+            value <= parse_decimal_scaled(MAX_FX_FRACTION, FX_DECIMALS)?,
+            "{at}: fx {key} {text} is above {MAX_FX_FRACTION}; it is a fraction, so write \
+             0.005 for 50 bp"
+        );
+        Ok(value)
+    };
+    Ok(Some(Fx {
+        legs,
+        min_sources,
+        max_depeg: fraction(
+            raw_fx.max_depeg.as_deref(),
+            DEFAULT_FX_MAX_DEPEG,
+            "max_depeg",
+        )?,
+        max_disagreement: fraction(
+            raw_fx.max_disagreement.as_deref(),
+            DEFAULT_FX_MAX_DISAGREEMENT,
+            "max_disagreement",
+        )?,
+    }))
+}
+
+/// Refuses a pair whose `max_source_lag_ms`, `quote` or `[pairs.fx]` the file parser would
+/// refuse, with the same message: for the backoffice, which checks an edit before writing
+/// it. A pair setting none of them is not looked at, so nothing else changes there.
 pub(crate) fn check_source_keys(raw: &RawPair) -> Result<()> {
-    if raw.max_source_lag_ms.is_none() {
+    if raw.max_source_lag_ms.is_none()
+        && raw.fx.is_none()
+        && raw.sources.iter().all(|s| s.quote.is_none())
+    {
         return Ok(());
     }
     parse_feeds(raw, "this pair").map(|_| ())
@@ -1772,6 +2005,159 @@ sources = [
             "{written}"
         );
         parse_config(&written, 18).expect("a rendered config must load");
+    }
+
+    /// A source may be quoted in USD, converted by the pair's `[pairs.fx]`: the legs keep
+    /// their order, `min_sources` defaults to all of them, the two tolerances to their
+    /// defaults, and a pair with neither key parses exactly as before.
+    #[test]
+    fn usd_sources_parse_with_an_fx_stanza_and_its_defaults() {
+        let body = r#"
+sources = [
+  { venue = "coinbase", symbol = "ETH-USD", weight = "2", quote = "USD" },
+  { venue = "okx", symbol = "ETH-USDC" },
+]
+[pairs.fx]
+sources = [
+  { venue = "kraken", symbol = "USDC/USD" },
+  { venue = "coinbase", symbol = "USDC-USD" },
+]
+"#;
+        let config = parse_config(&pair_with(body), 18).unwrap();
+        let feeds = config.pairs[0].feeds.as_ref().unwrap();
+        let quotes: Vec<Option<Quote>> = feeds.sources.iter().map(|s| s.quote).collect();
+        assert_eq!(quotes, [Some(Quote::Usd), None]);
+        assert_eq!(feeds.unconverted(), 1);
+        let fx = feeds.fx.as_ref().expect("the stanza");
+        assert_eq!(
+            fx.legs,
+            [
+                FxLeg {
+                    venue: VenueId::Kraken,
+                    symbol: "USDC/USD".into()
+                },
+                FxLeg {
+                    venue: VenueId::Coinbase,
+                    symbol: "USDC-USD".into()
+                },
+            ]
+        );
+        assert_eq!(fx.min_sources, 2);
+        assert_eq!(format_scaled(fx.max_depeg, FX_DECIMALS), "0.005");
+        assert_eq!(format_scaled(fx.max_disagreement, FX_DECIMALS), "0.0005");
+        assert_eq!(
+            feeds.describe(),
+            "coinbase:ETH-USD ×2 in USD + okx:ETH-USDC ×1, fx kraken:USDC/USD + \
+             coinbase:USDC-USD"
+        );
+
+        // Set, the keys are read as written; and written back, they load the same.
+        let set = format!(
+            "{body}min_sources = \"1\"\nmax_depeg = \"0.01\"\nmax_disagreement = \"0.001\"\n"
+        );
+        let fx = parse_config(&pair_with(&set), 18).unwrap().pairs[0]
+            .feeds
+            .clone()
+            .unwrap()
+            .fx
+            .unwrap();
+        assert_eq!(fx.min_sources, 1);
+        assert_eq!(format_scaled(fx.max_depeg, FX_DECIMALS), "0.01");
+        assert_eq!(format_scaled(fx.max_disagreement, FX_DECIMALS), "0.001");
+        let raw: RawConfig = toml::from_str(&pair_with(&set)).unwrap();
+        let written = render_raw(&raw).unwrap();
+        assert!(written.contains("quote = \"USD\""), "{written}");
+        let again = parse_config(&written, 18).expect("a rendered config must load");
+        assert_eq!(
+            again.pairs[0].feeds.as_ref().unwrap().fx.as_ref(),
+            Some(&fx)
+        );
+
+        // No quote and no stanza: what a file written before either existed means.
+        let plain = parse_config(
+            &pair_with(
+                r#"sources = [{ venue = "coinbase", symbol = "ETH-USD" }, { venue = "okx", symbol = "ETH-USDC" }]"#,
+            ),
+            18,
+        )
+        .unwrap();
+        let feeds = plain.pairs[0].feeds.as_ref().unwrap();
+        assert!(feeds.fx.is_none());
+        assert!(feeds.sources.iter().all(|s| s.quote.is_none()));
+        assert_eq!(feeds.describe(), "coinbase:ETH-USD ×1 + okx:ETH-USDC ×1");
+    }
+
+    #[test]
+    fn usd_sources_and_fx_refuse_what_cannot_be_converted() {
+        let usd = r#"sources = [{ venue = "coinbase", symbol = "ETH-USD", quote = "USD" }, { venue = "okx", symbol = "ETH-USDC" }]
+"#;
+        let fx = |keys: &str| {
+            format!(
+                "{usd}[pairs.fx]\nsources = [{{ venue = \"kraken\", symbol = \"USDC/USD\" }}, \
+                 {{ venue = \"coinbase\", symbol = \"USDC-USD\" }}]\n{keys}"
+            )
+        };
+        let cases = [
+            (usd.to_owned(), "has no [pairs.fx] to convert it by"),
+            (
+                r#"sources = [{ venue = "coinbase", symbol = "ETH-USD", quote = "EUR" }]"#
+                    .to_owned(),
+                "the only one is \"USD\"",
+            ),
+            (
+                "sources = [{ venue = \"okx\", symbol = \"ETH-USDC\" }]\n[pairs.fx]\nsources = \
+                 [{ venue = \"kraken\", symbol = \"USDC/USD\" }]"
+                    .to_owned(),
+                "none of this pair's is",
+            ),
+            (
+                "symbol = \"ETHUSDC\"\n[pairs.fx]\nsources = [{ venue = \"kraken\", symbol = \
+                 \"USDC/USD\" }]"
+                    .to_owned(),
+                "this pair has no sources",
+            ),
+            (
+                format!("{usd}[pairs.fx]\nsources = []"),
+                "[pairs.fx] has no sources",
+            ),
+            (
+                format!("{usd}[pairs.fx]\nsources = [{{ venue = \"nasdaq\", symbol = \"USDC\" }}]"),
+                "unknown venue",
+            ),
+            (
+                format!(
+                    "{usd}[pairs.fx]\nsources = [{{ venue = \"kraken\", symbol = \"USDC/USD\" }}, \
+                     {{ venue = \"kraken\", symbol = \"usdc/usd\" }}]"
+                ),
+                "repeats kraken:usdc/usd",
+            ),
+            (
+                format!("{usd}[pairs.fx]\nsources = [{{ venue = \"kraken\", weight = \"1\" }}]"),
+                "unknown field",
+            ),
+            (fx("min_sources = \"0\""), "fx min_sources is 0"),
+            (
+                fx("min_sources = \"3\""),
+                "fx min_sources is 3 but there are 2",
+            ),
+            (fx("max_depeg = \"0\""), "fx max_depeg 0 is zero"),
+            (fx("max_depeg = \"0.5\""), "fx max_depeg 0.5 is above 0.05"),
+            (fx("max_depeg = \"bp\""), "invalid fx max_depeg"),
+            (
+                fx("max_disagreement = \"0.06\""),
+                "fx max_disagreement 0.06 is above 0.05",
+            ),
+        ];
+        for (body, expected) in cases {
+            let err = format!(
+                "{:#}",
+                parse_config(&pair_with(&body), 18).map(|_| ()).unwrap_err()
+            );
+            assert!(
+                err.contains(expected),
+                "{body}\n  expected {expected:?} in: {err}"
+            );
+        }
     }
 
     #[test]

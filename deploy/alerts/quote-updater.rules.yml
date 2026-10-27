@@ -464,6 +464,33 @@ groups:
             quote_updater_venue_future_stamps_total, or every stamped venue late by about the
             same amount, points at this host's clock instead.
 
+      # A pair's `quote = "USD"` sources left out of its average because its FX rate
+      # (`[pairs.fx]`) was refused: too few legs fresh, off its peg, or legs that disagree.
+      # A ticket, like PusherVenueLate: the pair keeps quoting on its other sources while
+      # min_sources are fresh, and PusherFeedDown says when they are not.
+      #
+      # Per pair, not per reason, and over a 2m window: a guard that flaps (a leg going in
+      # and out of max_disagreement) or whose reason changes (stale, then depeg) has had the
+      # USD sources out all along, and a per-reason `== 1` would restart `for` at every
+      # change and never fire. The reasons standing now are read back into the description.
+      # Five minutes rides out a leg's reconnect. NaN, a pair without [pairs.fx], never
+      # compares equal.
+      - alert: PusherFxGuardTripped
+        expr: max by (pair) (max_over_time(quote_updater_fx_guard_tripped[2m])) == 1
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: USD sources out for 5 minutes, FX rate refused"
+          description: >-
+            The pair's sources quoted in USD have been left out of its average for five
+            minutes because its FX rate could not be used. Now: {{ with printf
+            "quote_updater_fx_guard_tripped{pair=%q} == 1" $labels.pair | query }}{{ range .
+            }}{{ .Labels.reason }} {{ end }}{{ else }}cleared {{ end }}(stale is fewer fresh FX
+            legs than [pairs.fx] min_sources, depeg is a rate further from 1 than max_depeg,
+            disagreement is legs further apart than max_disagreement). The pair quotes on its
+            other sources meanwhile. quote_updater_fx_rate and quote_updater_fx_sources_fresh
+            say what the legs read; their venue series are labelled fx:<venue>.
+
       - alert: PusherFeedSampleNotCurrent
         expr: quote_updater_feed_sample_current == 0
         for: 5m

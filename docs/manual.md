@@ -122,12 +122,13 @@ is no single book whose spread it could copy.
 
 Three consequences of averaging worth choosing deliberately:
 
-- **Every source must price in the same quote currency.** The average does not convert:
-  mixing Coinbase's `ETH-USD` with Binance's `ETHUSDC` averages dollars with USDC, which
-  is fine only while the two trade at par. The startup cross-check accepts a USDC or USDT
-  pair read from the base's USDC, USDT or USD market, with a warning; any other
-  difference (a different asset, or another quote) fails it unless the pair sets
-  `allow_symbol_mismatch`.
+- **Every source is averaged in the pair's quote currency unless it says otherwise.** A
+  source without `quote` is averaged as read: mixing Coinbase's `ETH-USD` with Binance's
+  `ETHUSDC` that way averages dollars with USDC, which is fine only while the two trade at
+  par. The startup cross-check accepts a USDC or USDT pair read from the base's USDC, USDT
+  or USD market, with a warning that it is averaged at par; any other difference (a
+  different asset, or another quote) fails it unless the pair sets
+  `allow_symbol_mismatch`. A USD market can instead be converted; see below.
 - **A venue dropping out steps the mid by the disagreement between venues.** The fresh set
   changes, so the average moves by however far the departing venue sat from the rest. The
   breaker judges that step like any other, so `max_deviation` has to be larger than the
@@ -175,6 +176,66 @@ the symbol typed works.
 venue with a wrong symbol, or one disagreeing with the others, shows up before anything is
 published. Each venue can be repointed (a mock, a regional endpoint) from
 `[settings.endpoints]`; `binance_ws` is the older spelling of its Binance entry.
+
+### Sources quoted in USD
+
+A source marked `quote = "USD"` is converted into the pair's quote token before it is
+averaged, by the rate the pair's `[pairs.fx]` stanza reads:
+
+```toml
+[[pairs]]
+# ... a WETH/USDT pair
+min_sources = "2"
+sources = [
+  { venue = "coinbase", symbol = "ETH-USD",  weight = "2", quote = "USD" },
+  { venue = "okx",      symbol = "ETH-USDT", weight = "1" },
+  { venue = "bybit",    symbol = "ETHUSDT",  weight = "1" },
+]
+
+[pairs.fx]
+sources = [
+  { venue = "kraken",   symbol = "USDT/USD" },
+  { venue = "coinbase", symbol = "USDT-USD" },
+]
+min_sources = "2"            # default: all of them
+max_depeg = "0.005"          # default
+max_disagreement = "0.0005"  # default
+```
+
+The FX legs are the quote token's own USD markets. Each is a feed like a source, dialled
+with the pair's sources and judged fresh by the same rules (30 seconds, and
+`max_source_lag_ms` when set), with its own `quote_updater_venue_feed_*` series under the
+venue label `fx:<venue>`. A leg carries no weight and does not count toward the pair's
+`min_sources`. The rate is the plain mean of the fresh legs: the price of one quote token
+in USD, about 0.998 for USDT. On every composite tick each fresh USD source's mid is
+divided by it (USD per base over USD per quote token is quote token per base); on an
+inverted lane, which carries the reciprocal, it is multiplied instead. The half-spread is
+a fraction of the mid and is not touched. A converted sample is as old as the older of
+its own price and the oldest leg.
+
+The rate is refused, and every USD source is left out of that tick's average, while:
+
+- fewer legs are fresh than the stanza's `min_sources` (`stale`);
+- the rate is further from 1 than `max_depeg` (`depeg`);
+- the legs are further apart than `max_disagreement`, highest less lowest over their mean
+  (`disagreement`).
+
+`quote_updater_fx_guard_tripped{reason}` says which, `quote_updater_fx_rate` and
+`quote_updater_fx_sources_fresh` what the legs read, and `quote_updater_source_converted`
+which sources were converted into the last average. `PusherFxGuardTripped` raises a ticket
+after five minutes of it, per pair, so a guard that flaps or changes reason still does. A
+leg that has not delivered within 15 seconds of the pair starting is named: a warning on a
+run, which starts on the sources that need no rate, and a failure under `--check`. One leg
+(`min_sources = "1"`) is allowed, with a startup warning: nothing checks a single leg's
+print, and a bad one moves the mid by up to `max_depeg` times the USD sources' weight.
+
+The pair's `min_sources` is judged after the USD sources are left out. Set it no higher
+than the number of sources without `quote`, or a refused rate withdraws the whole pair
+rather than leaving it quoting on the rest; startup warns when it is higher. A pair with
+no `quote` and no `[pairs.fx]` behaves exactly as before. The startup cross-check reads
+each leg against the quote token's USD market (`USDT/USD` at kraken on a USDT pair), which
+`allow_symbol_mismatch` does not waive, and does not warn about a USD source that declares
+`quote = "USD"`.
 
 ### Late venues: prices that arrive behind the exchange
 

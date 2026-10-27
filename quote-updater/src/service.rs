@@ -58,8 +58,9 @@ pub(crate) struct RunningPair {
     /// when the generation that tripped on it was replaced) that only the lane's removal
     /// can retire, and the current generation's latch does not know them.
     trip_sources: Vec<(&'static str, crate::guard::Cause)>,
-    /// The venues this pair reads, so a removal can quiesce their series too.
-    venues: Vec<venue::VenueId>,
+    /// The `venue` labels of the feeds this pair reads (`VenueFeed::series`), so a removal
+    /// can quiesce their series too.
+    venues: Vec<String>,
     /// Distinguishes this generation of the lane from the next one. A pair task announces
     /// itself on the `done` channel as it ends, and by the time the run loop reads that a
     /// reload may already have started a replacement on the same lane — so the lane alone
@@ -227,7 +228,7 @@ impl Service {
         let lane = spec.lane;
         let label = live.pair.label.clone();
         let pair_metrics = live.metrics.clone();
-        let venues: Vec<venue::VenueId> = live.venues.iter().map(|v| v.venue).collect();
+        let venues: Vec<String> = live.venues.iter().map(|v| v.series()).collect();
         let guard_kinds = live.guard_kinds.clone();
         let id = self.next_id;
         self.next_id += 1;
@@ -549,7 +550,7 @@ impl Service {
     fn quiesce(
         &self,
         label: &str,
-        venues: &[venue::VenueId],
+        venues: &[String],
         guard_kinds: &[&'static str],
         trip_sources: &[(&'static str, crate::guard::Cause)],
     ) {
@@ -563,8 +564,8 @@ impl Service {
             pair.trip_source(source, cause.as_str()).set(f64::NAN);
         }
         for venue in venues {
-            self.metrics.unwatch_venue(label, venue.as_str());
-            self.metrics.for_venue(label, venue.as_str()).quiesce();
+            self.metrics.unwatch_venue(label, venue);
+            self.metrics.for_venue(label, venue).quiesce();
         }
         for builder in &self.builders.builders {
             self.metrics.for_builder(label, &builder.name).quiesce();
@@ -1883,7 +1884,7 @@ mod tests {
         let stopped = service.stop(U256::from(1)).await;
         service.quiesce(
             "A/B",
-            &[venue::VenueId::Binance],
+            &["binance".to_owned()],
             &["kill"],
             &stopped.trip_sources,
         );

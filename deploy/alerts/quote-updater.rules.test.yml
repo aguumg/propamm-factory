@@ -5,7 +5,8 @@
 # of fixtures as live rules.
 #
 # Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, plus
-# PusherStockCalendarEnding and PusherStockCalendarEnded and PusherVenueLate (at the end),
+# PusherStockCalendarEnding and PusherStockCalendarEnded and PusherVenueLate and
+# PusherFxGuardTripped (at the end),
 # which are new enough to want their labels and wording proven. The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
@@ -228,3 +229,53 @@ tests:
             exp_annotations:
               summary: "ETH/USDT: okx has been delivering prices late for 5 minutes"
               description: "This venue's prices have been arriving later behind the exchange's own timestamps than max_source_lag_ms allows for five minutes, so it is out of the pair's average. quote_updater_venue_source_lag_ms says how far behind; a steady quote_updater_venue_future_stamps_total, or every stamped venue late by about the same amount, points at this host's clock instead."
+
+  # PusherFxGuardTripped: five minutes of a pair's USD sources out for a refused FX rate
+  # raises a ticket naming the reasons standing now; a depeg that clears inside that does
+  # not, nor the NaN a pair without [pairs.fx] exports. A guard that flaps every minute, and
+  # one whose reason changes from stale to depeg, still fire: the USD sources were out all
+  # along.
+  - interval: 1m
+    name: USD sources out for a refused FX rate for five minutes raise a ticket
+    input_series:
+      - series: 'quote_updater_fx_guard_tripped{pair="ETH/USDT",reason="stale"}'
+        values: "0 1x10"
+      - series: 'quote_updater_fx_guard_tripped{pair="ETH/USDT",reason="depeg"}'
+        values: "0x11"
+      - series: 'quote_updater_fx_guard_tripped{pair="BTC/USDT",reason="depeg"}'
+        values: "0 1x3 0x6"
+      - series: 'quote_updater_fx_guard_tripped{pair="ETH/USDC",reason="stale"}'
+        values: "NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN"
+      # Flapping: in and out of max_disagreement every minute.
+      - series: 'quote_updater_fx_guard_tripped{pair="SOL/USDT",reason="disagreement"}'
+        values: "0 1 0 1 0 1 0 1 0 1 0 1"
+      # The reason changes: stale for three minutes, then depeg.
+      - series: 'quote_updater_fx_guard_tripped{pair="ARB/USDT",reason="stale"}'
+        values: "0 1 1 1 0 0 0 0 0 0 0 0"
+      - series: 'quote_updater_fx_guard_tripped{pair="ARB/USDT",reason="depeg"}'
+        values: "0 0 0 0 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PusherFxGuardTripped
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherFxGuardTripped
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: ETH/USDT
+            exp_annotations:
+              summary: "ETH/USDT: USD sources out for 5 minutes, FX rate refused"
+              description: "The pair's sources quoted in USD have been left out of its average for five minutes because its FX rate could not be used. Now: stale (stale is fewer fresh FX legs than [pairs.fx] min_sources, depeg is a rate further from 1 than max_depeg, disagreement is legs further apart than max_disagreement). The pair quotes on its other sources meanwhile. quote_updater_fx_rate and quote_updater_fx_sources_fresh say what the legs read; their venue series are labelled fx:<venue>."
+          - exp_labels:
+              severity: ticket
+              pair: SOL/USDT
+            exp_annotations:
+              summary: "SOL/USDT: USD sources out for 5 minutes, FX rate refused"
+              description: "The pair's sources quoted in USD have been left out of its average for five minutes because its FX rate could not be used. Now: disagreement (stale is fewer fresh FX legs than [pairs.fx] min_sources, depeg is a rate further from 1 than max_depeg, disagreement is legs further apart than max_disagreement). The pair quotes on its other sources meanwhile. quote_updater_fx_rate and quote_updater_fx_sources_fresh say what the legs read; their venue series are labelled fx:<venue>."
+          - exp_labels:
+              severity: ticket
+              pair: ARB/USDT
+            exp_annotations:
+              summary: "ARB/USDT: USD sources out for 5 minutes, FX rate refused"
+              description: "The pair's sources quoted in USD have been left out of its average for five minutes because its FX rate could not be used. Now: depeg (stale is fewer fresh FX legs than [pairs.fx] min_sources, depeg is a rate further from 1 than max_depeg, disagreement is legs further apart than max_disagreement). The pair quotes on its other sources meanwhile. quote_updater_fx_rate and quote_updater_fx_sources_fresh say what the legs read; their venue series are labelled fx:<venue>."

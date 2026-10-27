@@ -182,6 +182,30 @@ impl TickReject {
     }
 }
 
+/// Why a pair's FX rate was not used, and its USD sources were left out of the average.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FxTrip {
+    /// Fewer FX legs fresh than `[pairs.fx]`'s `min_sources`.
+    Stale,
+    /// The rate is further from 1 than `max_depeg`.
+    Depeg,
+    /// The legs are further apart than `max_disagreement`.
+    Disagreement,
+}
+
+impl FxTrip {
+    /// Declaration order is load-bearing: children are indexed by `variant as usize`.
+    pub const ALL: [FxTrip; 3] = [FxTrip::Stale, FxTrip::Depeg, FxTrip::Disagreement];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FxTrip::Stale => "stale",
+            FxTrip::Depeg => "depeg",
+            FxTrip::Disagreement => "disagreement",
+        }
+    }
+}
+
 /// How a config reload ended.
 ///
 /// The failure modes the file-authoritative model introduces, and the reason this is three
@@ -261,6 +285,9 @@ pub struct Metrics {
     feed_delta: GaugeVec,
     feed_sources_fresh: GaugeVec,
     feed_sources_min: GaugeVec,
+    fx_rate: GaugeVec,
+    fx_sources_fresh: GaugeVec,
+    fx_guard_tripped: GaugeVec,
     venue_feed_up: GaugeVec,
     venue_feed_ticks: IntCounterVec,
     venue_feed_rejected: IntCounterVec,
@@ -270,6 +297,7 @@ pub struct Metrics {
     venue_feed_delta: GaugeVec,
     venue_source_lag_ms: GaugeVec,
     venue_late: GaugeVec,
+    source_converted: GaugeVec,
     venue_future_stamps: IntCounterVec,
     price_unusable: IntCounterVec,
     diagnostic: GaugeVec,
@@ -329,6 +357,11 @@ pub struct PairMetrics {
     pub feed_delta: Gauge,
     pub feed_sources_fresh: Gauge,
     pub feed_sources_min: Gauge,
+    /// The rate the pair's USD sources are converted by; NaN on a pair without `[pairs.fx]`.
+    pub fx_rate: Gauge,
+    pub fx_sources_fresh: Gauge,
+    /// `fx_guard_tripped`, one per [`FxTrip`], in its order.
+    fx_guard_tripped: [Gauge; FxTrip::ALL.len()],
     price_unusable: [IntCounter; UnusableKind::ALL.len()],
     publish_decisions: [IntCounter; 4],
     pub published_mid: Gauge,
@@ -372,6 +405,9 @@ pub struct VenueMetrics {
     /// 1 while the composite leaves this venue out of its pair's average for arriving
     /// later than `max_source_lag_ms` behind its exchange stamp.
     pub late: Gauge,
+    /// 1 while this venue's price is converted by its pair's FX rate into the average, 0
+    /// while it is not (not quoted in USD, or left out for the rate).
+    pub converted: Gauge,
     /// Frames whose exchange stamp was too far ahead of their arrival to read a lag from.
     pub future_stamps: IntCounter,
 }
@@ -391,6 +427,7 @@ impl VenueMetrics {
             &self.delta,
             &self.source_lag_ms,
             &self.late,
+            &self.converted,
         ] {
             gauge.set(f64::NAN);
         }
@@ -567,6 +604,28 @@ impl Metrics {
                 "Venues that must be fresh for the pair to publish (min_sources).",
                 pair,
             )?,
+            fx_rate: gauge(
+                &r,
+                "quote_updater_fx_rate",
+                "The price of one quote token in USD the pair's USD sources are converted by: \
+                 the mean of its fresh FX legs.",
+                pair,
+            )?,
+            fx_sources_fresh: gauge(
+                &r,
+                "quote_updater_fx_sources_fresh",
+                "FX legs whose latest price was fresh at the last composite tick.",
+                pair,
+            )?,
+            // One per reason, so the alert can say which; 1 for the reason the USD sources
+            // are out right now, 0 for the others.
+            fx_guard_tripped: gauge(
+                &r,
+                "quote_updater_fx_guard_tripped",
+                "1 while the pair's USD sources are left out of its average because its FX \
+                 rate is stale, off its peg, or its legs disagree.",
+                &["pair", "reason"],
+            )?,
             venue_feed_up: gauge(
                 &r,
                 "quote_updater_venue_feed_up",
@@ -622,6 +681,13 @@ impl Metrics {
                 "quote_updater_venue_late",
                 "1 while this venue is left out of its pair's average for arriving later \
                  than max_source_lag_ms behind its exchange timestamp.",
+                pv,
+            )?,
+            source_converted: gauge(
+                &r,
+                "quote_updater_source_converted",
+                "1 while this venue's price is converted by its pair's FX rate into the \
+                 average.",
                 pv,
             )?,
             venue_future_stamps: counter(
@@ -1031,6 +1097,12 @@ impl Metrics {
             feed_delta: self.feed_delta.with_label_values(p),
             feed_sources_fresh: self.feed_sources_fresh.with_label_values(p),
             feed_sources_min: self.feed_sources_min.with_label_values(p),
+            fx_rate: self.fx_rate.with_label_values(p),
+            fx_sources_fresh: self.fx_sources_fresh.with_label_values(p),
+            fx_guard_tripped: FxTrip::ALL.map(|reason| {
+                self.fx_guard_tripped
+                    .with_label_values(&[pair, reason.as_str()])
+            }),
             price_unusable: UnusableKind::ALL
                 .map(|k| self.price_unusable.with_label_values(&[pair, k.as_str()])),
             publish_decisions: PublishAction::ALL.map(|a| {
@@ -1081,6 +1153,7 @@ impl Metrics {
             delta: self.venue_feed_delta.with_label_values(pv),
             source_lag_ms: self.venue_source_lag_ms.with_label_values(pv),
             late: self.venue_late.with_label_values(pv),
+            converted: self.source_converted.with_label_values(pv),
             future_stamps: self.venue_future_stamps.with_label_values(pv),
         }
     }
@@ -1365,6 +1438,22 @@ impl PairMetrics {
             &self.signer_runway_updates,
             &self.consecutive_landing_misses,
         ] {
+            gauge.set(f64::NAN);
+        }
+        self.fx_absent();
+    }
+
+    /// The gauge saying the pair's USD sources are out for `reason`.
+    pub fn fx_guard_tripped(&self, reason: FxTrip) -> &Gauge {
+        &self.fx_guard_tripped[reason as usize]
+    }
+
+    /// The "no FX here" reading of every FX series: for a pair without `[pairs.fx]`, which
+    /// would otherwise export the registered 0s, and for a finished one.
+    pub fn fx_absent(&self) {
+        self.fx_rate.set(f64::NAN);
+        self.fx_sources_fresh.set(f64::NAN);
+        for gauge in &self.fx_guard_tripped {
             gauge.set(f64::NAN);
         }
     }

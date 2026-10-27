@@ -830,6 +830,9 @@ pub async fn build_report(
         }
 
         row.warnings.extend(band_warning(spec));
+        if let Some(feeds) = &spec.feeds {
+            row.warnings.extend(fx_warnings(feeds));
+        }
 
         // A venue symbol is the one hand-written field that can be catastrophically wrong:
         // publishing BTC's price on the WETH lane is arbitraged within a block. Every source
@@ -838,21 +841,19 @@ pub async fn build_report(
         if let Some(feeds) = &spec.feeds {
             let mut unreadable = false;
             for source in &feeds.sources {
-                match check_symbol(
+                let check = check_symbol(
                     source.venue,
                     &source.symbol,
                     base_symbol.as_deref(),
                     quote_symbol.as_deref(),
                     spec.allow_symbol_mismatch,
-                ) {
-                    SymbolCheck::Match | SymbolCheck::MismatchAllowed { .. } => {}
-                    SymbolCheck::StandIn { quoted_in } => row.warnings.push(format!(
-                        "{} stream {:?} is quoted in {quoted_in}, not {}; averaged as if \
-                         they were at par",
-                        source.venue,
-                        source.symbol,
-                        quote_symbol.as_deref().unwrap_or("the quote token")
-                    )),
+                );
+                row.warnings
+                    .extend(quote_warning(source, &check, quote_symbol.as_deref()));
+                match check {
+                    SymbolCheck::Match
+                    | SymbolCheck::MismatchAllowed { .. }
+                    | SymbolCheck::StandIn { .. } => {}
                     SymbolCheck::Mismatch { expected } => {
                         // `check_symbol` only returns `Mismatch` when both symbols were read.
                         let b = base_symbol
@@ -870,6 +871,10 @@ pub async fn build_report(
                     }
                     SymbolCheck::Unreadable => unreadable = true,
                 }
+            }
+            for leg in feeds.fx.iter().flat_map(|fx| &fx.legs) {
+                row.failures
+                    .extend(fx_leg_failure(leg, quote_symbol.as_deref()));
             }
             // The cross-check is the guard against publishing one asset's price on
             // another's lane, so losing it must be visible rather than silent. Once per
@@ -975,6 +980,83 @@ fn band_warning(spec: &crate::config::PairSpec) -> Option<String> {
                 .to_owned(),
         ),
     }
+}
+
+/// What a source's symbol check says about the currency it is quoted in, if anything. A
+/// market in another dollar (`StandIn`) is averaged as if at par, unless the source
+/// declares that quote and the pair's FX legs convert it. A source declaring a quote whose
+/// market reads in the pair's own quote token would be converted all the same.
+fn quote_warning(
+    source: &crate::config::Source,
+    check: &SymbolCheck,
+    quote_symbol: Option<&str>,
+) -> Option<String> {
+    let quote_symbol = quote_symbol.unwrap_or("the quote token");
+    match (check, source.quote) {
+        (SymbolCheck::StandIn { quoted_in }, Some(quote)) if quote.as_str() == quoted_in => None,
+        (SymbolCheck::StandIn { quoted_in }, _) => Some(format!(
+            "{} stream {:?} is quoted in {quoted_in}, not {quote_symbol}; averaged as if they \
+             were at par",
+            source.venue, source.symbol
+        )),
+        (SymbolCheck::Match, Some(quote)) => Some(format!(
+            "{} stream {:?} reads as quoted in {quote_symbol}, but is set quote = {:?}; it is \
+             divided by the FX rate as if it were",
+            source.venue,
+            source.symbol,
+            quote.as_str()
+        )),
+        _ => None,
+    }
+}
+
+/// Why an FX leg's symbol is wrong, if it is. A leg is the pair's quote token's market in
+/// USD, not the pair's market: on a USDT pair `USDT/USD` is what is expected there, and
+/// anything else is refused like a source naming the wrong asset. `allow_symbol_mismatch`
+/// does not reach it: that key is the pair's opt-out for its sources, and a leg reading
+/// the wrong asset converts every USD source by it. A token whose symbol could not be read
+/// is the report's warning about the sources already.
+fn fx_leg_failure(leg: &crate::config::FxLeg, quote_symbol: Option<&str>) -> Option<String> {
+    match check_symbol(leg.venue, &leg.symbol, quote_symbol, Some("USD"), false) {
+        SymbolCheck::Match | SymbolCheck::MismatchAllowed { .. } | SymbolCheck::Unreadable => None,
+        SymbolCheck::StandIn { .. } | SymbolCheck::Mismatch { .. } => Some(format!(
+            "fx {} stream {:?} is not {} in USD, which reads {:?} there",
+            leg.venue,
+            leg.symbol,
+            quote_symbol.unwrap_or_default(),
+            leg.venue
+                .expected_symbol(quote_symbol.unwrap_or_default(), "USD")
+        )),
+    }
+}
+
+/// What a pair's `[pairs.fx]` is set up to do that it may not mean: a rate read from one
+/// leg, which nothing checks against another, and a `min_sources` that only the converted
+/// sources can meet, so the FX rate failing withdraws the whole pair instead of the USD
+/// sources alone.
+fn fx_warnings(feeds: &crate::config::Feeds) -> Vec<String> {
+    let Some(fx) = &feeds.fx else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    if fx.min_sources == 1 {
+        warnings.push(
+            "fx min_sources is 1, so the USD sources are converted by a single leg that no \
+             other checks; a bad print there moves the mid by up to max_depeg times their \
+             weight"
+                .to_owned(),
+        );
+    }
+    let unconverted = feeds.unconverted();
+    if feeds.min_sources > unconverted {
+        warnings.push(format!(
+            "min_sources is {} but only {unconverted} sources need no FX rate, so the rate \
+             failing withdraws the whole pair rather than leaving out the USD sources; set it \
+             to at most {unconverted} to keep quoting on the rest",
+            feeds.min_sources
+        ));
+    }
+    warnings
 }
 
 #[cfg(test)]
@@ -1235,6 +1317,116 @@ mod tests {
                 expected: "USDCETH".to_owned()
             }
         );
+    }
+
+    /// A USD market on a USDT pair is averaged at par, and said so, unless the source
+    /// declares `quote = "USD"`, which the FX legs convert. A source declaring USD whose
+    /// market reads in USDT would be converted all the same, which is said too.
+    #[test]
+    fn a_declared_usd_market_is_converted_and_not_warned_as_at_par() {
+        use crate::config::{Quote, Source};
+        use crate::venue::VenueId;
+        let source = |symbol: &str, quote| Source {
+            venue: VenueId::Coinbase,
+            symbol: symbol.to_owned(),
+            weight: U256::one(),
+            quote,
+        };
+        let warning = |source: &Source| {
+            let check = check_symbol(
+                source.venue,
+                &source.symbol,
+                Some("WETH"),
+                Some("USDT"),
+                false,
+            );
+            quote_warning(source, &check, Some("USDT"))
+        };
+        let at_par = warning(&source("ETH-USD", None)).expect("a USD market at par is warned");
+        assert!(
+            at_par.contains("averaged as if they were at par"),
+            "{at_par}"
+        );
+        assert_eq!(warning(&source("ETH-USD", Some(Quote::Usd))), None);
+        let usdt = warning(&source("ETH-USDT", Some(Quote::Usd)))
+            .expect("a USDT market set to quote USD is warned");
+        assert!(usdt.contains("divided by the FX rate"), "{usdt}");
+        assert_eq!(warning(&source("ETH-USDT", None)), None);
+    }
+
+    /// An FX leg is read against the quote token's USD market, not the pair's: USDT/USD on
+    /// a USDT pair is expected there, any other asset is refused (the pair's
+    /// `allow_symbol_mismatch` is for its sources, not its legs), and a token whose symbol
+    /// could not be read is not a leg's failure.
+    #[test]
+    fn an_fx_leg_is_checked_against_the_quote_tokens_usd_market() {
+        use crate::config::FxLeg;
+        use crate::venue::VenueId;
+        let leg = |venue, symbol: &str| FxLeg {
+            venue,
+            symbol: symbol.to_owned(),
+        };
+        assert_eq!(
+            fx_leg_failure(&leg(VenueId::Kraken, "USDT/USD"), Some("USDT")),
+            None
+        );
+        assert_eq!(
+            fx_leg_failure(&leg(VenueId::Coinbase, "USDT-USD"), Some("USDT")),
+            None
+        );
+        let wrong = fx_leg_failure(&leg(VenueId::Kraken, "BTC/USD"), Some("USDT"))
+            .expect("another asset is refused");
+        assert!(wrong.contains("\"USDT/USD\""), "{wrong}");
+        assert_eq!(
+            fx_leg_failure(&leg(VenueId::Kraken, "USDT/USD"), None),
+            None
+        );
+    }
+
+    /// `[pairs.fx]` is warned about when one leg sets the rate, which nothing cross-checks,
+    /// and when the pair's `min_sources` needs a converted source, so the rate failing
+    /// withdraws the whole pair. A pair without the stanza earns neither.
+    #[test]
+    fn an_fx_stanza_is_warned_about_when_it_cannot_do_what_it_is_for() {
+        let feeds = |min_sources: &str, fx_min: &str| {
+            let text = format!(
+                r#"
+target = "0x00000000000000000000000000000000000000aa"
+[[pairs]]
+tokens = ["0x00000000000000000000000000000000000000bb", "0x00000000000000000000000000000000000000cc"]
+key_env = "K"
+pricing = {{ kind = "feed" }}
+min_sources = "{min_sources}"
+sources = [
+  {{ venue = "coinbase", symbol = "ETH-USD", quote = "USD" }},
+  {{ venue = "okx", symbol = "ETH-USDT" }},
+  {{ venue = "bybit", symbol = "ETHUSDT" }},
+]
+[pairs.fx]
+min_sources = "{fx_min}"
+sources = [
+  {{ venue = "kraken", symbol = "USDT/USD" }},
+  {{ venue = "coinbase", symbol = "USDT-USD" }},
+]
+"#
+            );
+            crate::config::parse_config(&text, 18).unwrap().pairs[0]
+                .feeds
+                .clone()
+                .unwrap()
+        };
+        assert!(fx_warnings(&feeds("2", "2")).is_empty());
+        let one_leg = fx_warnings(&feeds("2", "1"));
+        assert!(
+            matches!(one_leg.as_slice(), [w] if w.contains("fx min_sources is 1")),
+            "{one_leg:?}"
+        );
+        let halts = fx_warnings(&feeds("3", "2"));
+        assert!(
+            matches!(halts.as_slice(), [w] if w.contains("only 2 sources need no FX rate")),
+            "{halts:?}"
+        );
+        assert!(fx_warnings(&crate::config::Feeds::single_binance("ETHUSDT")).is_empty());
     }
 
     /// A USDC or USDT pair read from the base's USDC, USDT or USD market passes without the

@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::{sync::oneshot, task::JoinHandle};
 
-use crate::config::{self, BuilderConfig, RawConfig, RawPair, RawSource};
+use crate::config::{self, BuilderConfig, RawConfig, RawFx, RawFxSource, RawPair, RawSource};
 use crate::service::ReloadFailure;
 use crate::venue::VenueId;
 
@@ -281,8 +281,8 @@ impl Outcome {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// The venue table of the pair form: one symbol and one weight per venue the binary
-/// knows, named `symbol_<venue>` and `weight_<venue>`. A blank symbol is a venue the pair
+/// The venue table of the pair form: one symbol, one weight and one quote per venue the
+/// binary knows, named `symbol_<venue>`, `weight_<venue>` and `quote_<venue>`. A blank symbol is a venue the pair
 /// does not read. Named fields rather than a map because the form decoder does not do
 /// repeated keys; every field defaults so a form rendered before a venue was added still
 /// posts.
@@ -324,6 +324,26 @@ struct SourcesForm {
     symbol_mexc: String,
     #[serde(default)]
     weight_mexc: String,
+    /// `quote_<venue>`: blank for the pair's quote token, or `USD`. `None` is a form
+    /// rendered before the column existed, which keeps the venue's quote as the file has it.
+    #[serde(default)]
+    quote_binance: Option<String>,
+    #[serde(default)]
+    quote_coinbase: Option<String>,
+    #[serde(default)]
+    quote_kraken: Option<String>,
+    #[serde(default)]
+    quote_okx: Option<String>,
+    #[serde(default)]
+    quote_bybit: Option<String>,
+    #[serde(default)]
+    quote_kucoin: Option<String>,
+    #[serde(default)]
+    quote_bitget: Option<String>,
+    #[serde(default)]
+    quote_gate: Option<String>,
+    #[serde(default)]
+    quote_mexc: Option<String>,
     #[serde(default)]
     min_sources: String,
 }
@@ -345,20 +365,140 @@ impl SourcesForm {
         }
     }
 
-    /// The venues with a symbol filled in, in `VenueId::ALL` order.
-    fn sources(&self) -> Vec<RawSource> {
+    /// The quote posted for `venue`, `None` when the form did not post one.
+    fn quote(&self, venue: VenueId) -> Option<&str> {
+        match venue {
+            VenueId::Binance => self.quote_binance.as_deref(),
+            VenueId::Coinbase => self.quote_coinbase.as_deref(),
+            VenueId::Kraken => self.quote_kraken.as_deref(),
+            VenueId::Okx => self.quote_okx.as_deref(),
+            VenueId::Bybit => self.quote_bybit.as_deref(),
+            VenueId::Kucoin => self.quote_kucoin.as_deref(),
+            VenueId::Bitget => self.quote_bitget.as_deref(),
+            VenueId::Gate => self.quote_gate.as_deref(),
+            VenueId::Mexc => self.quote_mexc.as_deref(),
+        }
+    }
+
+    /// The venues with a symbol filled in, in `VenueId::ALL` order. A venue's quote is the
+    /// posted one, or `existing`'s for that venue when the form posted none.
+    fn sources(&self, existing: &[RawSource]) -> Vec<RawSource> {
         VenueId::ALL
             .iter()
             .filter_map(|venue| {
                 let (symbol, weight) = self.row(*venue);
+                let quote = match self.quote(*venue) {
+                    Some(posted) => optional(posted),
+                    None => existing
+                        .iter()
+                        .find(|s| s.venue.eq_ignore_ascii_case(venue.as_str()))
+                        .and_then(|s| s.quote.clone()),
+                };
                 optional(symbol).map(|symbol| RawSource {
                     venue: venue.as_str().to_owned(),
                     symbol,
                     weight: optional(weight),
+                    quote,
                 })
             })
             .collect()
     }
+}
+
+/// The pair form's FX section: one symbol per venue the binary knows, `fx_symbol_<venue>`,
+/// and the stanza's three keys. `fx_present` is a hidden input, so a form rendered before
+/// the section existed keeps the pair's `[pairs.fx]` as the file has it.
+#[derive(Deserialize, Default)]
+struct FxForm {
+    #[serde(default)]
+    fx_present: Option<String>,
+    #[serde(default)]
+    fx_symbol_binance: String,
+    #[serde(default)]
+    fx_symbol_coinbase: String,
+    #[serde(default)]
+    fx_symbol_kraken: String,
+    #[serde(default)]
+    fx_symbol_okx: String,
+    #[serde(default)]
+    fx_symbol_bybit: String,
+    #[serde(default)]
+    fx_symbol_kucoin: String,
+    #[serde(default)]
+    fx_symbol_bitget: String,
+    #[serde(default)]
+    fx_symbol_gate: String,
+    #[serde(default)]
+    fx_symbol_mexc: String,
+    #[serde(default)]
+    fx_min_sources: String,
+    #[serde(default)]
+    fx_max_depeg: String,
+    #[serde(default)]
+    fx_max_disagreement: String,
+}
+
+impl FxForm {
+    /// The FX symbol posted for `venue`.
+    fn symbol(&self, venue: VenueId) -> &str {
+        match venue {
+            VenueId::Binance => &self.fx_symbol_binance,
+            VenueId::Coinbase => &self.fx_symbol_coinbase,
+            VenueId::Kraken => &self.fx_symbol_kraken,
+            VenueId::Okx => &self.fx_symbol_okx,
+            VenueId::Bybit => &self.fx_symbol_bybit,
+            VenueId::Kucoin => &self.fx_symbol_kucoin,
+            VenueId::Bitget => &self.fx_symbol_bitget,
+            VenueId::Gate => &self.fx_symbol_gate,
+            VenueId::Mexc => &self.fx_symbol_mexc,
+        }
+    }
+}
+
+/// Writes the FX section into a pair: no symbol and no key is no `[pairs.fx]`; anything
+/// else is one, for the parser to judge, so a key typed without a market is refused rather
+/// than dropped.
+///
+/// The form shows one market per venue, the first the stanza lists there. A second market
+/// on a venue (written by hand) is kept as the file has it, after the posted ones, rather
+/// than dropped by a save of a form that could not show it; blanking that venue's row
+/// drops both.
+fn apply_fx(pair: &mut RawPair, fx: &FxForm) {
+    if fx.fx_present.is_none() {
+        return;
+    }
+    let mut sources: Vec<RawFxSource> = VenueId::ALL
+        .iter()
+        .filter_map(|venue| {
+            optional(fx.symbol(*venue)).map(|symbol| RawFxSource {
+                venue: venue.as_str().to_owned(),
+                symbol,
+            })
+        })
+        .collect();
+    let existing = pair.fx.as_ref().map_or(&[][..], |fx| fx.sources.as_slice());
+    for (i, leg) in existing.iter().enumerate() {
+        let same_venue = |other: &RawFxSource| other.venue.eq_ignore_ascii_case(&leg.venue);
+        let hidden = existing[..i].iter().any(same_venue);
+        if hidden && sources.iter().any(same_venue) {
+            sources.push(leg.clone());
+        }
+    }
+    let (min_sources, max_depeg, max_disagreement) = (
+        optional(&fx.fx_min_sources),
+        optional(&fx.fx_max_depeg),
+        optional(&fx.fx_max_disagreement),
+    );
+    pair.fx = (!sources.is_empty()
+        || min_sources.is_some()
+        || max_depeg.is_some()
+        || max_disagreement.is_some())
+    .then_some(RawFx {
+        sources,
+        min_sources,
+        max_depeg,
+        max_disagreement,
+    });
 }
 
 /// Writes the venue table into a pair the way the file spells it: one Binance market with
@@ -376,7 +516,7 @@ fn apply_sources(pair: &mut RawPair, sources: &SourcesForm, legacy_symbol: &str)
             ));
         }
     }
-    let mut rows = sources.sources();
+    let mut rows = sources.sources(&pair.sources);
     if rows.is_empty()
         && let Some(symbol) = optional(legacy_symbol)
     {
@@ -384,6 +524,7 @@ fn apply_sources(pair: &mut RawPair, sources: &SourcesForm, legacy_symbol: &str)
             venue: VenueId::Binance.as_str().to_owned(),
             symbol,
             weight: None,
+            quote: None,
         });
     }
     let min_sources = optional(&sources.min_sources);
@@ -391,6 +532,7 @@ fn apply_sources(pair: &mut RawPair, sources: &SourcesForm, legacy_symbol: &str)
         [only]
             if only.venue == VenueId::Binance.as_str()
                 && only.weight.is_none()
+                && only.quote.is_none()
                 && min_sources.is_none() =>
         {
             pair.symbol = Some(only.symbol.clone());
@@ -416,6 +558,8 @@ struct AddPair {
     symbol: String,
     #[serde(flatten)]
     sources: SourcesForm,
+    #[serde(flatten)]
+    fx: FxForm,
     min_mid: String,
     max_mid: String,
     max_deviation: String,
@@ -727,9 +871,11 @@ fn pair_from_form(form: &AddPair, kinds: &crate::kinds::Kinds) -> Result<RawPair
         halted: false,
         halt_reason: None,
         pricing: pricing_stanza(kinds, &form.pricing, None, &form.kind_fields)?,
+        fx: None,
         guards: guard_stanzas(kinds, &[], &form.kind_fields)?,
     };
     apply_sources(&mut pair, &form.sources, &form.symbol)?;
+    apply_fx(&mut pair, &form.fx);
     Ok(pair)
 }
 
@@ -1077,10 +1223,13 @@ fn apply_preview_command(
                     venues.insert(
                         venue,
                         PreviewVenue {
+                            // Averaged as read: the preview has no FX legs, so a USD
+                            // market shows unconverted here.
                             source: config::Source {
                                 venue,
                                 symbol,
                                 weight,
+                                quote: None,
                             },
                             rx: None,
                         },
@@ -1379,6 +1528,8 @@ struct EditPair {
     symbol: String,
     #[serde(flatten)]
     sources: SourcesForm,
+    #[serde(flatten)]
+    fx: FxForm,
     min_mid: String,
     max_mid: String,
     max_deviation: String,
@@ -1478,6 +1629,7 @@ async fn edit_pair(
 /// An edit form's changes to `pair`, without the checks the reload makes.
 fn edit_from_form(pair: &mut RawPair, form: &EditPair, kinds: &crate::kinds::Kinds) -> Result<()> {
     apply_sources(pair, &form.sources, &form.symbol)?;
+    apply_fx(pair, &form.fx);
     pair.pricing = pricing_stanza(kinds, &form.pricing, Some(&pair.pricing), &form.kind_fields)?;
     pair.guards = guard_stanzas(kinds, &pair.guards, &form.kind_fields)?;
     pair.min_mid = optional(&form.min_mid);
@@ -1972,6 +2124,27 @@ const MIN_SOURCES_FIELD: Field = Field::new(
      is 1: keep quoting as long as any one venue is up",
 );
 
+/// The `[pairs.fx]` keys besides its markets, in the order the form shows them.
+const FX_FIELDS: &[Field] = &[
+    Field::new(
+        "fx_min_sources",
+        "2",
+        "how many of the markets above must be fresh for the USD venues to be averaged. \
+         Blank is all of them; 1 is a rate nothing cross-checks",
+    ),
+    Field::new(
+        "fx_max_depeg",
+        "0.005",
+        "leave the USD venues out while the rate is further than this from 1. Blank is 0.005",
+    ),
+    Field::new(
+        "fx_max_disagreement",
+        "0.0005",
+        "leave the USD venues out while the markets above are further apart than this, as a \
+         fraction of their mean. Blank is 0.0005",
+    ),
+];
+
 /// Locked on an edit: the lane and the signer are derived from these, so changing one is a
 /// delete and an add.
 const PAIR_IDENTITY: &[Field] = &[
@@ -2170,6 +2343,9 @@ struct PairFormPage {
     /// One row per venue the binary knows.
     sources: Vec<SourceRow>,
     min_sources: Filled,
+    /// The FX section: one row per venue the binary knows, and the stanza's keys.
+    fx_sources: Vec<FxRow>,
+    fx: Vec<Filled>,
     /// One section per registered pricing kind, the pair's own checked.
     kinds: Vec<KindSection>,
     /// One block per guard kind; see [`GuardSection`].
@@ -2208,6 +2384,16 @@ struct SourceRow {
     /// What is different about this venue, if anything: polled, or no book. The page's
     /// script replaces it with what the lookup found.
     note: &'static str,
+    /// The pair's market here is quoted in USD, converted by its FX legs.
+    usd: bool,
+}
+
+/// One venue's row of the pair form's FX table.
+struct FxRow {
+    venue: &'static str,
+    symbol: String,
+    /// How this venue spells a quote token's USD market.
+    example: String,
 }
 
 #[derive(Template)]
@@ -2323,6 +2509,7 @@ fn render_pair_form_with(
         ],
         None => vec![None; SOURCE_FIELDS.len()],
     };
+    let fx = pair.and_then(|pair| pair.fx.as_ref());
     let knob = |field: &'static Field, value: fn(&RawPair) -> Option<&str>| {
         Filled::new(field, pair.and_then(value))
     };
@@ -2434,14 +2621,20 @@ fn render_pair_form_with(
                     pair.sources
                         .iter()
                         .find(|s| s.venue.eq_ignore_ascii_case(venue.as_str()))
-                        .map(|s| (s.symbol.clone(), s.weight.clone().unwrap_or_default()))
+                        .map(|s| {
+                            (
+                                s.symbol.clone(),
+                                s.weight.clone().unwrap_or_default(),
+                                s.quote.is_some(),
+                            )
+                        })
                         .or_else(|| {
                             (*venue == VenueId::Binance)
-                                .then(|| pair.symbol.clone().map(|s| (s, String::new())))
+                                .then(|| pair.symbol.clone().map(|s| (s, String::new(), false)))
                                 .flatten()
                         })
                 });
-                let (symbol, weight) = row.unwrap_or_default();
+                let (symbol, weight, usd) = row.unwrap_or_default();
                 let note = match venue {
                     VenueId::Mexc => "polled every second",
                     _ => "",
@@ -2452,10 +2645,35 @@ fn render_pair_form_with(
                     weight,
                     example: venue.expected_symbol("ETH", "USDC"),
                     note,
+                    usd,
                 }
             })
             .collect(),
         min_sources: knob(&MIN_SOURCES_FIELD, |p| p.min_sources.as_deref()),
+        fx_sources: VenueId::ALL
+            .iter()
+            .map(|venue| FxRow {
+                venue: venue.as_str(),
+                symbol: fx
+                    .and_then(|fx| {
+                        fx.sources
+                            .iter()
+                            .find(|s| s.venue.eq_ignore_ascii_case(venue.as_str()))
+                            .map(|s| s.symbol.clone())
+                    })
+                    .unwrap_or_default(),
+                example: venue.expected_symbol("USDT", "USD"),
+            })
+            .collect(),
+        fx: FX_FIELDS
+            .iter()
+            .zip([
+                fx.and_then(|fx| fx.min_sources.as_deref()),
+                fx.and_then(|fx| fx.max_depeg.as_deref()),
+                fx.and_then(|fx| fx.max_disagreement.as_deref()),
+            ])
+            .map(|(field, value)| Filled::new(field, value))
+            .collect(),
         kinds: kind_sections,
         guards: guard_sections,
         allow_symbol_mismatch: pair.is_some_and(|pair| pair.allow_symbol_mismatch),
@@ -2779,6 +2997,7 @@ api_key = "k"
                     halted: false,
                     halt_reason: None,
                     pricing: toml::from_str("kind = \"feed\"").unwrap(),
+                    fx: None,
                     guards: Vec::new(),
                 });
                 Ok(())
@@ -3118,11 +3337,13 @@ api_key = "k"
                     venue: "binance".into(),
                     symbol: "ETHUSDC".into(),
                     weight: Some("2".into()),
+                    quote: None,
                 },
                 RawSource {
                     venue: "kraken".into(),
                     symbol: "ETH/USD".into(),
                     weight: None,
+                    quote: None,
                 },
             ]
         );
@@ -3165,6 +3386,135 @@ api_key = "k"
         assert_eq!(written.pairs[0].symbol.as_deref(), Some("ETHUSDC"));
         assert!(written.pairs[0].sources.is_empty());
         assert_eq!(written.pairs[0].min_sources, None);
+    }
+
+    /// A venue's quote and the FX section through the real form decoder: set together,
+    /// shown again on the edit form, kept by a form that predates them (no `quote_<venue>`,
+    /// no `fx_present`), and cleared together. A USD venue with no FX section is refused
+    /// before anything is written, with the file parser's reason.
+    #[tokio::test]
+    async fn a_venues_quote_and_the_fx_section_are_saved_kept_and_cleared() {
+        let (path, state, mut reloads) = config_on_disk("fx");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
+        )
+        .await
+        .unwrap();
+        let _service = tokio::spawn(async move {
+            while let Some(request) = reloads.recv().await {
+                let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
+            }
+        });
+        let post = |body: &str| {
+            let body = format!(
+                "key_env=UPDATER_KEY_WETH_USDC&symbol_binance=ETHUSDC&symbol_coinbase=ETH-USD\
+                 &pricing=feed&pricing_feed_delta=0.0005&min_mid=&max_mid=&max_deviation=\
+                 &max_deviation_window=&max_deviation_window_blocks={body}"
+            );
+            format!(
+                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        let refused = http(local, &post("&quote_coinbase=USD&fx_present=1")).await;
+        assert!(
+            refused.contains("no [pairs.fx] to convert it by"),
+            "{refused}"
+        );
+        assert!(config::load_raw(&path).unwrap().pairs[0].fx.is_none());
+
+        let set = "&quote_binance=&quote_coinbase=USD&fx_present=1\
+                   &fx_symbol_kraken=USDC%2FUSD&fx_symbol_coinbase=USDC-USD&fx_min_sources=\
+                   &fx_max_depeg=0.004&fx_max_disagreement=";
+        let posted = http(local, &post(set)).await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        let written = config::load_raw(&path).unwrap();
+        let quotes: Vec<Option<&str>> = written.pairs[0]
+            .sources
+            .iter()
+            .map(|s| s.quote.as_deref())
+            .collect();
+        assert_eq!(quotes, [None, Some("USD")]);
+        let fx = written.pairs[0].fx.clone().expect("the section is saved");
+        assert_eq!(
+            fx.sources,
+            [
+                RawFxSource {
+                    venue: "coinbase".into(),
+                    symbol: "USDC-USD".into()
+                },
+                RawFxSource {
+                    venue: "kraken".into(),
+                    symbol: "USDC/USD".into()
+                },
+            ]
+        );
+        assert_eq!(
+            (fx.min_sources, fx.max_depeg.as_deref(), fx.max_disagreement),
+            (None, Some("0.004"), None)
+        );
+        let form = http(
+            local,
+            "GET /pairs/edit/UPDATER_KEY_WETH_USDC HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            form.contains(r#"<select name="quote_coinbase"><option value="">pair</option><option value=USD selected>"#),
+            "{form}"
+        );
+        assert!(
+            form.contains(r#"name="fx_symbol_kraken" value="USDC/USD""#),
+            "{form}"
+        );
+        assert!(form.contains(r#"name="fx_max_depeg""#), "{form}");
+        assert!(form.contains(r#"value="0.004""#), "{form}");
+
+        // A second market on one venue, written by hand: the form shows the first, and a
+        // save keeps the second rather than dropping it.
+        let mut raw = config::load_raw(&path).unwrap();
+        raw.pairs[0].fx.as_mut().unwrap().sources.push(RawFxSource {
+            venue: "kraken".into(),
+            symbol: "USDC/USD.B".into(),
+        });
+        std::fs::write(&path, config::render_raw(&raw).unwrap()).unwrap();
+        let posted = http(local, &post(set)).await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        let symbols: Vec<String> = config::load_raw(&path).unwrap().pairs[0]
+            .fx
+            .as_ref()
+            .unwrap()
+            .sources
+            .iter()
+            .map(|s| format!("{}:{}", s.venue, s.symbol))
+            .collect();
+        assert_eq!(
+            symbols,
+            ["coinbase:USDC-USD", "kraken:USDC/USD", "kraken:USDC/USD.B"]
+        );
+        let written = config::load_raw(&path).unwrap();
+
+        // A form from before the column and the section: both kept as the file has them.
+        let posted = http(local, &post("")).await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        let kept = config::load_raw(&path).unwrap();
+        assert_eq!(kept.pairs[0].sources, written.pairs[0].sources);
+        assert_eq!(kept.pairs[0].fx, written.pairs[0].fx);
+
+        // Cleared: no USD venue and an empty section.
+        let posted = http(local, &post("&quote_coinbase=&fx_present=1")).await;
+        assert!(posted.contains("location: /?ok="), "{posted}");
+        let cleared = config::load_raw(&path).unwrap();
+        assert!(cleared.pairs[0].sources.iter().all(|s| s.quote.is_none()));
+        assert_eq!(cleared.pairs[0].fx, None);
     }
 
     /// The source check through the real form decoder: set, kept by a form that predates

@@ -21,6 +21,7 @@
     venue: tr.querySelector("td.mono").textContent.trim(),
     symbol: tr.querySelector('input[name^="symbol_"]'),
     weight: tr.querySelector('input[name^="weight_"]'),
+    quote: tr.querySelector('select[name^="quote_"]'),
     note: tr.querySelector("td.note"),
   }));
   const isAddress = (s) => /^0x[0-9a-fA-F]{40}$/.test((s || "").trim());
@@ -203,14 +204,20 @@
         const row = rows.find((r) => r.venue === v.venue);
         if (!row) continue;
         seen.add(v.venue);
-        row.live.textContent = v.mid === null ? (v.age_ms === null ? "connecting…" : "no price") : fmt(v.mid, 6) + (v.fresh ? "" : " (stale)");
+        // The preview has no FX legs: a USD venue's mid is shown, and averaged, as read.
+        const usd = row.quote && row.quote.value === "USD" ? " (USD, unconverted)" : "";
+        row.live.textContent = v.mid === null ? (v.age_ms === null ? "connecting…" : "no price") : fmt(v.mid, 6) + usd + (v.fresh ? "" : " (stale)");
         row.live.classList.toggle("stale", v.mid !== null && !v.fresh);
       }
       for (const row of rows) if (!seen.has(row.venue)) row.live.textContent = sent.has(row.venue) ? "connecting…" : "";
       compositeLine.hidden = data.venues.length === 0;
+      const unconverted = rows.some((r) => r.tick.checked && r.quote && r.quote.value === "USD");
       compositeLine.textContent = data.composite === null
         ? `composite: waiting for a fresh venue (${data.fresh} fresh)`
-        : `composite mid ${fmt(data.composite, 6)} from ${data.fresh} fresh venue${data.fresh === 1 ? "" : "s"}: this is the number that would be published`;
+        : `composite mid ${fmt(data.composite, 6)} from ${data.fresh} fresh venue${data.fresh === 1 ? "" : "s"}: ` +
+          (unconverted
+            ? "USD venues averaged unconverted here; the run divides them by the [pairs.fx] rate"
+            : "this is the number that would be published");
     };
     // Dropped, or refused (too many preview pages open): try again in a few seconds and
     // tell the server the ticked venues afresh. Opening the socket connects to no venue.

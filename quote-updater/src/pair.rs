@@ -133,6 +133,11 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
             }
         }
     }
+    // A pair without `[pairs.fx]` has no rate to report, and its registered 0s would read
+    // as one whose guard is not tripped.
+    if !live.venues.iter().any(|venue| venue.fx) {
+        m.fx_absent();
+    }
     // Every venue under the composite, for the same reason: what it delivered before this
     // generation owned the series was recorded nowhere. A venue with no sample yet keeps
     // its `up` flag's 0 (it has not connected, which is what 0 says) but not the registered
@@ -141,11 +146,7 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
         let v = &venue.metrics;
         // From here on the venue's `up` is its feed task's own flag, read at every scrape,
         // so a connect that happened before this generation owned the series still shows.
-        metrics.watch_venue(
-            &live.pair.label,
-            venue.venue.as_str(),
-            venue.connected.clone(),
-        );
+        metrics.watch_venue(&live.pair.label, &venue.series(), venue.connected.clone());
         match *venue.rx.borrow() {
             Some(sample) => {
                 v.mid.set(feed::scaled_to_f64(sample.mid, price_decimals));
@@ -549,6 +550,15 @@ pub(crate) async fn build_live(
         Some(feeds) => {
             let history = histories.for_symbol(&feeds.history_key());
             let spawned = composite::connect(feeds, params(Some(history.clone()))).await?;
+            if !spawned.silent_fx.is_empty() {
+                tracing::warn!(
+                    "[{}] no price from FX leg {} within {:?}; the USD sources stay out of the \
+                     average until it delivers. Wrong symbol or blocked endpoint?",
+                    resolved.pair.label,
+                    spawned.silent_fx.join(", "),
+                    composite::FIRST_PRICE_TIMEOUT
+                );
+            }
             (Some(spawned.rx), spawned.venues, Some(History(history)))
         }
         None => (None, Vec::new(), None),
@@ -821,6 +831,13 @@ pub(crate) async fn collect_prices(
             let sample = match (validated, &spec.feeds) {
                 (Err(err), _) => Err(format!("{err:#}")),
                 (Ok(()), Some(feeds)) => match composite::connect(feeds, params()).await {
+                    // The run starts on such a leg, warning; a check is where it is caught.
+                    Ok(spawned) if !spawned.silent_fx.is_empty() => Err(format!(
+                        "no price from FX leg {} within {:?}; wrong symbol or blocked \
+                         endpoint?",
+                        spawned.silent_fx.join(", "),
+                        composite::FIRST_PRICE_TIMEOUT
+                    )),
                     Ok(spawned) => {
                         venues = venue_lines(&spawned);
                         let sample = *spawned.rx.borrow();
@@ -1114,6 +1131,7 @@ mod tests {
                 rx,
                 metrics: metrics.for_venue("UP/TEST", name),
                 connected,
+                fx: false,
             }
         };
         let live = |okx: bool| Live {

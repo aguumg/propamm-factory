@@ -24,13 +24,14 @@
     <p class=explain>A venue that goes quiet drops out of the average until it is back. Leave every venue
     unticked for a fixed mid, or for a pricing kind that brings its own mid, as a stock pair's does.</p>
     <table class=venues>
-      <thead><tr><th>venue<th>symbol<th>weight<th></tr></thead>
+      <thead><tr><th>venue<th>symbol<th>weight<th>quote<th></tr></thead>
       <tbody>
       {% for row in sources %}
         <tr>
           <td class=mono>{{ row.venue }}</td>
           <td><input type=text name="symbol_{{ row.venue }}" value="{{ row.symbol }}" placeholder="{{ row.example }}" spellcheck=false autocomplete=off></td>
           <td><input type=text name="weight_{{ row.venue }}" value="{{ row.weight }}" placeholder="1" spellcheck=false autocomplete=off></td>
+          <td><select name="quote_{{ row.venue }}"><option value="">pair</option><option value=USD{% if row.usd %} selected{% endif %}>USD</option></select></td>
           <td class=note>{{ row.note }}</td>
         </tr>
       {% endfor %}
@@ -39,6 +40,33 @@
     <div class=grid>
       {% let field = min_sources %}{% include "field.html" %}
       {% for field in source %}{% include "field.html" %}{% endfor %}
+    </div>
+  </div>
+  <hr>
+
+  {# The FX legs a venue quoted in USD is converted by. The hidden input tells the handler
+     this page has the section, so a page rendered before it existed keeps the pair's
+     [pairs.fx]. #}
+  <div class=sources>
+    <span class=key>fx</span>
+    <input type=hidden name=fx_present value=1>
+    <p class=explain>Only for a venue above set to quote USD: its mid is divided by the price of
+    the quote token in USD, the mean of these markets. While too few of them are fresh, or they
+    are off the peg or apart, every USD venue is left out of the average and the rest keep
+    quoting if there are <code>min_sources</code> of them.</p>
+    <table class=fx-venues>
+      <thead><tr><th>venue<th>symbol</tr></thead>
+      <tbody>
+      {% for row in fx_sources %}
+        <tr>
+          <td class=mono>{{ row.venue }}</td>
+          <td><input type=text name="fx_symbol_{{ row.venue }}" value="{{ row.symbol }}" placeholder="{{ row.example }}" spellcheck=false autocomplete=off></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class=grid>
+      {% for field in fx %}{% include "field.html" %}{% endfor %}
     </div>
   </div>
   <hr>

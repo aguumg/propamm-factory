@@ -308,6 +308,39 @@ max_deviation = "0.002"
 # those are never left out for it. 1500 is a sensible value on any pair.
 # See "Late venues" in docs/manual.md.
 # max_source_lag_ms = "1500"
+#
+# A venue quoted in USD, averaged into a pair quoted in a dollar token: mark the source
+# `quote = "USD"` and give the pair a `[pairs.fx]` stanza, the quote token's own USD
+# markets. The rate is the price of one quote token in USD, the plain mean of the fresh
+# legs (fresh by the same 30s and max_source_lag_ms rules as a source), and each USD mid
+# is divided by it before the average. While fewer than the stanza's `min_sources` legs
+# are fresh (default: all of them), or the rate is further than `max_depeg` from 1
+# (default 0.005), or the legs are further apart than `max_disagreement` (default
+# 0.0005, as a fraction of their mean), every USD source is left out and the rest keep
+# quoting while the pair's `min_sources` are fresh. Set the pair's `min_sources` no higher
+# than the sources without `quote`, or the rate failing withdraws the whole pair; startup
+# warns when it is. See "Sources quoted in USD" in docs/manual.md.
+#
+# [[pairs]]
+# tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+#            "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
+# key_env = "UPDATER_KEY_WETH_USDT"
+# pricing = { kind = "feed", delta = "0.0005" }
+# min_sources = "2"
+# sources = [
+#   { venue = "coinbase", symbol = "ETH-USD",  weight = "2", quote = "USD" },
+#   { venue = "okx",      symbol = "ETH-USDT", weight = "1" },
+#   { venue = "bybit",    symbol = "ETHUSDT",  weight = "1" },
+# ]
+#
+# [pairs.fx]
+# sources = [
+#   { venue = "kraken",   symbol = "USDT/USD" },
+#   { venue = "coinbase", symbol = "USDT-USD" },
+# ]
+# min_sources = "2"
+# max_depeg = "0.005"
+# max_disagreement = "0.0005"
 
 # A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
 # the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its

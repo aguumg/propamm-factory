@@ -8,6 +8,10 @@
 //! `min_sources` venues are fresh, and stops (by withdrawing its sample, so the loop
 //! refuses the next tick) when fewer are. A single venue with weight 1 is exactly the feed
 //! the pusher had before venues were plural.
+//!
+//! A venue quoted in USD on a pair quoted in a dollar token is converted by the pair's FX
+//! legs (`[pairs.fx]`) before it is averaged, and left out whenever they cannot vouch for
+//! the rate; see [`crate::config::Fx`].
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -16,10 +20,10 @@ use ethrex_common::U256;
 use eyre::{Result, eyre};
 use tokio::sync::{mpsc, watch};
 
-use crate::config::{Feeds, Source};
+use crate::config::{FX_DECIMALS, Feeds, Fx, Quote, Source};
 use crate::feed::{self, Adoption, Gated, PriceSample, scaled_to_f64};
 use crate::guard::{BoundGuard, Cause, CompositeSample, Latch, SourceSample, TripReason, Verdict};
-use crate::metrics::{Metrics, PairMetrics, VenueMetrics};
+use crate::metrics::{FxTrip, Metrics, PairMetrics, VenueMetrics};
 use crate::record::Recorder;
 use crate::update::MAX_PRICE_AGE;
 use crate::venue::{Endpoints, VenueId};
@@ -47,12 +51,30 @@ pub struct VenueFeed {
     /// Whether the venue is connected right now, as its feed task sets it. The `up` gauge
     /// reads it at scrape time once the pair takes over its series (`adopt_metrics`).
     pub connected: feed::Connected,
+    /// One of the pair's FX legs rather than a source: averaged into nothing, read only
+    /// for the rate its USD sources are converted by.
+    pub fx: bool,
 }
 
 impl VenueFeed {
     /// `binance:ETHUSDC`, how a venue is named in every line about it.
     pub fn name(&self) -> String {
         format!("{}:{}", self.venue, self.symbol)
+    }
+
+    /// The `venue` label of this feed's series: the venue's name for a source, and
+    /// `fx:<venue>` for an FX leg, which often reads the same venue as one of the sources
+    /// and must not share its series.
+    pub fn series(&self) -> String {
+        series_name(self.venue, self.fx)
+    }
+}
+
+fn series_name(venue: VenueId, fx: bool) -> String {
+    if fx {
+        format!("fx:{venue}")
+    } else {
+        venue.as_str().to_owned()
     }
 }
 
@@ -86,6 +108,9 @@ pub struct Params<'a> {
 pub struct Spawned {
     pub rx: watch::Receiver<Option<PriceSample>>,
     pub venues: Vec<VenueFeed>,
+    /// The FX legs ([`VenueFeed::name`]) that had not delivered by [`FIRST_PRICE_TIMEOUT`],
+    /// as [`connect`] found them; empty from [`spawn`], which waits for nothing.
+    pub silent_fx: Vec<String>,
 }
 
 /// Dials every source and spawns the task that averages them. Returns at once; use
@@ -104,29 +129,36 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
         recorder,
         history,
     } = params;
+    // The sources, then the FX legs. The legs are dialled the same way, so they are judged
+    // fresh and late by the same rules, but never inverted: the rate is the quote token's
+    // price in USD whichever way the lane publishes.
+    let legs = feeds.fx.iter().flat_map(|fx| &fx.legs);
     let venues: Vec<VenueFeed> = feeds
         .sources
         .iter()
-        .map(|source| {
-            let venue_metrics = metrics.for_venue(&label, source.venue.as_str());
+        .map(|source| (source.venue, &source.symbol, false))
+        .chain(legs.map(|leg| (leg.venue, &leg.symbol, true)))
+        .map(|(venue, symbol, fx)| {
+            let venue_metrics = metrics.for_venue(&label, &series_name(venue, fx));
             let connected = feed::Connected::default();
             let rx = feed::spawn_feed(
                 endpoints.http(),
-                source.venue,
-                endpoints.for_venue(source.venue),
-                &source.symbol,
+                venue,
+                endpoints.for_venue(venue),
+                symbol,
                 decimals,
-                invert,
+                invert && !fx,
                 Gated::new(venue_metrics.clone(), adopted.clone()),
                 recorder.clone(),
                 connected.clone(),
             );
             VenueFeed {
-                venue: source.venue,
-                symbol: source.symbol.clone(),
+                venue,
+                symbol: symbol.clone(),
                 rx,
                 metrics: venue_metrics,
                 connected,
+                fx,
             }
         })
         .collect();
@@ -164,8 +196,12 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
             .iter()
             .map(|v| Gated::new(v.metrics.clone(), adopted.clone()))
             .collect(),
-        late: vec![false; feeds.sources.len()],
-        latest: vec![None; feeds.sources.len()],
+        late: vec![false; venues.len()],
+        latest: vec![None; venues.len()],
+        fx: feeds.fx.clone(),
+        fx_tripped: None,
+        fx_said: None,
+        started: Instant::now(),
         decimals,
         invert,
         latch,
@@ -188,6 +224,7 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
                     m.feed_sample_current.set(f64::NAN);
                     m.feed_sources_fresh.set(f64::NAN);
                     m.feed_sources_min.set(f64::NAN);
+                    m.fx_absent();
                 });
             }
             _ = async {
@@ -212,19 +249,42 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
             } => {}
         }
     });
-    Spawned { rx, venues }
+    Spawned {
+        rx,
+        venues,
+        silent_fx: Vec::new(),
+    }
 }
 
 /// [`spawn`], then waits for the first composite sample. Shared by startup and `--check`
 /// so the two agree by construction: a source that fails here is one the run refuses to
 /// start on, which is what makes checking it worth anything.
+///
+/// The FX legs are then given the rest of the same [`FIRST_PRICE_TIMEOUT`] to deliver, and
+/// any still silent are named in [`Spawned::silent_fx`]. Not an error here: the sources
+/// that need no rate are publishing, and the caller says what a silent leg means (a
+/// warning on a run, a failure under `--check`). Without it a wrong FX symbol would keep
+/// the USD sources out for good with only an alert to say so.
 pub async fn connect(feeds: &Feeds, params: Params<'_>) -> Result<Spawned> {
+    let deadline = tokio::time::Instant::now() + FIRST_PRICE_TIMEOUT;
     let mut spawned = spawn(feeds, params);
-    let waited = tokio::time::timeout(FIRST_PRICE_TIMEOUT, spawned.rx.wait_for(|s| s.is_some()))
+    let waited = tokio::time::timeout_at(deadline, spawned.rx.wait_for(|s| s.is_some()))
         .await
         .map(|first| first.map(|_| ()));
     match waited {
-        Ok(Ok(())) => Ok(spawned),
+        Ok(Ok(())) => {
+            for leg in spawned.venues.iter().filter(|v| v.fx) {
+                let mut rx = leg.rx.clone();
+                let _ = tokio::time::timeout_at(deadline, rx.wait_for(|s| s.is_some())).await;
+            }
+            spawned.silent_fx = spawned
+                .venues
+                .iter()
+                .filter(|v| v.fx && v.rx.borrow().is_none())
+                .map(VenueFeed::name)
+                .collect();
+            Ok(spawned)
+        }
         Ok(Err(_)) => Err(eyre!("the composite task died")),
         Err(_) => {
             // Name the venues that never delivered: with several, the one that is wrong is
@@ -247,21 +307,34 @@ pub async fn connect(feeds: &Feeds, params: Params<'_>) -> Result<Spawned> {
 }
 
 /// The averaging state: the latest sample from each source and where the result goes.
+///
+/// `connected`, `venue_metrics`, `late` and `latest` hold the sources first, in order, and
+/// then the FX legs, so index `i` is `sources[i]` below `sources.len()` and an FX leg from
+/// there on.
 struct Composite {
     sources: Vec<Source>,
     min_sources: usize,
     /// `max_source_lag_ms`: how late a venue's price may arrive behind its exchange stamp
     /// and still count as fresh. `None` leaves every venue judged by silence alone.
     max_lag: Option<Duration>,
-    /// Each source's feed flag, where the feed task leaves how late its last price was.
+    /// Each feed's flag, where the feed task leaves how late its last price was.
     connected: Vec<feed::Connected>,
-    /// Each source's series, for `late`.
+    /// Each feed's series, for `late` and `converted`.
     venue_metrics: Vec<Gated<VenueMetrics>>,
-    /// Whether each source's latest price arrived later than `max_lag`, judged when that
+    /// Whether each feed's latest price arrived later than `max_lag`, judged when that
     /// price arrived ([`Self::judge_lateness`]), so a stale reading cannot flip between
     /// frames. Always `false` without `max_lag` and for a venue whose frames carry no stamp.
     late: Vec<bool>,
     latest: Vec<Option<PriceSample>>,
+    /// `[pairs.fx]`, on a pair with sources quoted in USD.
+    fx: Option<Fx>,
+    /// Why the FX rate was refused at the last judging, if it was.
+    fx_tripped: Option<FxTrip>,
+    /// What the log last said about the rate, so it says each change once.
+    fx_said: Option<FxTrip>,
+    /// When the composite was spawned: the legs are still being dialled until
+    /// [`FIRST_PRICE_TIMEOUT`] after it, and a rate stale for that alone is not said.
+    started: Instant,
     decimals: u32,
     invert: bool,
     latch: Latch,
@@ -324,7 +397,7 @@ impl Composite {
             _ => false,
         };
         if late != self.late[i] {
-            let venue = self.sources[i].venue;
+            let venue = self.feed_name(i);
             if late {
                 tracing::warn!(
                     "[{}] {venue} is delivering prices late behind its own timestamps; left \
@@ -342,19 +415,102 @@ impl Composite {
         self.venue_metrics[i].record(|m| m.late.set(if late { 1.0 } else { 0.0 }));
     }
 
+    /// How feed `i` is named in a line about it: the venue for a source, the venue and
+    /// symbol for an FX leg.
+    fn feed_name(&self, i: usize) -> String {
+        match self.sources.get(i) {
+            Some(source) => source.venue.to_string(),
+            None => self
+                .fx
+                .iter()
+                .flat_map(|fx| &fx.legs)
+                .nth(i - self.sources.len())
+                .map_or_else(String::new, |leg| {
+                    format!("{}:{} (fx)", leg.venue, leg.symbol)
+                }),
+        }
+    }
+
+    /// The FX rate the USD sources are converted by at `(now, wall)`, or `None` when it
+    /// cannot be used and they are left out: judged over the legs that are fresh by the
+    /// sources' own rules, with its gauges written and a change of verdict said once.
+    fn judge_fx(&mut self, now: Instant, wall: SystemTime) -> Option<FxRate> {
+        let fx = self.fx.as_ref()?;
+        let n = self.sources.len();
+        let fresh: Vec<PriceSample> = self.latest[n..]
+            .iter()
+            .zip(&self.late[n..])
+            .filter_map(|(sample, late)| {
+                sample.filter(|s| !late && s.age_at(now, wall) <= MAX_PRICE_AGE)
+            })
+            .collect();
+        let verdict = fx_rate(&fresh, fx, self.decimals);
+        let tripped = verdict.as_ref().err().copied();
+        let mean = mean_rate(&fresh, self.decimals);
+        self.metrics.record(|m| {
+            m.fx_rate.set(mean.unwrap_or(f64::NAN));
+            m.fx_sources_fresh.set(fresh.len() as f64);
+            for reason in FxTrip::ALL {
+                m.fx_guard_tripped(reason)
+                    .set(if tripped == Some(reason) { 1.0 } else { 0.0 });
+            }
+        });
+        self.fx_tripped = tripped;
+        let dialling = tripped == Some(FxTrip::Stale)
+            && self.fx_said.is_none()
+            && now < self.started + FIRST_PRICE_TIMEOUT;
+        if tripped != self.fx_said && !dialling {
+            match tripped {
+                Some(reason) => tracing::warn!(
+                    "[{}] FX rate refused ({}: {} of {} legs fresh, mean {}); the USD sources \
+                     are left out of the average until it is usable",
+                    self.label,
+                    reason.as_str(),
+                    fresh.len(),
+                    fx.legs.len(),
+                    mean.map_or_else(|| "none".to_owned(), |m| m.to_string()),
+                ),
+                None => tracing::info!(
+                    "[{}] FX rate usable again; the USD sources are back in the average",
+                    self.label
+                ),
+            }
+            self.fx_said = tripped;
+        }
+        verdict.ok()
+    }
+
     /// The sources whose latest sample is fresh at `(now, wall)`: delivered within
-    /// [`MAX_PRICE_AGE`] and, under `max_lag`, not late behind its stamp. With the gauges
-    /// that describe the count written.
-    fn fresh_sources(&self, now: Instant, wall: SystemTime) -> Vec<(&Source, PriceSample)> {
+    /// [`MAX_PRICE_AGE`] and, under `max_lag`, not late behind its stamp. A source quoted
+    /// in USD is in only with `fx`, the rate [`Self::judge_fx`] allowed, and converted by
+    /// it. With the gauges that describe the count written.
+    fn fresh_sources(
+        &self,
+        now: Instant,
+        wall: SystemTime,
+        fx: Option<FxRate>,
+    ) -> Vec<(&Source, PriceSample)> {
         let fresh: Vec<(&Source, PriceSample)> = self
             .sources
             .iter()
             .zip(&self.latest)
             .zip(&self.late)
-            .filter_map(|((source, sample), late)| {
-                sample
-                    .filter(|s| !late && s.age_at(now, wall) <= MAX_PRICE_AGE)
-                    .map(|s| (source, s))
+            .zip(&self.venue_metrics)
+            .filter_map(|(((source, sample), late), venue_metrics)| {
+                let sample = sample.filter(|s| !late && s.age_at(now, wall) <= MAX_PRICE_AGE);
+                let sample = match source.quote {
+                    None => sample,
+                    Some(Quote::Usd) => {
+                        let converted = sample.zip(fx).and_then(|(sample, fx)| {
+                            convert(sample, fx, self.decimals, self.invert)
+                        });
+                        venue_metrics.record(|m| {
+                            m.converted.set(if converted.is_some() { 1.0 } else { 0.0 })
+                        });
+                        converted
+                    }
+                };
+                sample.map(|s| (source, s))
             })
             .collect();
         let min = self.min_sources as f64;
@@ -373,8 +529,10 @@ impl Composite {
     }
 
     /// The timer's work: the gauges, from what is fresh right now, and no sample.
-    fn audit_freshness(&self) {
-        let _ = self.fresh_sources(Instant::now(), SystemTime::now());
+    fn audit_freshness(&mut self) {
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let fx = self.judge_fx(now, wall);
+        let _ = self.fresh_sources(now, wall, fx);
     }
 
     /// Averages the fresh sources and publishes the result, or publishes nothing when too
@@ -382,7 +540,8 @@ impl Composite {
     fn recompute(&mut self, tx: &watch::Sender<Option<PriceSample>>) {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let fresh = self.fresh_sources(now, wall);
+        let fx = self.judge_fx(now, wall);
+        let fresh = self.fresh_sources(now, wall, fx);
         if fresh.len() < self.min_sources {
             // The last composite is withdrawn, not left to age out. For venues that went
             // silent that changes nothing: the last composite was published at the last
@@ -398,8 +557,20 @@ impl Composite {
                     .filter(|(_, late)| **late)
                     .map(|(source, _)| source.venue.as_str())
                     .collect();
+                // The USD sources out for the rate is a cause of its own, and not one a
+                // venue's own gauges show.
+                let fx_out =
+                    self.fx_tripped
+                        .filter(|_| fx.is_none())
+                        .map_or_else(String::new, |reason| {
+                            format!(
+                                "; the USD sources are out, FX rate refused ({})",
+                                reason.as_str()
+                            )
+                        });
                 tracing::warn!(
-                    "[{}] {} of {} venues fresh, {} needed{}; withdrawing until enough are",
+                    "[{}] {} of {} venues fresh, {} needed{}{fx_out}; withdrawing until enough \
+                     are",
                     self.label,
                     fresh.len(),
                     self.sources.len(),
@@ -501,6 +672,90 @@ impl Composite {
     }
 }
 
+/// The rate a pair's USD sources are converted by: the price of one quote token in USD at
+/// the price scale, and the stamp of the oldest leg it was read from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FxRate {
+    pub rate: U256,
+    pub at: Instant,
+    pub wall: SystemTime,
+}
+
+/// The legs' plain mean as a number, for the gauge and the log; `None` with no leg.
+fn mean_rate(legs: &[PriceSample], decimals: u32) -> Option<f64> {
+    (!legs.is_empty()).then(|| {
+        legs.iter()
+            .map(|leg| scaled_to_f64(leg.mid, decimals))
+            .sum::<f64>()
+            / legs.len() as f64
+    })
+}
+
+/// The rate `fresh` legs give under `fx`'s rules, or why they give none: too few of them,
+/// a mean further from 1 than `max_depeg`, or a spread (highest less lowest, over the mean)
+/// wider than `max_disagreement`. The comparisons are in `f64`, as the breaker's ratios
+/// are; the rate itself is the integer mean, so the conversion is exact.
+pub(crate) fn fx_rate(fresh: &[PriceSample], fx: &Fx, decimals: u32) -> Result<FxRate, FxTrip> {
+    if fresh.len() < fx.min_sources {
+        return Err(FxTrip::Stale);
+    }
+    let mean = mean_rate(fresh, decimals).ok_or(FxTrip::Stale)?;
+    if (mean - 1.0).abs() > scaled_to_f64(fx.max_depeg, FX_DECIMALS) {
+        return Err(FxTrip::Depeg);
+    }
+    let reading = |leg: &PriceSample| scaled_to_f64(leg.mid, decimals);
+    let high = fresh.iter().map(reading).fold(f64::MIN, f64::max);
+    let low = fresh.iter().map(reading).fold(f64::MAX, f64::min);
+    if (high - low) / mean > scaled_to_f64(fx.max_disagreement, FX_DECIMALS) {
+        return Err(FxTrip::Disagreement);
+    }
+    // Saturating: a sum near a uint256 is a mean the depeg check above already refused.
+    let sum = fresh
+        .iter()
+        .fold(U256::zero(), |sum, leg| sum.saturating_add(leg.mid));
+    let rate = sum / U256::from(fresh.len());
+    // A mean that rounds to zero at the price scale is as far from 1 as a rate gets, and
+    // would be divided by.
+    if rate.is_zero() {
+        return Err(FxTrip::Depeg);
+    }
+    let oldest = &fresh[0];
+    Ok(FxRate {
+        rate,
+        at: fresh.iter().map(|leg| leg.at).fold(oldest.at, Instant::min),
+        wall: fresh
+            .iter()
+            .map(|leg| leg.wall)
+            .fold(oldest.wall, SystemTime::min),
+    })
+}
+
+/// A USD source's sample in the pair's quote token: in market orientation the USD mid
+/// over the rate (USD per base, over USD per quote token, is quote token per base), so on
+/// an inverted lane, which carries the reciprocal, the lane mid times the rate. The delta
+/// is a fraction of the mid and stays as it is. Stamped with the older of the sample's
+/// and the rate's clocks, so the sample ages with whichever it was made of ages first.
+/// `None` only for a product that leaves a uint256.
+pub(crate) fn convert(
+    sample: PriceSample,
+    fx: FxRate,
+    decimals: u32,
+    invert: bool,
+) -> Option<PriceSample> {
+    let one = U256::exp10(decimals as usize);
+    let mid = if invert {
+        sample.mid.checked_mul(fx.rate)? / one
+    } else {
+        sample.mid.checked_mul(one)? / fx.rate
+    };
+    Some(PriceSample {
+        delta: sample.delta,
+        mid,
+        at: sample.at.min(fx.at),
+        wall: sample.wall.min(fx.wall),
+    })
+}
+
 /// `(Σ w·delta / Σ w, Σ w·mid / Σ w)` over `fresh`, or `None` if a product overflows. The
 /// weights' scale cancels, so the result is at the samples' own scale. Integer division
 /// truncates, the same as every other scaled quotient in the pusher.
@@ -536,6 +791,7 @@ mod tests {
             venue,
             symbol: symbol.to_owned(),
             weight: parse_decimal_scaled(weight, WEIGHT_DECIMALS).unwrap(),
+            quote: None,
         }
     }
 
@@ -577,6 +833,7 @@ mod tests {
             venue: VenueId::Binance,
             symbol: "A".into(),
             weight: U256::MAX,
+            quote: None,
         };
         assert!(weighted_average(&[(&a, sample(2, 0))]).is_none());
     }
@@ -685,6 +942,7 @@ mod tests {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
             checks: Default::default(),
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -760,6 +1018,7 @@ mod tests {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
             checks: Default::default(),
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -825,6 +1084,7 @@ mod tests {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
             checks: Default::default(),
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -878,6 +1138,7 @@ mod tests {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
             checks: Default::default(),
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -933,6 +1194,7 @@ mod tests {
             sources: vec![source(VenueId::Binance, "TESTUSDT", "1")],
             min_sources: 1,
             checks: Default::default(),
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -986,6 +1248,7 @@ mod tests {
             ],
             min_sources: 2,
             checks: Default::default(),
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -1030,6 +1293,7 @@ mod tests {
             ],
             min_sources: 2,
             checks: Default::default(),
+            fx: None,
         };
         let spawned = spawn(
             &feeds,
@@ -1132,6 +1396,7 @@ mod tests {
             checks: crate::config::SourceChecks {
                 max_lag: Some(Duration::from_millis(1_500)),
             },
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -1189,6 +1454,7 @@ mod tests {
             ],
             min_sources: 1,
             checks: Default::default(),
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -1263,6 +1529,7 @@ mod tests {
             checks: crate::config::SourceChecks {
                 max_lag: Some(Duration::from_millis(1_500)),
             },
+            fx: None,
         };
         let mut spawned = spawn(
             &feeds,
@@ -1291,5 +1558,593 @@ mod tests {
         .await
         .expect("a prompt frame puts a price back")
         .unwrap();
+    }
+    /// A sample at `px` (whole units, 8 decimals) stamped `age` ago.
+    fn aged(px: &str, age: Duration) -> PriceSample {
+        PriceSample {
+            delta: U256::from(12_345u64),
+            mid: parse_decimal_scaled(px, 8).unwrap(),
+            at: Instant::now() - age,
+            wall: SystemTime::now() - age,
+        }
+    }
+
+    fn fx_config(min_sources: usize) -> Fx {
+        Fx {
+            legs: vec![
+                crate::config::FxLeg {
+                    venue: VenueId::Okx,
+                    symbol: "USDT-USD".into(),
+                },
+                crate::config::FxLeg {
+                    venue: VenueId::Okx,
+                    symbol: "USDT-USD-B".into(),
+                },
+            ],
+            min_sources,
+            max_depeg: parse_decimal_scaled("0.005", FX_DECIMALS).unwrap(),
+            max_disagreement: parse_decimal_scaled("0.0005", FX_DECIMALS).unwrap(),
+        }
+    }
+
+    /// The rate is the legs' plain mean, and a USD mid is divided by it: 3992 USD at 0.998
+    /// USD per quote token is 4000 of the quote token. The delta is a fraction of the mid
+    /// and is left as it is.
+    #[test]
+    fn a_usd_mid_is_divided_by_the_mean_of_the_legs() {
+        let legs = [
+            aged("0.9979", Duration::ZERO),
+            aged("0.9981", Duration::ZERO),
+        ];
+        let rate = fx_rate(&legs, &fx_config(2), 8).unwrap();
+        assert_eq!(rate.rate, U256::from(99_800_000u64));
+        let usd = aged("3992", Duration::ZERO);
+        let converted = convert(usd, rate, 8, false).unwrap();
+        assert_eq!(converted.mid, U256::from(400_000_000_000u64));
+        assert_eq!(converted.delta, usd.delta);
+    }
+
+    /// An inverted lane carries the reciprocal, so its USD sample is multiplied by the
+    /// rate: the same price as the direct lane's conversion, read the other way up.
+    #[test]
+    fn an_inverted_lane_converts_to_the_reciprocal_of_the_direct_one() {
+        let decimals = 18;
+        let one = U256::exp10(decimals as usize);
+        let rate = FxRate {
+            rate: parse_decimal_scaled("0.998", decimals).unwrap(),
+            at: Instant::now(),
+            wall: SystemTime::now(),
+        };
+        let usd = parse_decimal_scaled("3992", decimals).unwrap();
+        let direct = PriceSample {
+            delta: U256::zero(),
+            mid: usd,
+            at: Instant::now(),
+            wall: SystemTime::now(),
+        };
+        let inverted = PriceSample {
+            mid: one * one / usd,
+            ..direct
+        };
+        let direct = convert(direct, rate, decimals, false).unwrap().mid;
+        let inverted = convert(inverted, rate, decimals, true).unwrap().mid;
+        assert_eq!(direct, parse_decimal_scaled("4000", decimals).unwrap());
+        // 1/4000 = 0.00025, to the last digit the two truncations leave.
+        let expected = parse_decimal_scaled("0.00025", decimals).unwrap();
+        assert!(
+            expected - inverted <= U256::one(),
+            "inverted {inverted}, expected {expected}"
+        );
+        assert!(
+            (scaled_to_f64(direct, decimals) * scaled_to_f64(inverted, decimals) - 1.0).abs()
+                < 1e-12
+        );
+    }
+
+    /// A converted sample is as old as the oldest thing it was made of: an old USD price
+    /// over a new rate is old, and a new USD price over a rate from an older leg is as old
+    /// as that leg.
+    #[test]
+    fn the_converted_sample_is_as_old_as_its_oldest_part() {
+        let twenty = Duration::from_secs(20);
+        let legs = [aged("0.998", Duration::ZERO), aged("0.998", twenty)];
+        let rate = fx_rate(&legs, &fx_config(2), 8).unwrap();
+        assert_eq!((rate.at, rate.wall), (legs[1].at, legs[1].wall));
+        let fresh = convert(aged("3992", Duration::ZERO), rate, 8, false).unwrap();
+        assert_eq!((fresh.at, fresh.wall), (legs[1].at, legs[1].wall));
+        let old = aged("3992", Duration::from_secs(25));
+        let converted = convert(old, rate, 8, false).unwrap();
+        assert_eq!((converted.at, converted.wall), (old.at, old.wall));
+        assert!(fresh.age_at(Instant::now(), SystemTime::now()) >= twenty);
+    }
+
+    /// The rate is refused, and why: fewer legs than `min_sources`, a mean further from 1
+    /// than `max_depeg`, legs further apart than `max_disagreement`. One leg is enough
+    /// when the stanza says so.
+    #[test]
+    fn the_rate_is_refused_when_stale_off_peg_or_split() {
+        let fresh = |px: &str| aged(px, Duration::ZERO);
+        let both = fx_config(2);
+        assert_eq!(fx_rate(&[fresh("0.998")], &both, 8), Err(FxTrip::Stale));
+        assert_eq!(fx_rate(&[], &fx_config(1), 8), Err(FxTrip::Stale));
+        assert!(fx_rate(&[fresh("0.998")], &fx_config(1), 8).is_ok());
+        assert_eq!(
+            fx_rate(&[fresh("0.99"), fresh("0.99")], &both, 8),
+            Err(FxTrip::Depeg)
+        );
+        assert_eq!(
+            fx_rate(&[fresh("1.0051"), fresh("1.0051")], &both, 8),
+            Err(FxTrip::Depeg)
+        );
+        assert!(fx_rate(&[fresh("1.0049"), fresh("1.0049")], &both, 8).is_ok());
+        // 15 bp apart, over a 5 bp limit.
+        assert_eq!(
+            fx_rate(&[fresh("0.998"), fresh("0.9995")], &both, 8),
+            Err(FxTrip::Disagreement)
+        );
+        assert!(fx_rate(&[fresh("0.998"), fresh("0.9984")], &both, 8).is_ok());
+    }
+
+    /// An OKX-dialect venue serving several markets on one endpoint: each connection's
+    /// subscribe names its market, which is then sent what the test sends under that name,
+    /// and every text `ping` is answered `pong`, so a market sent nothing more stays live;
+    /// except on the `mute` markets, which never answer one and so go quiet.
+    async fn okx_desk(
+        markets: &[&str],
+        mute: &[&str],
+    ) -> (
+        String,
+        std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>,
+    ) {
+        use futures_util::StreamExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut senders = std::collections::HashMap::new();
+        let mut receivers = std::collections::HashMap::new();
+        for market in markets {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            senders.insert((*market).to_owned(), tx);
+            receivers.insert((*market).to_owned(), rx);
+        }
+        let receivers = Arc::new(Mutex::new(receivers));
+        let mute: Arc<Vec<String>> = Arc::new(mute.iter().map(|m| (*m).to_owned()).collect());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let receivers = receivers.clone();
+                let mute = mute.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = accept_async(stream).await else {
+                        return;
+                    };
+                    let Some(Ok(Message::Text(subscribe))) = ws.next().await else {
+                        return;
+                    };
+                    let subscribe: serde_json::Value =
+                        serde_json::from_str(subscribe.as_str()).unwrap();
+                    let market = subscribe["args"][0]["instId"].as_str().unwrap_or_default();
+                    let Some(mut frames) = receivers.lock().unwrap().remove(market) else {
+                        return;
+                    };
+                    let answers = !mute.iter().any(|m| m == market);
+                    loop {
+                        tokio::select! {
+                            frame = frames.recv() => {
+                                let Some(frame) = frame else { return };
+                                if ws.send(Message::text(frame)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            msg = ws.next() => match msg {
+                                Some(Ok(Message::Text(text)))
+                                    if answers && text.as_str() == "ping" =>
+                                {
+                                    if ws.send(Message::text("pong")).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Some(Ok(_)) => {}
+                                _ => return,
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("ws://{addr}"), senders)
+    }
+
+    fn okx_frame(market: &str, px: &str, ts_ms: u64) -> String {
+        format!(
+            r#"{{"arg":{{"channel":"tickers","instId":"{market}"}},"data":[{{"instId":"{market}","bidPx":"{px}","askPx":"{px}","ts":"{ts_ms}"}}]}}"#
+        )
+    }
+
+    /// A pair on one USD market (weight 1, `quote = "USD"`) and one USDT market (weight 1),
+    /// converted by two USDT/USD legs, all on the OKX desk.
+    fn usd_pair(min_sources: usize, fx_min: usize, max_lag: Option<Duration>) -> Feeds {
+        Feeds {
+            sources: vec![
+                Source {
+                    quote: Some(Quote::Usd),
+                    ..source(VenueId::Okx, "ETH-USD", "1")
+                },
+                source(VenueId::Okx, "ETH-USDT", "1"),
+            ],
+            min_sources,
+            checks: crate::config::SourceChecks { max_lag },
+            fx: Some(fx_config(fx_min)),
+        }
+    }
+
+    const MARKETS: [&str; 4] = ["ETH-USD", "ETH-USDT", "USDT-USD", "USDT-USD-B"];
+
+    async fn wait_for_mid(rx: &watch::Receiver<Option<PriceSample>>, mid: Option<u64>) {
+        wait_for_mid_within(rx, mid, Duration::from_secs(5)).await;
+    }
+
+    async fn wait_for_mid_within(
+        rx: &watch::Receiver<Option<PriceSample>>,
+        mid: Option<u64>,
+        within: Duration,
+    ) {
+        let mut rx = rx.clone();
+        tokio::time::timeout(
+            within,
+            rx.wait_for(move |s| s.map(|p| p.mid) == mid.map(|px| U256::from(px * 100_000_000))),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("no composite at {mid:?}"))
+        .unwrap();
+    }
+
+    async fn wait_for_gauge(gauge: &prometheus::Gauge, value: f64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gauge.get() != value {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("gauge stayed at {}, not {value}", gauge.get()));
+    }
+
+    /// With the rate usable the USD market is converted and averaged with the USDT one:
+    /// (3992 / 0.998 + 4010) / 2 = 4005. Off its peg the USD market is left out and the
+    /// pair quotes on the USDT market alone; with legs that disagree, the same; back on
+    /// the peg, back in. The gauges say which.
+    #[tokio::test]
+    async fn usd_sources_are_converted_and_left_out_while_the_rate_is_off_peg_or_split() {
+        let (url, desk) = okx_desk(&MARKETS, &[]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        let metrics = Metrics::new().unwrap();
+        let spawned = spawn(
+            &usd_pair(1, 2, None),
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        let send =
+            |market: &str, px: &str| desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        let m = metrics.for_pair("TEST");
+        let converted = metrics.for_venue("TEST", "okx").converted.clone();
+
+        send("ETH-USD", "3992");
+        send("ETH-USDT", "4010");
+        send("USDT-USD", "0.998");
+        send("USDT-USD-B", "0.998");
+        wait_for_mid(&spawned.rx, Some(4005)).await;
+        assert_eq!(m.fx_rate.get(), 0.998);
+        assert_eq!(m.fx_sources_fresh.get(), 2.0);
+        assert_eq!(converted.get(), 1.0);
+        for reason in FxTrip::ALL {
+            assert_eq!(m.fx_guard_tripped(reason).get(), 0.0, "{}", reason.as_str());
+        }
+        assert_eq!(
+            spawned
+                .venues
+                .iter()
+                .map(VenueFeed::series)
+                .collect::<Vec<_>>(),
+            ["okx", "okx", "fx:okx", "fx:okx"],
+            "the legs have series of their own"
+        );
+
+        // One leg moved and not yet the other reads as a disagreement first; wait for both.
+        send("USDT-USD", "0.99");
+        send("USDT-USD-B", "0.99");
+        wait_for_gauge(m.fx_guard_tripped(FxTrip::Depeg), 1.0).await;
+        wait_for_mid(&spawned.rx, Some(4010)).await;
+        assert_eq!(converted.get(), 0.0);
+        assert_eq!(m.feed_sources_fresh.get(), 1.0);
+
+        send("USDT-USD", "0.998");
+        send("USDT-USD-B", "0.9995");
+        wait_for_gauge(m.fx_guard_tripped(FxTrip::Disagreement), 1.0).await;
+        assert_eq!(m.fx_guard_tripped(FxTrip::Depeg).get(), 0.0);
+        assert_eq!(
+            spawned.rx.borrow().map(|s| s.mid),
+            Some(U256::from(401_000_000_000u64))
+        );
+
+        send("USDT-USD-B", "0.998");
+        wait_for_mid(&spawned.rx, Some(4005)).await;
+        assert_eq!(m.fx_guard_tripped(FxTrip::Disagreement).get(), 0.0);
+    }
+
+    /// An FX leg late behind its own stamp is left out like a late source, and with both
+    /// legs required the USD market goes with it; under an `fx.min_sources` of 1 the other
+    /// leg carries the rate alone.
+    #[tokio::test]
+    async fn a_late_fx_leg_takes_the_usd_sources_out_unless_one_leg_is_enough() {
+        for (fx_min, expected) in [(2, 4010), (1, 4005)] {
+            let (url, desk) = okx_desk(&MARKETS, &[]).await;
+            let endpoints = Endpoints::single(VenueId::Okx, url);
+            let metrics = Metrics::new().unwrap();
+            let spawned = spawn(
+                &usd_pair(1, fx_min, Some(Duration::from_millis(1_500))),
+                params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+            );
+            let send = |market: &str, px: &str, ts: u64| {
+                desk[market].send(okx_frame(market, px, ts)).unwrap()
+            };
+            send("ETH-USD", "3992", now_ms());
+            send("ETH-USDT", "4010", now_ms());
+            send("USDT-USD", "0.998", now_ms());
+            send("USDT-USD-B", "0.998", now_ms());
+            wait_for_mid(&spawned.rx, Some(4005)).await;
+
+            // Within MAX_PRICE_AGE of arriving, so only its lateness can leave it out. (Both
+            // legs share the desk's `fx:okx` series, so its `late` gauge is not read here.)
+            send("USDT-USD-B", "0.998", now_ms() - 30_000);
+            let m = metrics.for_pair("TEST");
+            wait_for_gauge(&m.fx_sources_fresh, 1.0).await;
+            // Any composite after the late frame was judged: the USDT market ticks again.
+            send("ETH-USDT", "4010", now_ms());
+            wait_for_mid(&spawned.rx, Some(expected)).await;
+            let stale = if fx_min == 2 { 1.0 } else { 0.0 };
+            assert_eq!(
+                m.fx_guard_tripped(FxTrip::Stale).get(),
+                stale,
+                "fx min {fx_min}"
+            );
+        }
+    }
+
+    /// The pair's `min_sources` is judged on what is left once the USD sources are out:
+    /// with both markets required, a rate off its peg withdraws the pair, and the rate back
+    /// on it brings the pair back.
+    #[tokio::test]
+    async fn the_pairs_min_sources_is_judged_after_the_usd_sources_drop() {
+        let (url, desk) = okx_desk(&MARKETS, &[]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        let metrics = Metrics::new().unwrap();
+        let spawned = spawn(
+            &usd_pair(2, 2, None),
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        let send =
+            |market: &str, px: &str| desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        send("ETH-USD", "3992");
+        send("ETH-USDT", "4010");
+        send("USDT-USD", "0.998");
+        send("USDT-USD-B", "0.998");
+        wait_for_mid(&spawned.rx, Some(4005)).await;
+
+        send("USDT-USD", "0.99");
+        send("USDT-USD-B", "0.99");
+        wait_for_mid(&spawned.rx, None).await;
+        assert_eq!(metrics.for_pair("TEST").feed_up.get(), 0.0);
+
+        send("USDT-USD", "0.998");
+        send("USDT-USD-B", "0.998");
+        wait_for_mid(&spawned.rx, Some(4005)).await;
+    }
+
+    /// Without `quote` a USD market is averaged as read, as it always was: no rate, no
+    /// conversion, and the FX series say there is none.
+    #[tokio::test]
+    async fn a_usd_market_without_quote_is_averaged_as_read() {
+        let (url, desk) = okx_desk(&MARKETS, &[]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        let metrics = Metrics::new().unwrap();
+        let feeds = Feeds {
+            sources: vec![
+                source(VenueId::Okx, "ETH-USD", "1"),
+                source(VenueId::Okx, "ETH-USDT", "1"),
+            ],
+            min_sources: 1,
+            checks: Default::default(),
+            fx: None,
+        };
+        let spawned = spawn(
+            &feeds,
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        let send =
+            |market: &str, px: &str| desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        send("ETH-USD", "3990");
+        send("ETH-USDT", "4010");
+        wait_for_mid(&spawned.rx, Some(4000)).await;
+        assert_eq!(spawned.venues.len(), 2, "no legs dialled");
+        assert_eq!(
+            metrics.for_pair("TEST").fx_sources_fresh.get(),
+            0.0,
+            "never written"
+        );
+        assert_eq!(metrics.for_venue("TEST", "okx").converted.get(), 0.0);
+    }
+
+    /// A quiet FX leg on a live socket is a rate that has not moved: the pongs that keep
+    /// its socket up refresh its sample past MAX_PRICE_AGE, so the USD market stays in,
+    /// converted. A pong carries no exchange stamp, so it says nothing about lateness and
+    /// the leg is not read as late under `max_source_lag_ms`. Real time, so the test takes
+    /// a little over MAX_PRICE_AGE, as `feed`'s pong test does.
+    #[tokio::test]
+    async fn a_quiet_fx_leg_kept_alive_by_pongs_keeps_the_usd_sources_in() {
+        let (url, desk) = okx_desk(&MARKETS, &[]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        let metrics = Metrics::new().unwrap();
+        let mut spawned = spawn(
+            &usd_pair(2, 2, Some(Duration::from_millis(1_500))),
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        let send =
+            |market: &str, px: &str| desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        send("ETH-USD", "3992");
+        send("ETH-USDT", "4010");
+        send("USDT-USD", "0.998");
+        send("USDT-USD-B", "0.998");
+        wait_for_mid(&spawned.rx, Some(4005)).await;
+        let started = Instant::now();
+        let later = tokio::time::timeout(
+            MAX_PRICE_AGE + Duration::from_secs(25),
+            spawned.rx.wait_for(|s| {
+                s.is_some_and(|s| s.at >= started + MAX_PRICE_AGE + Duration::from_secs(5))
+            }),
+        )
+        .await
+        .expect("the pongs did not keep the composite publishing")
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            later.mid,
+            U256::from(400_500_000_000u64),
+            "still converted and averaged"
+        );
+        let m = metrics.for_pair("TEST");
+        assert_eq!(m.fx_sources_fresh.get(), 2.0);
+        assert_eq!(m.fx_guard_tripped(FxTrip::Stale).get(), 0.0);
+        assert_eq!(metrics.for_venue("TEST", "fx:okx").late.get(), 0.0);
+    }
+    /// An inverted lane converts too, and its FX legs are not inverted with it: the rate
+    /// stays 0.998, not its reciprocal 1.002 (which would pass `max_depeg` and price the USD
+    /// market 0.4% off), and the lane mid is the reciprocal of the direct one, 1/4000.
+    #[tokio::test]
+    async fn an_inverted_pair_converts_its_usd_sources_with_the_rate_upright() {
+        let (url, desk) = okx_desk(&MARKETS, &[]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        let metrics = Metrics::new().unwrap();
+        let mut feeds = usd_pair(1, 2, None);
+        feeds.sources.truncate(1);
+        let mut params = params(&endpoints, &metrics, Latch::new(), None, Vec::new());
+        params.invert = true;
+        params.decimals = 18;
+        let mut spawned = spawn(&feeds, params);
+        let send =
+            |market: &str, px: &str| desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        send("ETH-USD", "3992");
+        send("USDT-USD", "0.998");
+        send("USDT-USD-B", "0.998");
+        let sample =
+            tokio::time::timeout(Duration::from_secs(5), spawned.rx.wait_for(|s| s.is_some()))
+                .await
+                .expect("no converted composite")
+                .unwrap()
+                .unwrap();
+        let lane = scaled_to_f64(sample.mid, 18);
+        assert!((lane * 4000.0 - 1.0).abs() < 1e-12, "lane mid {lane}");
+        assert_eq!(metrics.for_pair("TEST").fx_rate.get(), 0.998);
+    }
+
+    /// At startup the FX legs may deliver after the sources: the pair quotes on what needs
+    /// no rate first, and the USD sources join once the rate arrives.
+    #[tokio::test]
+    async fn the_usd_sources_join_once_the_fx_legs_deliver() {
+        let (url, desk) = okx_desk(&MARKETS, &[]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        let metrics = Metrics::new().unwrap();
+        let spawned = spawn(
+            &usd_pair(1, 2, None),
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        let send =
+            |market: &str, px: &str| desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        send("ETH-USD", "3992");
+        send("ETH-USDT", "4010");
+        wait_for_mid(&spawned.rx, Some(4010)).await;
+        let m = metrics.for_pair("TEST");
+        assert_eq!(m.fx_guard_tripped(FxTrip::Stale).get(), 1.0);
+        assert!(m.fx_rate.get().is_nan(), "no leg, no rate");
+
+        send("USDT-USD", "0.998");
+        send("USDT-USD-B", "0.998");
+        wait_for_mid(&spawned.rx, Some(4005)).await;
+        assert_eq!(m.fx_guard_tripped(FxTrip::Stale).get(), 0.0);
+    }
+
+    /// `connect` gives the FX legs the rest of FIRST_PRICE_TIMEOUT and names one still
+    /// silent, for the run to warn about and `--check` to fail on, rather than starting as
+    /// if the USD sources were merely out for a while. Real time: one FIRST_PRICE_TIMEOUT.
+    #[tokio::test]
+    async fn connect_names_an_fx_leg_that_never_delivers() {
+        let (url, desk) = okx_desk(&MARKETS, &[]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        let metrics = Metrics::new().unwrap();
+        for market in ["ETH-USD", "ETH-USDT", "USDT-USD"] {
+            let px = if market == "USDT-USD" {
+                "0.998"
+            } else {
+                "4000"
+            };
+            desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        }
+        let spawned = connect(
+            &usd_pair(1, 2, None),
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        )
+        .await
+        .expect("the sources that need no rate are enough to start");
+        assert_eq!(spawned.silent_fx, ["okx:USDT-USD-B"]);
+
+        // Every leg delivering: nothing named, and no wait beyond the legs' first frames.
+        let (url, desk) = okx_desk(&MARKETS, &[]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        for market in MARKETS {
+            let px = if market.starts_with("USDT") {
+                "0.998"
+            } else {
+                "4000"
+            };
+            desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        }
+        let started = Instant::now();
+        let spawned = connect(
+            &usd_pair(1, 2, None),
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert!(spawned.silent_fx.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// An FX leg whose socket goes quiet (it stops answering pings, so nothing refreshes
+    /// its sample) ages out at MAX_PRICE_AGE like a silent source, and with both legs
+    /// required the USD sources go with it. Real time: a little over MAX_PRICE_AGE.
+    #[tokio::test]
+    async fn a_silent_fx_leg_ages_out_and_takes_the_usd_sources_with_it() {
+        let (url, desk) = okx_desk(&MARKETS, &["USDT-USD-B"]).await;
+        let endpoints = Endpoints::single(VenueId::Okx, url);
+        let metrics = Metrics::new().unwrap();
+        let spawned = spawn(
+            &usd_pair(1, 2, None),
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        );
+        let send =
+            |market: &str, px: &str| desk[market].send(okx_frame(market, px, now_ms())).unwrap();
+        send("ETH-USD", "3992");
+        send("ETH-USDT", "4010");
+        send("USDT-USD", "0.998");
+        send("USDT-USD-B", "0.998");
+        wait_for_mid(&spawned.rx, Some(4005)).await;
+        let m = metrics.for_pair("TEST");
+        tokio::time::timeout(MAX_PRICE_AGE + Duration::from_secs(15), async {
+            while m.fx_guard_tripped(FxTrip::Stale).get() != 1.0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the quiet leg never aged out");
+        assert_eq!(m.fx_sources_fresh.get(), 1.0);
+        // The answering markets' pongs keep recomputing: the next composite is without
+        // the USD market.
+        wait_for_mid_within(&spawned.rx, Some(4010), Duration::from_secs(15)).await;
     }
 }
