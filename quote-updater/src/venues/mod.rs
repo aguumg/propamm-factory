@@ -11,6 +11,7 @@ pub mod kraken;
 pub mod kucoin;
 pub mod mexc;
 pub mod okx;
+pub mod ondo;
 
 /// An exchange's millisecond timestamp as a wall-clock time: what a venue that stamps its
 /// frames says the price is as of, for the feed's source age.

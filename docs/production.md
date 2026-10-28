@@ -11,8 +11,11 @@ Deploying to production consists, roughly, of three things:
 If there is no factory on your chain yet, deploy one:
 
 ```bash
-make deploy-factory DEPLOY_RPC_URL=https://... PRIVATE_KEY=0x...
+make deploy-factory DEPLOY_RPC_URL=https://... PRIVATE_KEY=0x... FACTORY_OWNER=0x...
 ```
+
+`FACTORY_OWNER` is the account that can call `disableCreation`, which stops the factory from
+creating any more PropAMMs, for good, and emits `CreationDisabled`. It defaults to the deployer.
 
 Note: on Ethereum mainnet the current factory's address is `0x7625E38581124da157586759466E87601416172c`.
 

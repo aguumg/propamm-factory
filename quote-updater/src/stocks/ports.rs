@@ -2,7 +2,8 @@
 //! answer. A design answers through adapters of its own (`issuers/ondo/` for Ondo's Global
 //! Markets tokens); the core judges every answer the same way, whoever gave it:
 //!
-//! - [`PriceSource`]: the token's price, polled.
+//! - [`PriceSource`]: the issuer's own price for the token and its stock, for the `k` the
+//!   issuer prices with and the stock's ticker. The price the pair quotes is the venue's.
 //! - [`Valuation`]: how the token's price follows its stock (one token is worth `k` shares),
 //!   and the corporate action that will stop that holding.
 //! - [`MarketStatus`]: what the issuer says about the market and the asset, for a design
@@ -63,7 +64,9 @@ impl Fetched {
     }
 }
 
-/// Where the token's price comes from. Polled by a task of the core's.
+/// The issuer's own price for the token and its stock. Read once at the build, for the
+/// stock's ticker, and on the status schedule for the `k` the issuer prices with, by a
+/// task of the core's. Not the price the pair quotes: that is the issuer's venue.
 pub trait PriceSource: Send + Sync + 'static {
     /// The latest price.
     fn fetch(&self) -> BoxFuture<'_, eyre::Result<Fetched>>;
@@ -124,7 +127,10 @@ impl Action {
 /// the core's, a block apart.
 pub trait Valuation: Send + Sync + 'static {
     /// The shares one token is worth now, and the corporate action scheduled on it, if any.
-    fn read(&self) -> BoxFuture<'_, eyre::Result<Shares>>;
+    /// `None` for a token the source does not list: the core then quotes the pair on the
+    /// price source alone, without the multiplier gates, and says so at the build. An
+    /// `Err` is a read that failed, which the build refuses and a running pair ages out.
+    fn read(&self) -> BoxFuture<'_, eyre::Result<Option<Shares>>>;
 }
 
 /// Something the issuer reports on the asset that stops quoting: a pause, a size limit, a

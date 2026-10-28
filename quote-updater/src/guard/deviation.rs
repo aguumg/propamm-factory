@@ -5,9 +5,15 @@
 //! than the configured fraction from the one before it. It is not a bound on where the
 //! price may end up (a move that arrives in small steps never trips it, however far it
 //! travels, because that is a real market move and `min_mid`/`max_mid` bounds the
-//! destination). A second, optional check measures the move over a trailing window of N
-//! blocks: at a short window that is still feed integrity, at a long one it is a policy to
-//! stop making markets when the market moves this hard. Both trip the same latch.
+//! destination). Tick to tick means between consecutive samples: after the composite has
+//! published nothing for longer than [`MAX_PRICE_AGE`] (every venue out, or a market that
+//! closes for the night or the weekend, as a stock does), the pair was not quoting, and the
+//! first sample after the gap is a fresh start rather than a move from the one before it.
+//! A move across a gap is one the pair never offered a price through; the band still
+//! bounds where it lands. A second, optional check measures the move over a trailing
+//! window of N blocks: at a short window that is still feed integrity, at a long one it is
+//! a policy to stop making markets when the market moves this hard. Both trip the same
+//! latch.
 //!
 //! Pure and IO-free on purpose: no clock, no channels, no logging. The composite acts on
 //! the verdicts, which is what makes every transition testable without tokio.
@@ -26,6 +32,7 @@ use crate::{
     guard::{CompositeSample, MarketGuard, TripReason, Verdict},
     metrics::PairMetrics,
     pricing::Diagnostics,
+    update::MAX_PRICE_AGE,
 };
 
 /// Everything the operator lines about a trip need, rendered where the arithmetic lives.
@@ -90,9 +97,11 @@ pub(crate) struct DeviationGuard {
     config: BreakerConfig,
     /// `config.scale()`, computed once: it is on the path of every sample.
     scale: U256,
-    /// The last mid this guard approved, None until the first: startup has nothing to
-    /// deviate from and always passes.
-    reference: Option<U256>,
+    /// The last mid this guard approved and when it was sampled, None until the first:
+    /// startup has nothing to deviate from and always passes. A reference older than
+    /// [`MAX_PRICE_AGE`] when the next sample arrives is dropped the same way: the pair was
+    /// not quoting across that gap (see the module doc).
+    reference: Option<(U256, Instant)>,
     /// One bucket per second of the trailing window, oldest first; empty for a guard with
     /// no window configured.
     window: VecDeque<(Instant, U256)>,
@@ -328,37 +337,40 @@ impl MarketGuard for DeviationGuard {
         }
         let anchor = self.window.front().map(|&(_, mid)| mid);
 
-        // Nothing seen yet, so there is nothing to deviate from: startup extends the same
-        // trust to its first price that the service already does.
-        let Some(previous) = self.reference else {
-            self.reference = Some(mid);
-            return Verdict::Pass;
-        };
+        // Nothing seen yet, or nothing for longer than the pair quotes a price, so there is
+        // nothing tick to tick to deviate from: startup extends the same trust to its first
+        // price that the service already does, and so does the first price after a gap. The
+        // window keeps measuring over its whole span regardless.
+        let first = self.reference.is_none();
+        let previous = self
+            .reference
+            .filter(|(_, since)| at.saturating_duration_since(*since) <= MAX_PRICE_AGE)
+            .map(|(previous, _)| previous);
 
-        if let Some(threshold) = self.config.threshold_scaled {
+        if let (Some(threshold), Some(previous)) = (self.config.threshold_scaled, previous) {
             let diff = self.deviation(mid, previous);
             self.last_ratio = Some(self.ratio(diff, previous, threshold));
             if self.beyond(diff, previous, threshold) {
                 let deviation =
                     self.describe(diff, previous, mid, threshold, String::new(), "previous");
-                self.reference = Some(mid);
+                self.reference = Some((mid, at));
                 return self.trip(deviation);
             }
         }
 
-        if let (Some(config), Some(anchor)) = (window_config, anchor) {
+        if let (Some(config), Some(anchor), false) = (window_config, anchor, first) {
             let diff = self.deviation(mid, anchor);
             self.last_window_ratio = Some(self.ratio(diff, anchor, config.threshold_scaled));
             if self.beyond(diff, anchor, config.threshold_scaled) {
                 let span = format!(" over {} blocks", config.blocks);
                 let deviation =
                     self.describe(diff, anchor, mid, config.threshold_scaled, span, "anchor");
-                self.reference = Some(mid);
+                self.reference = Some((mid, at));
                 return self.trip(deviation);
             }
         }
 
-        self.reference = Some(mid);
+        self.reference = Some((mid, at));
         self.publish_ratios();
         Verdict::Pass
     }
@@ -470,6 +482,39 @@ mod tests {
         }
         assert!(matches!(
             assess(&mut g, mid("4300"), now()),
+            Verdict::Trip(_)
+        ));
+    }
+
+    /// Tick to tick is between consecutive samples. After a gap longer than the pair quotes
+    /// a price for (every venue out, a market closed for the night), the first sample is a
+    /// fresh start: the pair offered no price across the gap, so the move across it is not
+    /// one it quoted through. A gap inside that limit is an ordinary tick.
+    #[test]
+    fn the_first_sample_after_a_gap_longer_than_a_price_lives_is_a_fresh_start() {
+        let mut g = guard(config("0.02"));
+        let start = now();
+        assert_eq!(assess(&mut g, mid("100"), start), Verdict::Pass);
+        // 3% up after a gap just past MAX_PRICE_AGE: not a move the pair quoted through.
+        let after_gap = start + MAX_PRICE_AGE + Duration::from_millis(1);
+        assert_eq!(assess(&mut g, mid("103"), after_gap), Verdict::Pass);
+        // The sample after the gap is the new reference: 3% more, a second later, trips.
+        assert!(matches!(
+            assess(&mut g, mid("106.1"), after_gap + Duration::from_secs(1)),
+            Verdict::Trip(_)
+        ));
+        // Exactly MAX_PRICE_AGE apart is still consecutive.
+        let mut g = guard(config("0.02"));
+        assert_eq!(assess(&mut g, mid("100"), start), Verdict::Pass);
+        assert!(matches!(
+            assess(&mut g, mid("103"), start + MAX_PRICE_AGE),
+            Verdict::Trip(_)
+        ));
+        // The window is a bound over its span, not a tick: it still trips across the gap.
+        let mut w = guard(config_windowed("0.50", "0.10", 5));
+        assert_eq!(assess(&mut w, mid("100"), start), Verdict::Pass);
+        assert!(matches!(
+            assess(&mut w, mid("111"), start + MAX_PRICE_AGE * 2),
             Verdict::Trip(_)
         ));
     }

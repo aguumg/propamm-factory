@@ -80,9 +80,13 @@ contract PropAMM is
     /// balance, as a fraction at SPREAD_SCALE. Impact is linear in the share the fill consumes.
     uint256 constant IMPACT_FACTOR = 1e14; // 1bps
 
+    /// @dev Retired: nothing reads or writes it. Kept so this layout matches instances created
+    /// while it was in use, which can upgrade onto this implementation; removing it would move
+    /// every variable after it to another slot.
     address private __DEPRECATED_vault;
     TokenPair[] public tokenPairs;
 
+    /// @dev Retired, and kept for the same reason as `__DEPRECATED_vault`.
     mapping(uint256 => bool) private __DEPRECATED_tokenPairKeys;
     /// @dev The vault each pair fills from, by pair key, and the registry of pairs in one: a pair
     /// is registered exactly when its vault is nonzero. `_addPair` sets it, `removePair` clears
@@ -122,11 +126,6 @@ contract PropAMM is
         for (uint256 i = 0; i < pairs.length; i++) {
             _addPair(pairs[i].token0, pairs[i].token1, pairs[i].vault);
         }
-    }
-
-    function reinitializeV2(address oracle_) external reinitializer(2) {
-        __DEPRECATED_vault = address(0);
-        oracle = IPrioUpdateRegistry(oracle_);
     }
 
     /// @inheritdoc IPropAMM

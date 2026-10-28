@@ -47,6 +47,19 @@ impl Feed {
             }
         }
     }
+
+    /// What the build says when a blank delta would copy a half-spread of zero: the pair's
+    /// one source quotes a single price with no book behind it (`ondo`), so the pair would
+    /// quote at the mid itself. A warning, not a refusal, said at the build so `--check`
+    /// and the startup log show it.
+    fn zero_spread_warning(cfg: &FeedConfig, pair: &PairShape) -> Option<String> {
+        (cfg.delta.is_none() && pair.mid_only_sources > 0).then(|| {
+            "the delta is blank, so the venue's half-spread is copied, and the venue quotes one \
+             price with no book: that half-spread is zero and the pair quotes at the mid with \
+             no spread; set a delta (\"0.003\" is 30 bp)"
+                .to_owned()
+        })
+    }
 }
 
 const FIELDS: &[FormField] = &[FormField::new(
@@ -87,6 +100,9 @@ impl Factory for Feed {
     ) -> BoxFuture<'a, eyre::Result<FeedPricer>> {
         let pair = ctx.pair();
         Box::pin(std::future::ready(Self::resolve(cfg, pair).map(|delta| {
+            if let Some(warning) = Self::zero_spread_warning(cfg, pair) {
+                tracing::warn!("[{}] feed: {warning}", pair.label);
+            }
             FeedPricer {
                 delta,
                 spread_scale: crate::config::spread_scale(pair.price_decimals),
@@ -194,6 +210,23 @@ mod tests {
             .price(&tick, &mut testing::diagnostics(&ctx))
             .expect("the stated delta is published");
         assert_eq!(out.delta, U256::from_dec_str("500000000000000").unwrap());
+    }
+
+    /// A source that quotes one price with no book behind it (`ondo`, an issuer's own
+    /// price) has a half-spread of zero, so a blank delta would publish the mid at no
+    /// spread. The build warns of it; a stated delta, or a source with a book, does not.
+    #[test]
+    fn a_blank_delta_over_a_source_with_no_book_is_warned_of() {
+        let mut pair = testing::pair();
+        let blank = FeedConfig::default();
+        assert_eq!(Feed::zero_spread_warning(&blank, &pair), None);
+        pair.mid_only_sources = 1;
+        let warning = Feed::zero_spread_warning(&blank, &pair)
+            .expect("a blank delta over a source with no book is warned of");
+        assert!(warning.contains("zero"), "{warning}");
+        assert!(warning.contains("set a delta"), "{warning}");
+        let stated: FeedConfig = toml::from_str("delta = \"0.003\"").unwrap();
+        assert_eq!(Feed::zero_spread_warning(&stated, &pair), None);
     }
 
     /// There is one book to copy; an average of several venues' spreads is not a number

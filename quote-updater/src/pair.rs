@@ -233,6 +233,7 @@ pub(crate) fn shape_of(resolved: &ResolvedPair, price_decimals: u32, target: Add
         price_decimals,
         target,
         sources: resolved.feeds.as_ref().map_or(0, |f| f.sources.len()),
+        mid_only_sources: resolved.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
         min_mid: resolved.pair.band.min,
         max_mid: resolved.pair.band.max,
     }
@@ -808,6 +809,7 @@ pub(crate) async fn collect_prices(
                 price_decimals,
                 target: chain.1,
                 sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
+                mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
                 min_mid: spec.band.min,
                 max_mid: spec.band.max,
             };
@@ -1483,6 +1485,7 @@ mod tests {
             price_decimals: 18,
             target: Address::zero(),
             sources: 1,
+            mid_only_sources: 0,
             min_mid: None,
             max_mid: None,
         };
@@ -1526,6 +1529,7 @@ mod tests {
         fn shape() -> PairShape {
             PairShape {
                 sources: 1,
+                mid_only_sources: 0,
                 min_mid: None,
                 max_mid: None,
                 label: "CUSTOM/TEST".into(),

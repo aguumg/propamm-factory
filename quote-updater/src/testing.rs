@@ -66,6 +66,7 @@ pub fn pair_for(
         price_decimals,
         target,
         sources: 1,
+        mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
     }
@@ -85,6 +86,7 @@ pub fn pair_with(inverted: bool, price_decimals: u32) -> PairShape {
         price_decimals,
         target: ethrex_common::Address::repeat_byte(3),
         sources: 1,
+        mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
     }

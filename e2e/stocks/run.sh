@@ -7,17 +7,18 @@
 #
 #   bash e2e/stocks/run.sh   from anywhere; builds what it needs, exits 0 when every check holds
 #
-# 1. `--check` on a full builder-mode config (pricer and both guards) passes, and passes with
-#    the pair halted, which the library labels by its lane.
-# 2. `--check` fails, naming why, on a wrong API key, and on a token the oracle has no
-#    multiplier for.
+# 1. `--check` on a full builder-mode config (the ondo venue, the feed pricer and the three
+#    guards) passes, and passes with the pair halted, which the library labels by its lane.
+# 2. `--check` fails, naming why, on a wrong API key; and passes on a token the oracle does
+#    not list, saying the multiplier is not checked.
 # 3. `--check` names each refusal Ondo's stack holds for the pair, found where Ondo keeps it:
 #    the token paused, the vault blocklisted, the PropAMM sanctioned. Each mock contract
 #    answers only for what it holds, so a lookup under the wrong id or of the wrong list
 #    finds nothing. And it withdraws on a refusal no list holds, which only the transfer the
 #    guard tries on the token as the PropAMM can find.
 # 4. One node-mode push lands, and PropAMM quotes 1 AAPLon at Ondo's price less the delta.
-# 5. An event Ondo files under the stock's ticker (AAPL) withdraws the AAPLon quote.
+# 5. An event Ondo files under the stock's ticker (AAPL) withdraws the AAPLon quote, which
+#    `--check` says since the guard judges once at its build.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -121,18 +122,26 @@ text = open(src).read()
 text = re.sub(r"(?m)^target = .*$", f'target = "{propamm}"', text)
 text = re.sub(r"(?m)^mode = .*$", f'mode = "{mode}"', text)
 text = re.sub(r"(?m)^rpc_url = .*$", f'rpc_url = "{rpc}"', text)
+# The ondo venue is dialled at the mock API: an endpoints table, after the plain settings.
+pairs = "[[pairs]]"
+assert pairs in text, "the example config's pair moved"
+text = text.replace(
+    pairs, f'[settings.endpoints]\nondo = "http://127.0.0.1:{api_port}"\n\n{pairs}', 1
+)
 ondo = 'kind    = "ondo"\n'
-assert ondo in text, "the example config's pricing stanza moved"
+assert ondo in text, "the example config's ondo guard stanza moved"
 text = text.replace(
     ondo, f'{ondo}api = "http://127.0.0.1:{api_port}"\nmultiplier_oracle = "{oracle}"\n'
 )
 if mode == "node":
-    # The first guard *table*: the header comment names [[pairs.guards]] too.
+    # The first guard *table*: the header comment names [[pairs.guards]] too. And the
+    # breaker, which node mode refuses: it has no live quote to withdraw.
     text = text[: re.search(r"(?m)^\[\[pairs\.guards\]\]", text).start()]
+    text = re.sub(r"(?m)^max_deviation = .*\n", "", text)
 if name == "halted":
     key_env = re.search(r"(?m)^key_env .*$", text).group(0)
     text = text.replace(key_env, f"{key_env}\nhalted  = true")
-assert "[[pairs]]" in text and ondo in text, f"the {name} config lost its pair"
+assert "[[pairs]]" in text and (mode == "node" or ondo in text), f"the {name} config lost its pair"
 open(dst, "w").write(text)
 PY
 }
@@ -155,19 +164,20 @@ ONDO_API_KEY=$API_KEY run --config "$WORK/halted.toml" --check >"$WORK/halted.ou
   || { cat "$WORK/halted.out"; fail "--check refused the pair halted"; }
 echo "  halted: --check passes"
 
-echo "== 2. --check refuses a wrong key and an unknown token"
+echo "== 2. --check refuses a wrong key, and says so on a token the oracle does not list"
 if ONDO_API_KEY=wrong run --config "$WORK/builder.toml" --check >"$WORK/badkey.out" 2>&1; then
   fail "--check passed with a wrong API key"
 fi
-# The error's own words: a bare 401 also matches whatever base fee the chain reports.
-grep -q "HTTP 401" "$WORK/badkey.out" || { cat "$WORK/badkey.out"; fail "a wrong key was not reported as a 401"; }
-grep -m1 "HTTP 401" "$WORK/badkey.out" | sed 's/^ */  wrong key: /'
+# The venue's poll is refused with a 401 and the pair never gets a first price.
+grep -q "401 Unauthorized" "$WORK/badkey.out" || { cat "$WORK/badkey.out"; fail "a wrong key was not reported as a 401"; }
+grep -m1 "401 Unauthorized" "$WORK/badkey.out" | sed 's/^ */  wrong key: /'
+# The oracle lists some tokens and not others: one it does not list is quoted on Ondo's
+# price alone, and the check passes saying so.
 send "$ORACLE" 'setMultiplier(address,uint128,uint256)' "$AAPLON" 0 0 --private-key "$DEPLOYER_KEY"
-if ONDO_API_KEY=$API_KEY run --config "$WORK/builder.toml" --check >"$WORK/nosv.out" 2>&1; then
-  fail "--check passed with no multiplier on chain"
-fi
-grep -q "no multiplier" "$WORK/nosv.out" || { cat "$WORK/nosv.out"; fail "a missing multiplier was not named"; }
-grep -m1 "no multiplier" "$WORK/nosv.out" | sed 's/^ */  no multiplier: /'
+ONDO_API_KEY=$API_KEY run --config "$WORK/builder.toml" --check >"$WORK/nosv.out" 2>&1 \
+  || { cat "$WORK/nosv.out"; fail "--check failed on a token the oracle does not list"; }
+grep -q "does not list" "$WORK/nosv.out" || { cat "$WORK/nosv.out"; fail "an unlisted token was not said to be"; }
+grep -m1 "does not list" "$WORK/nosv.out" | sed 's/^ */  unlisted: /'
 send "$ORACLE" 'setMultiplier(address,uint128,uint256)' "$AAPLON" "$SVALUE" 0 --private-key "$DEPLOYER_KEY"
 
 echo "== 3. --check names what Ondo's stack would refuse"
@@ -213,10 +223,9 @@ cat >"$EVENTS" <<'JSON'
 [{"symbol": "AAPL", "status": "active", "type": "unscheduled", "eventId": "smoke",
   "updateSharesMultiplier": false, "reason": {"code": "ASSET_PAUSED", "message": "smoke halt"}}]
 JSON
-# Under --once node mode pushes each pair once, and a refused quote fails the run.
-if ONDO_API_KEY=$API_KEY run --config "$WORK/node.toml" --mode node --once >"$WORK/event.out" 2>&1; then
-  cat "$WORK/event.out"; fail "--once pushed through an active event filed under AAPL"
-fi
+# The guard judges once at its build and says so: the check passes with the quote withdrawn.
+ONDO_API_KEY=$API_KEY run --config "$WORK/builder.toml" --check >"$WORK/event.out" 2>&1 \
+  || { cat "$WORK/event.out"; fail "--check failed on an active event: the quote should start withdrawn"; }
 grep -q "smoke halt" "$WORK/event.out" || { cat "$WORK/event.out"; fail "the event was not named"; }
 grep -m1 "smoke halt" "$WORK/event.out" | sed 's/^ */  withdrawn: /'
 echo "OK"

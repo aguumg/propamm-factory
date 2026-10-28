@@ -138,7 +138,7 @@ table.venues td.volume { font-size: .78rem; color: var(--dim); white-space: nowr
   display: grid; gap: .9rem;
   grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
 }
-label { display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
+label, .field { display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
 .key { font-size: .72rem; color: var(--dim); }
 .fieldhint { font-size: .68rem; color: var(--faint); line-height: 1.35; }
 input[type=text], input[type=password], textarea {
@@ -164,6 +164,13 @@ input[readonly] { color: var(--dim); border-style: dashed; cursor: not-allowed; 
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .check input { accent-color: var(--accent); }
+/* A choices field: its boxes in a row, each in its own small card. */
+.choices { display: flex; flex-wrap: wrap; gap: .5rem; margin: .3rem 0 .2rem; }
+.choices .check {
+  margin-right: 0; padding: .4rem .7rem; border: 1px solid var(--line-strong);
+  border-radius: 8px; background: var(--sunk); cursor: pointer;
+}
+.choices .check:hover { border-color: var(--faint); }
 .removal { margin: 1.25rem 0 0; }
 
 /* Pricing: one radio per registered kind and the section it switches to, with no script. The

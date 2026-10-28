@@ -23,11 +23,13 @@ contract Deploy is Script {
         pairs[0] = PropAMM.PairConfig({token0: USDC, token1: USDT, vault: vault});
 
         vm.startBroadcast();
-        PropAMMFactory factory = new PropAMMFactory();
+        // The deployer also owns the factory, and so is who can disable creation on it.
+        PropAMMFactory factory = new PropAMMFactory(msg.sender);
         address propAmm = factory.createPropAMM(owner, ORACLE, updaters, pairs);
         vm.stopBroadcast();
 
         console.log("PropAMMFactory deployed at:", address(factory));
+        console.log("factory owner:", factory.owner());
         console.log("PropAMM implementation at:", address(factory.implementation()));
         console.log("PropAMM created at:", propAmm);
         console.log("owner:", owner);

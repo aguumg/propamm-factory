@@ -533,6 +533,7 @@ impl Kinds {
                     price_decimals: config.price_decimals(),
                     target: config.target,
                     sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
+                    mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
                     min_mid: spec.band.min,
                     max_mid: spec.band.max,
                 };

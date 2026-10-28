@@ -80,6 +80,10 @@ pub enum FieldKind {
     /// The name of an environment variable, written as `{ env = "NAME" }`, the shape
     /// [`EnvSecret`] reads. The variable's value never reaches the page, in either direction.
     Env,
+    /// A fixed set of options, one checkbox each, written as an array of the ticked ones in
+    /// this order. The placeholder names the options ticked when the stanza has no key,
+    /// space-separated: the kind's default, so the page shows what the stanza means.
+    Choices(&'static [&'static str]),
 }
 
 impl FormField {
@@ -113,6 +117,18 @@ impl FormField {
     /// (`holidays = ["2026-11-26", ...]`).
     pub const fn list(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
         Self::of(FieldKind::List, name, placeholder, hint)
+    }
+
+    /// A field whose value is a choice among `options`, one checkbox each, written as an
+    /// array of the ticked ones (`sessions = ["regular", "postmarket"]`). `placeholder`
+    /// names the options ticked when the stanza has no key, space-separated.
+    pub const fn choices(
+        name: &'static str,
+        options: &'static [&'static str],
+        placeholder: &'static str,
+        hint: &'static str,
+    ) -> Self {
+        Self::of(FieldKind::Choices(options), name, placeholder, hint)
     }
 
     /// A field holding the name of an environment variable, written as `{ env = "NAME" }`
@@ -429,6 +445,9 @@ pub struct PairShape {
     /// How many venues the pair's `symbol`/`sources` stream from: 0 for a pair with no
     /// market, which a kind that reads one refuses in its `validate`.
     pub sources: usize,
+    /// How many of those quote one price with no book behind it (`ondo`, an issuer's own
+    /// price): their half-spread is zero, so a kind that copies the book's copies nothing.
+    pub mid_only_sources: usize,
     /// The pair's `min_mid`, in lane orientation, which the core holds every published mid
     /// to; a kind whose mid is a setting checks it here, so a mistake fails the file instead
     /// of every tick.
@@ -1198,6 +1217,7 @@ mod tests {
     fn pair(inverted: bool, price_decimals: u32) -> PairShape {
         PairShape {
             sources: 1,
+            mid_only_sources: 0,
             min_mid: None,
             max_mid: None,
             label: "WETH/USDC".into(),
