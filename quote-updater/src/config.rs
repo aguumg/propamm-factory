@@ -822,6 +822,11 @@ fn parse_fx(raw: &RawPair, sources: &[Source], at: &str) -> Result<Option<Fx>> {
             .parse()
             .wrap_err_with(|| format!("{at}: fx sources[{i}]"))?;
         ensure!(
+            venue != VenueId::Ondo,
+            "{at}: fx sources[{i}] is on ondo, which prices stock tokens, not the quote token \
+             in USD; read the rate from an exchange's USD market"
+        );
+        ensure!(
             !leg.symbol.trim().is_empty(),
             "{at}: fx sources[{i}] ({venue}) has no symbol"
         );
@@ -2157,6 +2162,10 @@ sources = [
             (
                 format!("{usd}[pairs.fx]\nsources = [{{ venue = \"nasdaq\", symbol = \"USDC\" }}]"),
                 "unknown venue",
+            ),
+            (
+                format!("{usd}[pairs.fx]\nsources = [{{ venue = \"ondo\", symbol = \"USDC\" }}]"),
+                "fx sources[0] is on ondo, which prices stock tokens",
             ),
             (
                 format!(

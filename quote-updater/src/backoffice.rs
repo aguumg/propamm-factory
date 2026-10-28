@@ -2754,8 +2754,11 @@ fn render_pair_form_with(
             })
             .collect(),
         min_sources: knob(&MIN_SOURCES_FIELD, |p| p.min_sources.as_deref()),
+        // Every exchange: Ondo prices stock tokens, with no USD market for the quote token
+        // (`config::parse_fx` refuses a leg there).
         fx_sources: VenueId::ALL
             .iter()
+            .filter(|venue| **venue != VenueId::Ondo)
             .map(|venue| FxRow {
                 venue: venue.as_str(),
                 symbol: fx
@@ -5808,6 +5811,15 @@ api_key = "k"
             .expect("the venue table has an ondo row");
         assert!(row.contains("no spread"), "{row}");
         assert!(row.contains("set a delta"), "{row}");
+    }
+
+    /// Ondo prices stock tokens, so it has no market for the quote token in USD to read a
+    /// rate from: the FX section offers the exchanges and not it.
+    #[test]
+    fn the_fx_section_offers_no_ondo_row() {
+        let form = render_pair_form(None, &test_kinds());
+        assert!(form.contains(r#"name="fx_symbol_kraken""#), "{form}");
+        assert!(!form.contains(r#"name="fx_symbol_ondo""#), "{form}");
     }
 
     /// A choices field renders one checkbox per option, the stanza's ticked, and what the
