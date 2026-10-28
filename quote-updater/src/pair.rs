@@ -147,6 +147,9 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
         // From here on the venue's `up` is its feed task's own flag, read at every scrape,
         // so a connect that happened before this generation owned the series still shows.
         metrics.watch_venue(&live.pair.label, &venue.series(), venue.connected.clone());
+        // Written only on a USD source's tick, so a venue an edit took off USD would keep
+        // the 1 the generation before left; this generation's ticks write it from here.
+        v.converted.set(0.0);
         match *venue.rx.borrow() {
             Some(sample) => {
                 v.mid.set(feed::scaled_to_f64(sample.mid, price_decimals));
@@ -1175,6 +1178,53 @@ mod tests {
         // A reload's new generation takes over: its own flags are what is read from then on.
         adopt_metrics(&live(false), 18, &metrics);
         assert_eq!(up("okx"), Some(0.0));
+    }
+
+    /// A reload keeps a pair's label and its venues', so the generation it starts takes over
+    /// the series the one before wrote. `converted` is written only on a USD source's tick,
+    /// so a venue the edit took off `quote = "USD"` would read the 1 its last conversion
+    /// left there for the life of the process. Adopted at 0, as a fresh process has it.
+    #[tokio::test]
+    async fn a_reload_starts_every_venue_unconverted() {
+        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
+
+        let secret = secp256k1::SecretKey::from_slice(&[0x24; 32]).unwrap();
+        let metrics = metrics::Metrics::new().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (_venue_tx, venue_rx) = tokio::sync::watch::channel(None);
+        // What the generation before left: coinbase converted into its last average.
+        metrics.for_venue("FX/TEST", "coinbase").converted.set(1.0);
+        let live = Live {
+            pair: Pair {
+                tokens: (Address::zero(), Address::zero()),
+                lane: U256::from(5),
+                signer: Signer::from(LocalSigner::new(secret)),
+                label: "FX/TEST".to_owned(),
+                band: config::MidBand::default(),
+            },
+            values: ValueSource::feed_for_tests(rx, None, false, 18),
+            latch: crate::guard::Latch::new(),
+            armed: false,
+            guard_kinds: Vec::new(),
+            deviation: None,
+            metrics: metrics.for_pair("FX/TEST"),
+            venues: vec![crate::composite::VenueFeed {
+                venue: "coinbase".parse().unwrap(),
+                symbol: "ETH-USDT".to_owned(),
+                rx: venue_rx,
+                metrics: metrics.for_venue("FX/TEST", "coinbase"),
+                connected: feed::Connected::with(true),
+                fx: false,
+            }],
+            observers: Default::default(),
+        };
+
+        adopt_metrics(&live, 18, &metrics);
+
+        assert_eq!(
+            metrics.for_venue("FX/TEST", "coinbase").converted.get(),
+            0.0
+        );
     }
 
     /// A pair can arrive at adoption already tripped, because its feed has been reading and
