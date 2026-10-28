@@ -1,3 +1,19 @@
+{% if !field.choices.is_empty() %}
+<div class=field>
+  <span class=key>{{ field.label }}</span>
+  {# The key itself, so the post says the field was on the page even with no box ticked. #}
+  <input type=hidden name="{{ field.name }}" value="">
+  <div class=choices>
+    {% for choice in field.choices %}
+    <label class=check>
+      <input type=checkbox name="{{ choice.name }}"{% if choice.checked %} checked{% endif %}>
+      <span class=choice-name>{{ choice.label }}</span>
+    </label>
+    {% endfor %}
+  </div>
+  <span class=fieldhint>{{ field.hint }}</span>
+</div>
+{% else %}
 <label>
   <span class=key>{{ field.label }}</span>
   {% if field.multiline %}
@@ -13,3 +29,4 @@
   {% endif %}
   <span class=fieldhint>{{ field.hint }}</span>
 </label>
+{% endif %}

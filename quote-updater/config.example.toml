@@ -97,6 +97,7 @@ disable_cross_region = false
 # coinbase = "wss://ws-feed.exchange.coinbase.com"
 # kucoin = "https://api.kucoin.com"        # the REST host its socket URL is fetched from
 # mexc = "https://api.mexc.com"            # polled
+# ondo = "https://api.gm.ondo.finance"     # polled; the key comes from ONDO_API_KEY
 # coingecko = "https://api.coingecko.com/api/v3"  # not a venue: where vault USD prices come from
 
 # Seconds between pushes in node mode. No effect in builder mode.

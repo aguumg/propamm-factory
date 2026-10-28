@@ -1,11 +1,12 @@
-//! A second tokenized-stock issuer, `acme`, beside Ondo: constant prices, one share per
-//! token, an always-open status, and a token whose one rule is a pause on a registry of
+//! A second tokenized-stock issuer, `acme`, beside Ondo: a constant price ratio, one share
+//! per token, an always-open status, and a token whose one rule is a pause on a registry of
 //! its own. It is not a real design. It exists so the workspace build proves that an
 //! issuer written outside the library reaches everything it needs, since an example is
 //! compiled against the public API alone: the ports and their constructors, the core's
 //! `Stanza` and `Adapters`, the restriction guard with a closure that carries the issuer's
 //! own setting, the shared chain reads, and the `poll` conventions a refresher is built
-//! from. `docs/stocks.md` walks through it.
+//! from. The price a pair quotes is a venue, which lives in the library (`venues/`); an
+//! issuer outside it guards the pair. `docs/stocks.md` walks through it.
 
 use std::{sync::Arc, time::Duration};
 
@@ -22,33 +23,31 @@ use quote_updater::{
             Fetched, MarketStatus, Price, PriceSource, Restrictions, Rules, Shares, Stamped,
             StatusFeed, StatusReading, Stoppage, Valuation,
         },
-        pricer::{self, Adapters, Settings, Stanza, StockPricer},
+        status::{self, Adapters, Settings, Stanza, StatusGuard},
     },
 };
 use serde::Deserialize;
 
-/// The `[pairs.pricing]` stanza for `kind = "acme"`: the core's keys it exposes, and the
+/// The `[[pairs.guards]]` stanza for `kind = "acme"`: the core's keys it exposes, and the
 /// issuer's own.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcmeCfg {
     /// The token's `symbol()`.
     symbol: String,
-    /// The half-spread as a fraction of the mid, as written.
-    delta: String,
     /// The registry Acme pauses tokens on.
     registry: String,
-    /// How often the price is polled, in milliseconds; the core's default when absent.
+    /// How often the status is read, in seconds; the core's default when absent.
     #[serde(default)]
-    poll_ms: Option<u64>,
+    status_poll_secs: Option<u64>,
 }
 
 impl AcmeCfg {
     /// The core's stanza: its defaults, then what this kind lets the operator set.
     fn stanza(&self) -> Stanza<'_> {
-        let mut stanza = Stanza::new("acme", "Acme", &self.symbol, &self.delta);
-        if let Some(poll_ms) = self.poll_ms {
-            stanza.price_poll = Duration::from_millis(poll_ms);
+        let mut stanza = Stanza::new("acme", "Acme", &self.symbol);
+        if let Some(secs) = self.status_poll_secs {
+            stanza.status_poll = Some(Duration::from_secs(secs));
         }
         stanza
     }
@@ -61,7 +60,8 @@ impl AcmeCfg {
     }
 }
 
-/// A price source that prices the token at its stock, stamped on the library's clock.
+/// The issuer's price for the token and its stock, stamped on the library's clock: what the
+/// core reads the issuer's `k` and the stock's ticker from.
 struct ConstPrices {
     token: f64,
     stock: f64,
@@ -153,12 +153,12 @@ impl Rules for AcmeRules {
     }
 }
 
-/// The issuer: registered as `acme` (the pricer) and `acme_token` (the guard).
+/// The issuer: registered as `acme` (the status guard) and `acme_token` (the token guard).
 struct Acme;
 
-impl Factory for Acme {
+impl QuoteGuardFactory for Acme {
     type Config = AcmeCfg;
-    type Pricer = StockPricer;
+    type Guard = StatusGuard;
 
     fn validate(&self, cfg: &AcmeCfg, pair: &PairShape) -> eyre::Result<()> {
         cfg.check(pair).map(drop)
@@ -168,7 +168,7 @@ impl Factory for Acme {
         &'a self,
         cfg: &'a AcmeCfg,
         ctx: &'a mut BuildCtx,
-    ) -> BoxFuture<'a, eyre::Result<StockPricer>> {
+    ) -> BoxFuture<'a, eyre::Result<StatusGuard>> {
         Box::pin(async move {
             let (settings, _registry) = cfg.check(ctx.pair())?;
             let mut adapters = Adapters::new(
@@ -184,13 +184,13 @@ impl Factory for Acme {
                     Box::pin(keep_fresh()),
                 ))
             }));
-            pricer::build(ctx, settings, adapters).await
+            status::build(ctx, settings, adapters).await
         })
     }
 }
 
 impl Issuer for Acme {
-    const PRICER_KIND: &'static str = "acme";
+    const STATUS_GUARD_KIND: &'static str = "acme";
     const TOKEN_GUARD_KIND: &'static str = "acme_token";
     type TokenGuard = RestrictionGuardFactory;
 

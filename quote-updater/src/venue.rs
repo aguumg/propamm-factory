@@ -33,6 +33,8 @@ pub enum VenueId {
     Bitget,
     Gate,
     Mexc,
+    /// Ondo Global Markets' own price for one of its stock tokens: the issuer as a venue.
+    Ondo,
 }
 
 impl VenueId {
@@ -54,6 +56,7 @@ impl VenueId {
         VenueId::Bitget,
         VenueId::Gate,
         VenueId::Mexc,
+        VenueId::Ondo,
     ];
 
     /// The name a config file uses for this venue.
@@ -68,6 +71,7 @@ impl VenueId {
             VenueId::Bitget => "bitget",
             VenueId::Gate => "gate",
             VenueId::Mexc => "mexc",
+            VenueId::Ondo => "ondo",
         }
     }
 
@@ -84,6 +88,7 @@ impl VenueId {
             VenueId::Bitget => bitget::DEFAULT_ENDPOINT,
             VenueId::Gate => gate::DEFAULT_ENDPOINT,
             VenueId::Mexc => mexc::DEFAULT_ENDPOINT,
+            VenueId::Ondo => ondo::DEFAULT_ENDPOINT,
         }
     }
 
@@ -105,6 +110,7 @@ impl VenueId {
             VenueId::Bitget => bitget::connection(endpoint, symbol),
             VenueId::Gate => gate::connection(endpoint, symbol),
             VenueId::Mexc => mexc::connection(endpoint, symbol),
+            VenueId::Ondo => ondo::connection(endpoint, symbol)?,
         })
     }
 
@@ -123,12 +129,14 @@ impl VenueId {
             VenueId::Bitget => bitget::parse(text),
             VenueId::Gate => gate::parse(text),
             VenueId::Mexc => mexc::parse(text),
+            VenueId::Ondo => ondo::parse(text),
         }
     }
 
     /// [`Self::parse`], plus the exchange's own time for the price when the frame carries
     /// one: Kraken's `timestamp` and Coinbase's `time` (RFC 3339), OKX's `ts`, Bybit's `ts`,
-    /// KuCoin's `timestamp`, Bitget's `ts` and Gate's `t` (epoch milliseconds), and Binance's `E`
+    /// KuCoin's `timestamp`, Bitget's `ts`, Gate's `t` and Ondo's `timestamp` (epoch
+    /// milliseconds), and Binance's `E`
     /// on a stream that sends it (its spot bookTicker does not). `None` where there is none,
     /// and for MEXC, which is polled: those prices are aged by when they arrived. Kept
     /// beside `parse` rather than replacing it so a venue that carries no time needs
@@ -145,6 +153,7 @@ impl VenueId {
             VenueId::Gate => gate::parse_stamped(text),
             // Polled over REST, whose body carries no time: aged by the fetch.
             VenueId::Mexc => Ok(self.parse(text)?.map(|quote| (quote, None))),
+            VenueId::Ondo => ondo::parse_stamped(text),
         }
     }
 
@@ -161,7 +170,15 @@ impl VenueId {
             VenueId::Bitget => bitget::expected_symbol(base, quote),
             VenueId::Gate => gate::expected_symbol(base, quote),
             VenueId::Mexc => mexc::expected_symbol(base, quote),
+            VenueId::Ondo => ondo::expected_symbol(base, quote),
         }
+    }
+
+    /// Whether the venue quotes a book, a best bid and ask. Ondo answers one price
+    /// ([`Quote::Mid`]), whose half-spread is zero: a kind that copies the book's spread
+    /// copies nothing from it.
+    pub fn quotes_a_book(self) -> bool {
+        self != VenueId::Ondo
     }
 }
 
@@ -265,11 +282,14 @@ pub enum Connection {
         keepalive: Keepalive,
     },
     /// An HTTP resource fetched every `every`, for venues that have no stream. Each fetch
-    /// that parses is a sample stamped at the fetch.
+    /// that parses is a sample stamped at the fetch, or at the body's own time when it
+    /// carries one. `follow_redirects` is false for a request that carries a key in its
+    /// headers, which a redirect would carry along.
     Poll {
         url: String,
         headers: Vec<(String, String)>,
         every: Duration,
+        follow_redirects: bool,
     },
 }
 
@@ -317,6 +337,8 @@ impl Eq for Keepalive {}
 pub enum Quote {
     /// The best bid and ask of an order book.
     Book { bid: String, ask: String },
+    /// One price with no book behind it (an issuer's own price): the mid, at no spread.
+    Mid(String),
 }
 
 #[cfg(test)]
@@ -337,16 +359,28 @@ mod tests {
         assert!(err.to_string().contains("binance"), "{err}");
     }
 
+    /// Every exchange quotes a book; Ondo, an issuer naming its own price, quotes one price
+    /// with no spread.
+    #[test]
+    fn only_ondo_quotes_without_a_book() {
+        for venue in VenueId::ALL {
+            assert_eq!(venue.quotes_a_book(), *venue != VenueId::Ondo, "{venue}");
+        }
+    }
+
     /// Every venue spells a wrapped token's market as the underlying's, in its own shape.
     #[test]
     fn every_venue_spells_the_weth_usdc_market() {
-        for venue in VenueId::ALL {
+        // Every exchange; Ondo is an issuer naming its own token, so it spells the token
+        // as it is.
+        for venue in VenueId::ALL.iter().filter(|v| **v != VenueId::Ondo) {
             let spelling = venue.expected_symbol("WETH", "USDC");
             assert!(
                 !spelling.contains("WETH"),
                 "{venue} spells the wrapped token: {spelling}"
             );
         }
+        assert_eq!(VenueId::Ondo.expected_symbol("AAPLon", "USDC"), "AAPLon");
         assert_eq!(VenueId::Binance.expected_symbol("WETH", "USDC"), "ETHUSDC");
         assert_eq!(
             VenueId::Coinbase.expected_symbol("WETH", "USDC"),

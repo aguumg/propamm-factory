@@ -714,8 +714,15 @@ mod tests {
 
         let example: toml::Value =
             toml::from_str(include_str!("../../../example/config.stocks.toml")).unwrap();
-        let stanza = example["pairs"][0]["guards"][1].as_table().unwrap().clone();
-        assert_eq!(stanza["kind"].as_str(), Some("ondo_token"));
+        let stanza = example["pairs"][0]["guards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["kind"].as_str() == Some("ondo_token"))
+            .expect("the example has the guard")
+            .as_table()
+            .unwrap()
+            .clone();
         let posted: std::collections::HashMap<String, String> = fields
             .iter()
             .map(|f| {

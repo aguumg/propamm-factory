@@ -713,6 +713,7 @@ fn test_shape(inverted: bool, price_decimals: u32) -> PairShape {
         price_decimals,
         target: Address::zero(),
         sources: 1,
+        mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
     }

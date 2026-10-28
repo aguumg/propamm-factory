@@ -362,6 +362,15 @@ impl Feeds {
         }
     }
 
+    /// How many sources quote one price with no book behind it ([`VenueId::quotes_a_book`]):
+    /// what [`crate::pricing::PairShape::mid_only_sources`] tells a pricer.
+    pub fn mid_only_sources(&self) -> usize {
+        self.sources
+            .iter()
+            .filter(|source| !source.venue.quotes_a_book())
+            .count()
+    }
+
     /// The one-line description the report and the backoffice print: `binance:ETHUSDC`, or
     /// `binance:ETHUSDC ×2 + coinbase:ETH-USD ×1` when there is more than one.
     pub fn describe(&self) -> String {
@@ -1723,6 +1732,31 @@ sources = [{ venue = "binance", symbol = "ETHUSDT" }]
         );
         let err = parse_config(&text, 18).map(|_| ()).unwrap_err().to_string();
         assert!(err.contains("not both"), "{err}");
+    }
+
+    /// The sources that quote one price with no book behind it, which a kind copying the
+    /// book's half-spread would copy as zero: Ondo's, and no exchange's.
+    #[test]
+    fn a_source_with_no_book_is_counted_as_mid_only() {
+        let text = pair_with(
+            r#"sources = [
+  { venue = "ondo", symbol = "AAPLon" },
+  { venue = "okx", symbol = "ETH-USDC" },
+]
+pricing = { kind = "feed", delta = "0.003" }
+"#,
+        );
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(
+            config.pairs[0].feeds.as_ref().unwrap().mid_only_sources(),
+            1
+        );
+        let text = pair_with(r#"symbol = "ETHUSDC""#);
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(
+            config.pairs[0].feeds.as_ref().unwrap().mid_only_sources(),
+            0
+        );
     }
 
     /// The late-venue key is off unless set, and read as written when it is.

@@ -149,6 +149,7 @@ The venues, and how each spells a market (wrapped tokens are spelled as the unde
 | `bitget` | `ETHUSDC` | ticker stream |
 | `gate` | `ETH_USDC` | book_ticker stream |
 | `mexc` | `ETHUSDC` | REST, polled every second (its stream is protobuf-only) |
+| `ondo` | `AAPLon` | Ondo's own price for one of its stock tokens, polled every second with the key in `ONDO_API_KEY` (docs/stocks.md) |
 
 CoinGecko is not a price source. The updater uses it for one thing: the USD price of every
 vault token, once a minute, for the dashboard's vault totals (`quote_updater_token_price_usd`
@@ -205,7 +206,7 @@ of seconds old.
 
 What the key measures is the stream, not the market. Most venues write the exchange's own
 clock reading into every price frame: Kraken (`timestamp`), Coinbase (`time`), OKX (`ts`),
-Bybit (`ts`), KuCoin (`timestamp`), Bitget (`ts`) and Gate (`t`). The feed subtracts that from
+Bybit (`ts`), KuCoin (`timestamp`), Bitget (`ts`), Gate (`t`) and Ondo (`timestamp`). The feed subtracts that from
 the frame's arrival, which gives how long the frame took to reach us. A backlog makes every
 frame late by seconds; a quiet book whose last frame arrived promptly reads as prompt
 however long ago that was, so a thin market is not read as a late one. That difference is

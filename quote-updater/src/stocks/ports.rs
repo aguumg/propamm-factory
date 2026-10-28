@@ -2,7 +2,8 @@
 //! answer. A design answers through adapters of its own (`issuers/ondo/` for Ondo's Global
 //! Markets tokens); the core judges every answer the same way, whoever gave it:
 //!
-//! - [`PriceSource`]: the token's price, polled.
+//! - [`PriceSource`]: the issuer's own price for the token and its stock, for the `k` the
+//!   issuer prices with and the stock's ticker. The price the pair quotes is the venue's.
 //! - [`Valuation`]: how the token's price follows its stock (one token is worth `k` shares),
 //!   and the corporate action that will stop that holding.
 //! - [`MarketStatus`]: what the issuer says about the market and the asset, for a design
@@ -63,7 +64,9 @@ impl Fetched {
     }
 }
 
-/// Where the token's price comes from. Polled by a task of the core's.
+/// The issuer's own price for the token and its stock. Read once at the build, for the
+/// stock's ticker, and on the status schedule for the `k` the issuer prices with, by a
+/// task of the core's. Not the price the pair quotes: that is the issuer's venue.
 pub trait PriceSource: Send + Sync + 'static {
     /// The latest price.
     fn fetch(&self) -> BoxFuture<'_, eyre::Result<Fetched>>;

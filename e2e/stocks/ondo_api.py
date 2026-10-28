@@ -1,4 +1,4 @@
-"""A stand-in for Ondo's GM API, for run.sh: the three endpoints the `ondo` pricer reads,
+"""A stand-in for Ondo's GM API, for run.sh: the three endpoints the `ondo` venue and guard read,
 answering one asset at a fixed price stamped with the current time. Standard library only.
 
     python3 ondo_api.py PORT API_KEY SYMBOL TOKEN_PRICE STOCK_PRICE [EVENTS_FILE]

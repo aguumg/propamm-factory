@@ -325,6 +325,10 @@ struct SourcesForm {
     #[serde(default)]
     weight_mexc: String,
     #[serde(default)]
+    symbol_ondo: String,
+    #[serde(default)]
+    weight_ondo: String,
+    #[serde(default)]
     min_sources: String,
 }
 
@@ -342,6 +346,7 @@ impl SourcesForm {
             VenueId::Bitget => (&self.symbol_bitget, &self.weight_bitget),
             VenueId::Gate => (&self.symbol_gate, &self.weight_gate),
             VenueId::Mexc => (&self.symbol_mexc, &self.weight_mexc),
+            VenueId::Ondo => (&self.symbol_ondo, &self.weight_ondo),
         }
     }
 
@@ -520,7 +525,26 @@ pub(crate) fn kind_stanza(
         let Some(text) = posted.get(&key) else {
             continue;
         };
-        match field_toml(field, text)? {
+        let value = match field.kind {
+            // The page posts the key itself as a hidden input, so the field is known to be
+            // carried, and one `<key>__<option>` per ticked box. A post with no box at all
+            // (a scripted one) may name the options in the key's text instead.
+            crate::pricing::FieldKind::Choices(options)
+                if options
+                    .iter()
+                    .any(|option| posted.contains_key(&format!("{key}__{option}"))) =>
+            {
+                Some(toml::Value::Array(
+                    options
+                        .iter()
+                        .filter(|option| posted.contains_key(&format!("{key}__{option}")))
+                        .map(|option| toml::Value::String((*option).to_owned()))
+                        .collect(),
+                ))
+            }
+            _ => field_toml(field, text)?,
+        };
+        match value {
             Some(value) => table.insert(field.name.to_owned(), value),
             None => table.remove(field.name),
         };
@@ -618,6 +642,26 @@ fn field_toml(field: &crate::pricing::FormField, text: &str) -> Result<Option<to
                 .map(|line| toml::Value::String(line.to_owned()))
                 .collect(),
         )),
+        // As a list, when posted as text (no box ticked, or a scripted post): the options
+        // named, one per line or space-separated, held to the declared ones.
+        FieldKind::Choices(options) => Some(toml::Value::Array(
+            text.split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|word| !word.is_empty())
+                .map(|word| {
+                    options
+                        .iter()
+                        .find(|option| option.eq_ignore_ascii_case(word))
+                        .map(|option| toml::Value::String((*option).to_owned()))
+                        .ok_or_else(|| {
+                            eyre!(
+                                "`{}` takes {}, not {word:?}",
+                                field.name,
+                                options.join(", ")
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
         FieldKind::Env => match optional(text) {
             None => None,
             Some(name) => {
@@ -658,7 +702,7 @@ pub(crate) fn field_value(
     use crate::pricing::FieldKind;
     match (field.kind, value) {
         (_, None) => String::new(),
-        (FieldKind::List, Some(toml::Value::Array(items))) => items
+        (FieldKind::List | FieldKind::Choices(_), Some(toml::Value::Array(items))) => items
             .iter()
             .filter_map(toml::Value::as_str)
             .collect::<Vec<_>>()
@@ -668,7 +712,7 @@ pub(crate) fn field_value(
             .and_then(toml::Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        (FieldKind::Env | FieldKind::List, Some(_)) => String::new(),
+        (FieldKind::Env | FieldKind::List | FieldKind::Choices(_), Some(_)) => String::new(),
         (FieldKind::Text | FieldKind::Number, Some(scalar)) => match scalar {
             toml::Value::String(text) => text.clone(),
             toml::Value::Integer(int) => int.to_string(),
@@ -826,6 +870,7 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
                 "volume_usd": row.and_then(|r| r.volume_usd),
                 "note": row.map(|r| r.note.clone()).unwrap_or_else(|| match venue {
                     VenueId::Mexc => "polled every second".to_owned(),
+                    VenueId::Ondo => ONDO_NOTE.to_owned(),
                     _ => String::new(),
                 }),
                 "stand_in": row.is_some_and(|r| r.note.starts_with("quoted in")),
@@ -1193,6 +1238,8 @@ struct EndpointsForm {
     endpoint_gate: String,
     #[serde(default)]
     endpoint_mexc: String,
+    #[serde(default)]
+    endpoint_ondo: String,
 }
 
 impl EndpointsForm {
@@ -1207,6 +1254,7 @@ impl EndpointsForm {
             VenueId::Bitget => &self.endpoint_bitget,
             VenueId::Gate => &self.endpoint_gate,
             VenueId::Mexc => &self.endpoint_mexc,
+            VenueId::Ondo => &self.endpoint_ondo,
         }
     }
 }
@@ -1328,7 +1376,7 @@ fn build_settings(form: &SaveSettings) -> Result<config::FileSettings> {
         let Some(url) = value else { continue };
         let parsed = url::Url::parse(&url)
             .map_err(|err| eyre!("{venue} endpoint {url:?} is not a URL: {err}"))?;
-        let streamed = !matches!(venue, VenueId::Kucoin | VenueId::Mexc);
+        let streamed = !matches!(venue, VenueId::Kucoin | VenueId::Mexc | VenueId::Ondo);
         let schemes: &[&str] = if streamed {
             &["ws", "wss"]
         } else {
@@ -1890,6 +1938,17 @@ struct Filled {
     readonly: bool,
     /// A textarea rather than an input: a list field, one item per line.
     multiline: bool,
+    /// One checkbox per option rather than an input: a choices field. Empty for the rest.
+    choices: Vec<Choice>,
+}
+
+/// One option of a choices field, as the page renders it.
+struct Choice {
+    /// The checkbox's `name`: `<field name>__<option>`.
+    name: String,
+    /// The option, as the config spells it.
+    label: &'static str,
+    checked: bool,
 }
 
 impl Filled {
@@ -1903,6 +1962,7 @@ impl Filled {
             value: value.unwrap_or_default().to_owned(),
             readonly: false,
             multiline: false,
+            choices: Vec::new(),
         }
     }
 
@@ -1915,8 +1975,36 @@ impl Filled {
         field: &crate::pricing::FormField,
         value: Option<&toml::Value>,
     ) -> Self {
+        let name = format!("{prefix}_{kind}_{}", field.name);
+        let choices = match field.kind {
+            crate::pricing::FieldKind::Choices(options) => {
+                // The stanza's own list when it has one, else the kind's default, which the
+                // placeholder names.
+                let ticked: Vec<String> = match value.and_then(toml::Value::as_array) {
+                    Some(items) => items
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                    None => field
+                        .placeholder
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect(),
+                };
+                options
+                    .iter()
+                    .map(|option| Choice {
+                        name: format!("{name}__{option}"),
+                        label: option,
+                        checked: ticked.iter().any(|t| t.eq_ignore_ascii_case(option)),
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         Self {
-            name: format!("{prefix}_{kind}_{}", field.name),
+            name,
             label: field.name,
             placeholder: field.placeholder,
             hint: field.hint,
@@ -1924,6 +2012,7 @@ impl Filled {
             value: field_value(field, value),
             readonly: false,
             multiline: field.kind == crate::pricing::FieldKind::List,
+            choices,
         }
     }
 
@@ -1963,6 +2052,14 @@ const SOURCE_FIELDS: &[Field] = &[
          (not binance, not mexc). Blank is off",
     ),
 ];
+
+/// What the venue table says beside the `ondo` row: it is an issuer's price for its own
+/// stock token, not a market the lookup can list, and it has no spread for a blank delta
+/// to copy.
+const ONDO_NOTE: &str = "Ondo's own price for one of its stock tokens, polled every second \
+                         with the key in ONDO_API_KEY; the symbol is the token's, e.g. AAPLon. \
+                         It is one price with no spread: set a delta in the pricing, or a \
+                         blank one quotes at the mid";
 
 /// How many venues must have a fresh price before the pair publishes.
 const MIN_SOURCES_FIELD: Field = Field::new(
@@ -2444,6 +2541,7 @@ fn render_pair_form_with(
                 let (symbol, weight) = row.unwrap_or_default();
                 let note = match venue {
                     VenueId::Mexc => "polled every second",
+                    VenueId::Ondo => ONDO_NOTE,
                     _ => "",
                 };
                 SourceRow {
@@ -5138,7 +5236,8 @@ api_key = "k"
             toml::from_str(include_str!("../../example/config.stocks.toml")).unwrap();
         let want = example.pairs[0].clone();
         let mut kinds = crate::kinds::Kinds::default();
-        kinds.insert("ondo", Arc::new(Ondo));
+        kinds.insert("feed", Arc::new(crate::pricing::Feed));
+        kinds.insert_guard("ondo", crate::kinds::quote_guard_factory(Ondo));
         kinds.insert_guard(
             "us_market_hours",
             crate::kinds::quote_guard_factory(UsMarketHoursFactory),
@@ -5163,7 +5262,13 @@ api_key = "k"
             let request = reloads.recv().await.expect("a reload must be requested");
             let _ = request.reply.send(Ok("reload: 1 started".to_owned()));
         });
-        let (pricing, hours, token) = (&want.pricing, &want.guards[0], &want.guards[1]);
+        let (pricing, ondo, hours, token) = (
+            &want.pricing,
+            &want.guards[0],
+            &want.guards[1],
+            &want.guards[2],
+        );
+        assert_eq!(ondo["kind"].as_str(), Some("ondo"));
         let text = |table: &toml::Table, key: &str| table[key].as_str().unwrap().to_owned();
         let lines = |key: &str| {
             hours[key]
@@ -5178,22 +5283,27 @@ api_key = "k"
             ("token0", want.tokens[0].clone()),
             ("token1", want.tokens[1].clone()),
             ("key_env", want.key_env.clone()),
+            ("symbol_ondo", want.sources[0].symbol.clone()),
+            ("weight_ondo", want.sources[0].weight.clone().unwrap()),
+            ("min_sources", String::new()),
+            ("max_source_lag_ms", want.max_source_lag_ms.clone().unwrap()),
             ("min_mid", want.min_mid.clone().unwrap()),
             ("max_mid", want.max_mid.clone().unwrap()),
-            ("max_deviation", String::new()),
+            ("max_deviation", want.max_deviation.clone().unwrap()),
             ("max_deviation_window", String::new()),
             ("max_deviation_window_blocks", String::new()),
-            ("allow_symbol_mismatch", "on".to_owned()),
-            ("pricing", "ondo".to_owned()),
-            ("pricing_ondo_symbol", text(pricing, "symbol")),
+            ("pricing", "feed".to_owned()),
+            ("pricing_feed_delta", text(pricing, "delta")),
+            ("guards_present", "1".to_owned()),
+            ("enabled_guard_ondo", "on".to_owned()),
+            ("guard_ondo_symbol", text(ondo, "symbol")),
             (
-                "pricing_ondo_api_key",
-                pricing["api_key"]["env"].as_str().unwrap().to_owned(),
+                "guard_ondo_api_key",
+                ondo["api_key"]["env"].as_str().unwrap().to_owned(),
             ),
-            ("pricing_ondo_delta", text(pricing, "delta")),
             (
-                "pricing_ondo_sessions",
-                pricing["sessions"]
+                "guard_ondo_sessions",
+                ondo["sessions"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -5201,7 +5311,6 @@ api_key = "k"
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
-            ("guards_present", "1".to_owned()),
             ("enabled_guard_us_market_hours", "on".to_owned()),
             (
                 "guard_us_market_hours_open_delay_secs",
@@ -5239,9 +5348,12 @@ api_key = "k"
             .find(|p| p.key_env == want.key_env)
             .expect("the stock pair was added");
         assert_eq!(pair.tokens, want.tokens);
+        assert_eq!(pair.sources, want.sources);
+        assert_eq!(pair.max_source_lag_ms, want.max_source_lag_ms);
+        assert_eq!(pair.max_deviation, want.max_deviation);
         assert_eq!(pair.min_mid, want.min_mid);
         assert_eq!(pair.max_mid, want.max_mid);
-        assert!(pair.allow_symbol_mismatch);
+        assert!(!pair.allow_symbol_mismatch);
         assert_eq!(pair.pricing, want.pricing);
         // Every guard runs and the most severe answer wins, so the order of the stanzas
         // carries nothing: a new pair's follow the registry's order, the example's its own.
@@ -5253,8 +5365,8 @@ api_key = "k"
         assert_eq!(by_kind(&pair.guards), by_kind(&want.guards));
     }
 
-    /// A pair priced by a kind that sources its own mid (a stock pair) lists no venue, and
-    /// the add page takes it that way: no symbol, no sources.
+    /// A pair priced by a kind that sources its own mid lists no venue, and the add page
+    /// takes it that way: no symbol, no sources.
     #[tokio::test]
     async fn a_pair_whose_pricing_kind_sources_its_own_mid_saves_with_no_venue() {
         let (path, state, mut reloads) = config_on_disk("no-venue");
@@ -5326,6 +5438,118 @@ api_key = "k"
                 && form.contains("spellcheck=false></textarea>"),
             "an absent list is an empty textarea: {form}"
         );
+    }
+
+    /// Ondo answers one price with no spread, so a pair priced on it alone copies a spread
+    /// of zero unless the pricing states one: the venue table says so beside the row, where
+    /// the operator adding a stock pair fills it in.
+    #[test]
+    fn the_ondo_row_says_to_set_a_delta() {
+        let form = render_pair_form(None, &test_kinds());
+        let row = form
+            .split("<tr>")
+            .find(|row| row.contains(r#"name="symbol_ondo""#))
+            .expect("the venue table has an ondo row");
+        assert!(row.contains("no spread"), "{row}");
+        assert!(row.contains("set a delta"), "{row}");
+    }
+
+    /// A choices field renders one checkbox per option, the stanza's ticked, and what the
+    /// rendered form posts writes the same list back; with no key in the stanza the
+    /// kind's default is ticked, which the placeholder names.
+    #[test]
+    fn a_choices_field_renders_one_box_per_option_and_posts_the_ticked_ones_back() {
+        use crate::stocks::issuers::ondo::Ondo;
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert_guard("ondo", crate::kinds::quote_guard_factory(Ondo));
+        let kinds = Arc::new(kinds);
+        let mut config = a_config();
+        let mut ondo = guard_table("ondo", None);
+        ondo.insert(
+            "symbol".to_owned(),
+            toml::Value::String("AAPLon".to_owned()),
+        );
+        ondo.insert(
+            "sessions".to_owned(),
+            toml::Value::Array(vec![
+                toml::Value::String("regular".to_owned()),
+                toml::Value::String("overnight".to_owned()),
+            ]),
+        );
+        config.pairs[0].guards = vec![ondo.clone()];
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert!(
+            form.contains(r#"<input type=hidden name="guard_ondo_sessions" value="">"#),
+            "{form}"
+        );
+        for (option, checked) in [
+            ("regular", true),
+            ("premarket", false),
+            ("postmarket", false),
+            ("overnight", true),
+            ("offhours", false),
+        ] {
+            let tag = format!(
+                r#"<input type=checkbox name="guard_ondo_sessions__{option}"{}>"#,
+                if checked { " checked" } else { "" }
+            );
+            assert!(form.contains(&tag), "{option}: {form}");
+        }
+        // What the browser posts from that form rebuilds the list, in option order.
+        let posted: std::collections::HashMap<String, String> =
+            posted_fields(&form).into_iter().collect();
+        let fields = crate::pricing::QuoteGuardFactory::fields(&Ondo);
+        let rebuilt = kind_stanza("guard", fields, "ondo", Some(&ondo), &posted).unwrap();
+        assert_eq!(rebuilt["sessions"], ondo["sessions"]);
+        // No box ticked is an empty list, the key present: the kind's default applies.
+        let mut none = posted.clone();
+        none.retain(|key, _| !key.starts_with("guard_ondo_sessions__"));
+        let rebuilt = kind_stanza("guard", fields, "ondo", Some(&ondo), &none).unwrap();
+        assert_eq!(rebuilt["sessions"], toml::Value::Array(Vec::new()));
+        // A stanza without the key shows the default ticked.
+        ondo.remove("sessions");
+        config.pairs[0].guards = vec![ondo];
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert!(
+            form.contains(r#"name="guard_ondo_sessions__regular" checked>"#)
+                && form.contains(r#"name="guard_ondo_sessions__postmarket">"#),
+            "{form}"
+        );
+    }
+
+    /// A choices field posted as text (no box, as a scripted post does) names the options,
+    /// in any case, and is refused for one not declared.
+    #[test]
+    fn a_choices_field_posted_as_text_names_its_options() {
+        const FIELDS: &[crate::pricing::FormField] = &[crate::pricing::FormField::choices(
+            "sessions",
+            &["regular", "postmarket"],
+            "regular",
+            "",
+        )];
+        let stanza = |text: &str| {
+            kind_stanza(
+                "pricing",
+                FIELDS,
+                "ondo",
+                None,
+                &posted_map(&[("pricing_ondo_sessions", text)]),
+            )
+        };
+        // Written as the options are declared, in the order posted.
+        assert_eq!(
+            stanza("Postmarket\nregular").unwrap()["sessions"],
+            toml::Value::Array(vec![
+                toml::Value::String("postmarket".to_owned()),
+                toml::Value::String("regular".to_owned()),
+            ])
+        );
+        assert_eq!(
+            stanza("").unwrap()["sessions"],
+            toml::Value::Array(Vec::new())
+        );
+        let err = stanza("regular, weekend").unwrap_err();
+        assert!(format!("{err:#}").contains("weekend"), "{err:#}");
     }
 
     /// A float with no fraction reads back as a float (`1.0`), so an unrelated save does

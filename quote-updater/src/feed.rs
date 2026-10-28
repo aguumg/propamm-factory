@@ -490,9 +490,12 @@ pub fn spawn_feed(
                             subscribe,
                             keepalive,
                         }) => feed.read_stream(&url, subscribe.as_deref(), &keepalive).await,
-                        Ok(Connection::Poll { url, headers, every }) => {
-                            feed.poll(&url, &headers, every).await
-                        }
+                        Ok(Connection::Poll {
+                            url,
+                            headers,
+                            every,
+                            follow_redirects,
+                        }) => feed.poll(&url, &headers, every, follow_redirects).await,
                         Err(err) => Err(err),
                     };
                     // The stream is gone the instant `read_stream` returns, on either arm —
@@ -518,6 +521,23 @@ pub fn spawn_feed(
 /// connection pool. Every request times out after [`POLL_TIMEOUT`] unless it sets a
 /// timeout of its own, and names the pusher: CoinGecko (the vault's USD prices) and
 /// Coinbase answer 403 to a request without a User-Agent.
+/// [`http_client`] that follows no redirect, for a poll whose headers carry a key: reqwest
+/// carries a custom header along to wherever a redirect points, and a venue that has no
+/// reason to redirect is better refused than followed with the key.
+fn no_redirect_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(POLL_TIMEOUT)
+                .user_agent(concat!("quote-updater/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("a reqwest client with no redirects builds")
+        })
+        .clone()
+}
+
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(POLL_TIMEOUT)
@@ -639,13 +659,24 @@ impl Feed {
     /// retained sample ages out on its own if that keeps happening. A body that does not
     /// parse is a rejected frame, counted and skipped, not a failed fetch: the venue is
     /// answering, just not with a price.
-    async fn poll(&self, url: &str, headers: &[(String, String)], every: Duration) -> Result<()> {
+    async fn poll(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        every: Duration,
+        follow_redirects: bool,
+    ) -> Result<()> {
         let Feed {
             venue,
             symbol,
             http,
             ..
         } = self;
+        let http = if follow_redirects {
+            http.as_ref().clone()
+        } else {
+            no_redirect_client()
+        };
         let mut sample_is_current = false;
         let mut first = true;
         loop {
@@ -820,13 +851,39 @@ impl std::fmt::Display for Rejected {
 
 /// Turns a venue's quote into the scaled (delta, mid) pair: `mid` is the midpoint of the
 /// best bid/ask and `delta` the half-spread as a fraction of it, (ask - bid) / (ask + bid),
-/// both scaled by 10^decimals — the [delta, mid] slot pair PropAMM prices fills from.
+/// both scaled by 10^decimals — the [delta, mid] slot pair PropAMM prices fills from. A
+/// quote that is one price with no book behind it is that price at no spread.
 fn quote_from_book(
     quote: Quote,
     decimals: u32,
     invert: bool,
 ) -> std::result::Result<(U256, U256), Rejected> {
-    let Quote::Book { bid, ask } = quote;
+    let (bid, ask) = match quote {
+        Quote::Book { bid, ask } => (bid, ask),
+        Quote::Mid(price) => {
+            let mid = parse_decimal_scaled(&price, decimals).map_err(Rejected::malformed)?;
+            if mid.is_zero() {
+                return Err(Rejected::of(
+                    TickReject::OneSided,
+                    eyre!("a price of zero; no meaningful mid"),
+                ));
+            }
+            let mid = if invert {
+                reciprocal_scaled(mid, decimals).ok_or_else(|| {
+                    Rejected::of(
+                        TickReject::Overflow,
+                        eyre!(
+                            "10^{decimals} squared overflows a uint256; inverted pairs need \
+                               price-decimals <= 38"
+                        ),
+                    )
+                })?
+            } else {
+                mid
+            };
+            return Ok((U256::zero(), mid));
+        }
+    };
     // An empty side is an empty side, whether the venue spells it "0" (Binance) or as an
     // empty string (OKX, Bitget and MEXC on a market with nothing on one side).
     let bid = if bid.is_empty() { "0" } else { bid.as_str() };

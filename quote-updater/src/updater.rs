@@ -225,14 +225,15 @@ impl UpdaterBuilder {
         )
     }
 
-    /// Registers a tokenized-stock issuer's two kinds, its pricer and its token guard, under
-    /// the names the issuer declares ([`crate::stocks::Issuer`]): `ondo` and `ondo_token`
-    /// for [`crate::stocks::issuers::ondo::Ondo`]. A binary names the issuers it
-    /// integrates, one call each, and nothing registers one implicitly. The explicit
-    /// [`Self::pricer`] and [`Self::quote_guard`] calls remain for other names.
+    /// Registers a tokenized-stock issuer's two kinds, its status guard and its token
+    /// guard, under the names the issuer declares ([`crate::stocks::Issuer`]): `ondo` and
+    /// `ondo_token` for [`crate::stocks::issuers::ondo::Ondo`]. A binary names the issuers
+    /// it integrates, one call each, and nothing registers one implicitly. The explicit
+    /// [`Self::quote_guard`] call remains for other names. The issuer's price is a venue
+    /// (`ondo` in a pair's `sources`), which needs no registering.
     pub fn stock_issuer<I: crate::stocks::Issuer>(self, issuer: I) -> Self {
         let token_guard = issuer.token_guard();
-        self.pricer(I::PRICER_KIND, issuer)
+        self.quote_guard(I::STATUS_GUARD_KIND, issuer)
             .quote_guard(I::TOKEN_GUARD_KIND, token_guard)
     }
 
@@ -797,7 +798,7 @@ mod tests {
             .stock_issuer(crate::stocks::issuers::ondo::Ondo);
         let kinds = &builder.parts.kinds;
         assert_eq!(kinds.guard_name("us_market_hours"), Some("us_market_hours"));
-        assert_eq!(kinds.pricer_name("ondo"), Some("ondo"));
+        assert_eq!(kinds.guard_name("ondo"), Some("ondo"));
         assert_eq!(kinds.guard_name("ondo_token"), Some("ondo_token"));
         kinds.errors().unwrap();
     }
@@ -805,30 +806,30 @@ mod tests {
     #[test]
     fn a_second_issuer_registers_under_its_own_names() {
         use crate::{
-            pricing::{BoxFuture, BuildCtx, Factory},
+            pricing::{BoxFuture, BuildCtx, QuoteGuardFactory},
             stocks::{
                 Issuer,
                 guard::RestrictionGuardFactory,
                 issuers::ondo::{Ondo, OndoCfg, compliance::OndoCompliance},
-                pricer::StockPricer,
+                status::StatusGuard,
             },
         };
-        /// Ondo's pricer and rules under another issuer's names.
+        /// Ondo's status guard and rules under another issuer's names.
         struct Other;
         static ONDO: Ondo = Ondo;
-        impl Factory for Other {
+        impl QuoteGuardFactory for Other {
             type Config = OndoCfg;
-            type Pricer = StockPricer;
+            type Guard = StatusGuard;
             fn build<'a>(
                 &'a self,
                 cfg: &'a OndoCfg,
                 ctx: &'a mut BuildCtx,
-            ) -> BoxFuture<'a, eyre::Result<StockPricer>> {
+            ) -> BoxFuture<'a, eyre::Result<StatusGuard>> {
                 ONDO.build(cfg, ctx)
             }
         }
         impl Issuer for Other {
-            const PRICER_KIND: &'static str = "other";
+            const STATUS_GUARD_KIND: &'static str = "other";
             const TOKEN_GUARD_KIND: &'static str = "other_token";
             type TokenGuard = RestrictionGuardFactory;
             fn token_guard(&self) -> RestrictionGuardFactory {
@@ -842,7 +843,7 @@ mod tests {
             .stock_issuer(Ondo)
             .stock_issuer(Other);
         let kinds = &builder.parts.kinds;
-        assert_eq!(kinds.pricer_name("other"), Some("other"));
+        assert_eq!(kinds.guard_name("other"), Some("other"));
         assert_eq!(kinds.guard_name("other_token"), Some("other_token"));
         kinds.errors().unwrap();
     }

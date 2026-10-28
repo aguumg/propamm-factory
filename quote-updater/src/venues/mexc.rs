@@ -24,6 +24,7 @@ pub fn connection(endpoint: &str, symbol: &str) -> Connection {
         ),
         headers: Vec::new(),
         every: POLL_EVERY,
+        follow_redirects: true,
     }
 }
 
@@ -64,6 +65,7 @@ mod tests {
                 url: "https://api.mexc.com/api/v3/ticker/bookTicker?symbol=ETHUSDC".into(),
                 headers: Vec::new(),
                 every: POLL_EVERY,
+                follow_redirects: true,
             }
         );
     }

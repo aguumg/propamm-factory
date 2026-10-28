@@ -1,15 +1,17 @@
 //! Ondo Global Markets stock tokens (AAPLon, ...): Ondo's adapters to the ports, and the two
-//! kinds built from them.
+//! guards built from them. The price itself is the `ondo` venue (`venues/ondo.rs`), Ondo's
+//! own price for the token from its GM API, which a pair lists in its `sources` like any
+//! other venue.
 //!
-//! - **`ondo`**, the stock pricer ([`crate::stocks::pricer`]) over Ondo's adapters: the price
-//!   from Ondo's own API ([`api::OndoPrices`]), the price Ondo itself mints and redeems
-//!   around; the share multiplier and its corporate-action pause from the chain's
-//!   `SyntheticSharesOracle` ([`oracle::OndoOracle`]), for a token that oracle lists (it
-//!   holds entries for some GM tokens and not others; one it does not list is quoted on
-//!   Ondo's price alone, without the multiplier gates); and Ondo's market session and asset
-//!   events ([`status::OndoStatus`]), which withdraw on any session but `regular`, on an
-//!   active pause or size limit under the token's symbol or the stock's ticker, and on an
-//!   upcoming event that will move the share multiplier.
+//! - **`ondo`**, the issuer-status guard ([`crate::stocks::status`]) over Ondo's adapters:
+//!   Ondo's market session and asset events ([`status::OndoStatus`]), which withdraw on any
+//!   session the stanza does not list, on an active pause or size limit under the token's
+//!   symbol or the stock's ticker, and on an upcoming event that will move the share
+//!   multiplier; and the share multiplier with its corporate-action pause from the chain's
+//!   `SyntheticSharesOracle` ([`oracle::OndoOracle`]), checked against the `k` Ondo's own
+//!   price answer ([`api::OndoPrices`]) prices with, for a token that oracle lists (it holds
+//!   entries for some GM tokens and not others; one it does not list is guarded without
+//!   the multiplier gates).
 //! - **`ondo_token`**, the restriction guard ([`crate::stocks::guard`]) over Ondo's pause
 //!   manager, blocklist and sanctions list ([`compliance::OndoCompliance`]).
 //!
@@ -17,15 +19,19 @@
 //! [[pairs]]
 //! tokens  = ["0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]  # AAPLon, USDC
 //! key_env = "UPDATER_KEY_AAPLON_USDC"
-//! allow_symbol_mismatch = true   # no venue symbol to check: the price comes from Ondo
+//! sources = [{ venue = "ondo", symbol = "AAPLon" }]
 //! min_mid = "100"
 //! max_mid = "500"
+//! max_deviation = "0.02"
 //!
 //! [pairs.pricing]
+//! kind  = "feed"
+//! delta = "0.003"                   # half-spread, a fraction of the mid (30 bp)
+//!
+//! [[pairs.guards]]
 //! kind    = "ondo"
 //! symbol  = "AAPLon"
 //! api_key = { env = "ONDO_API_KEY" }
-//! delta   = "0.003"                 # half-spread, a fraction of the mid (30 bp)
 //! ```
 
 pub mod api;
@@ -45,11 +51,11 @@ use crate::{
     stocks::ports::StatusFeed,
     stocks::{
         guard::RestrictionGuardFactory,
-        pricer::{self, Adapters, Settings, Stanza, StockPricer},
+        status::{self as status_guard, Adapters, Settings, Stanza, StatusGuard},
     },
 };
 
-/// The `[pairs.pricing]` stanza for `kind = "ondo"`.
+/// The `[[pairs.guards]]` stanza for `kind = "ondo"`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OndoCfg {
@@ -61,8 +67,6 @@ pub struct OndoCfg {
     pub ticker: Option<String>,
     /// The Ondo GM API key, as `{ env = "ONDO_API_KEY" }`.
     pub api_key: EnvSecret,
-    /// Published as the delta: the half-spread as a fraction of the mid (`"0.003"` = 30 bp).
-    pub delta: String,
     /// The sessions Ondo reports (`/v1/status/market`'s `marketStatus`) in which the pair
     /// quotes: any of `regular`, `premarket`, `postmarket`, `overnight` and `offhours`, in
     /// any case. Default `regular` only, and an empty list means the default. Ondo's
@@ -75,20 +79,10 @@ pub struct OndoCfg {
     /// The `SyntheticSharesOracle`; Ethereum mainnet's by default.
     #[serde(default)]
     pub multiplier_oracle: Option<String>,
-    /// How often the price is polled, in milliseconds (default 1000; Ondo caches it 1s).
-    #[serde(default = "default_poll_ms")]
-    pub poll_ms: u64,
-    /// How often the market and asset status are polled (default 15s).
+    /// How often the market and asset status are polled (default 15s), and the price ratio
+    /// with them.
     #[serde(default = "default_status_poll_secs")]
     pub status_poll_secs: u64,
-    /// The oldest price, by Ondo's timestamp, that is quoted (default 15s).
-    #[serde(default = "default_max_price_age_secs")]
-    pub max_price_age_secs: u64,
-    /// The longest Ondo's price may stand still and be quoted (default 30s): a halted
-    /// stock's price stops moving before Ondo's status says so. Raise it for a stock that
-    /// trades thinly enough to sit on one price that long in session.
-    #[serde(default = "default_max_unchanged_secs")]
-    pub max_unchanged_secs: u64,
     /// The oldest status or multiplier reading that is trusted (default 60s).
     #[serde(default = "default_max_status_age_secs")]
     pub max_status_age_secs: u64,
@@ -98,10 +92,6 @@ pub struct OndoCfg {
     /// The largest relative gap between Ondo's multiplier and the chain's (default 0.001).
     #[serde(default = "default_max_multiplier_gap")]
     pub max_multiplier_gap: f64,
-    /// Inventory skew: the mid moves by `skew × (base share − 0.5)`, down when the vault is
-    /// long the stock, so fills rebalance it. 0, the default, reads no inventory.
-    #[serde(default)]
-    pub skew: f64,
 }
 
 fn default_api() -> String {
@@ -119,17 +109,8 @@ const TRADING_SESSIONS: [&str; 5] = [
     "overnight",
     "offhours",
 ];
-fn default_poll_ms() -> u64 {
-    1_000
-}
 fn default_status_poll_secs() -> u64 {
     15
-}
-fn default_max_price_age_secs() -> u64 {
-    15
-}
-fn default_max_unchanged_secs() -> u64 {
-    30
 }
 fn default_max_status_age_secs() -> u64 {
     60
@@ -172,15 +153,10 @@ impl OndoCfg {
             kind: "ondo",
             source: "Ondo",
             symbol: &self.symbol,
-            delta: &self.delta,
-            price_poll: Duration::from_millis(self.poll_ms),
             status_poll: Some(Duration::from_secs(self.status_poll_secs)),
-            max_price_age_secs: self.max_price_age_secs,
-            max_unchanged_secs: self.max_unchanged_secs,
             max_status_age_secs: self.max_status_age_secs,
             pause_lead_secs: self.pause_lead_secs,
             max_multiplier_gap: self.max_multiplier_gap,
-            skew: self.skew,
         }
     }
 
@@ -190,11 +166,6 @@ impl OndoCfg {
         let settings = Settings::new(&self.stanza(), pair)?;
         self.sessions()?;
         api::check_api(&self.api).map_err(|err| eyre::eyre!(err))?;
-        eyre::ensure!(
-            (250..=60_000).contains(&self.poll_ms),
-            "poll_ms {} is not in 250..=60000: Ondo caches prices for a second",
-            self.poll_ms
-        );
         eyre::ensure!(
             self.ticker.as_ref().is_none_or(|ticker| !ticker.is_empty()),
             "ticker is empty"
@@ -210,17 +181,18 @@ impl OndoCfg {
 }
 
 /// Ondo Global Markets: registered with [`crate::UpdaterBuilder::stock_issuer`] as
-/// `ondo` (the pricer) and `ondo_token` (the guard on the token's rules).
+/// `ondo` (the status guard) and `ondo_token` (the guard on the token's rules).
 pub struct Ondo;
 
-/// What the backoffice shows for a pair priced by Ondo: every key of the stanza, the
-/// numbers written as numbers since the config reads `u64` and `f64`, the API key as the
-/// name of the variable holding it.
+/// What the backoffice shows for the guard: every key of the stanza, the numbers written
+/// as numbers since the config reads `u64` and `f64`, the API key as the name of the
+/// variable holding it.
 const FIELDS: &[FormField] = &[
     FormField::new(
         "symbol",
         "AAPLon",
-        "the asset's GM symbol in Ondo's API; the pair's first token must be it.",
+        "the asset's GM symbol in Ondo's API; the pair's first token must be it, and its \
+         ondo venue row names it too.",
     ),
     FormField::new(
         "ticker",
@@ -233,16 +205,11 @@ const FIELDS: &[FormField] = &[
         "ONDO_API_KEY",
         "the environment variable holding the Ondo GM API key, never the key itself.",
     ),
-    FormField::new(
-        "delta",
-        "0.003",
-        "the half-spread as a fraction of the mid: 0.003 is 30 bp.",
-    ),
-    FormField::list(
+    FormField::choices(
         "sessions",
+        &TRADING_SESSIONS,
         "regular",
-        "the sessions Ondo reports in which the pair quotes, one per line: regular, \
-         premarket, postmarket, overnight, offhours. Blank is regular only.",
+        "the sessions Ondo reports in which the pair quotes. None ticked is regular only.",
     ),
     FormField::new(
         "api",
@@ -253,29 +220,12 @@ const FIELDS: &[FormField] = &[
         "multiplier_oracle",
         oracle::MAINNET_MULTIPLIER_ORACLE,
         "the SyntheticSharesOracle the share multiplier is read from. Blank is Ethereum \
-         mainnet's. A token it does not list is quoted on Ondo's price alone, without the \
-         multiplier checks.",
-    ),
-    FormField::number(
-        "poll_ms",
-        "1000",
-        "milliseconds between price polls; Ondo caches prices for a second. Blank is 1000.",
+         mainnet's. A token it does not list is guarded without the multiplier checks.",
     ),
     FormField::number(
         "status_poll_secs",
         "15",
         "seconds between polls of Ondo's market and asset status. Blank is 15.",
-    ),
-    FormField::number(
-        "max_price_age_secs",
-        "15",
-        "the oldest price, by Ondo's timestamp, that is quoted. Blank is 15.",
-    ),
-    FormField::number(
-        "max_unchanged_secs",
-        "30",
-        "the longest Ondo's price may stand still and be quoted: a halted stock's price stops \
-         before the status says so. Blank is 30.",
     ),
     FormField::number(
         "max_status_age_secs",
@@ -292,31 +242,23 @@ const FIELDS: &[FormField] = &[
         "0.001",
         "the largest relative gap between Ondo's multiplier and the chain's. Blank is 0.001.",
     ),
-    FormField::number(
-        "skew",
-        "0",
-        "inventory skew: the mid moves by skew × (base share − 0.5), down when the vault is \
-         long the stock. Blank is 0, which reads no inventory.",
-    ),
 ];
 
-impl Factory for Ondo {
+impl QuoteGuardFactory for Ondo {
     type Config = OndoCfg;
-    type Pricer = StockPricer;
+    type Guard = StatusGuard;
 
     fn fields(&self) -> &'static [FormField] {
         FIELDS
     }
 
     fn form_help(&self) -> &'static str {
-        "<p class=explain>Ondo's own price for the token is the mid, less and plus a fixed \
-         half-spread. The quote is withdrawn while the price is stale or frozen, outside \
-         the Ondo sessions listed (the regular session alone unless the stanza says \
-         otherwise), around an asset event or a corporate action, and when \
-         Ondo's share multiplier and the chain's disagree (for a token the oracle lists; \
-         one it does not list skips that check). The band above is in the lane's \
-         orientation: USDC per token when the stock token's address sorts before USDC's, \
-         token per USDC (1/price) when it sorts after.</p>"
+        "<p class=explain>Withdraws while Ondo says the token's price is not what it seems: \
+         outside the Ondo sessions ticked (the regular session alone unless others are), \
+         around an asset event or a corporate action, and when Ondo's share multiplier and \
+         the chain's disagree (for a token the oracle lists; one it does not list skips \
+         that check). The price itself is the <code>ondo</code> venue above, averaged, aged \
+         and guarded like any other.</p>"
     }
 
     fn validate(&self, cfg: &OndoCfg, pair: &PairShape) -> eyre::Result<()> {
@@ -325,17 +267,14 @@ impl Factory for Ondo {
 
     fn summary(&self, cfg: &OndoCfg) -> String {
         let sessions = cfg.sessions().unwrap_or_default().join("+");
-        format!(
-            "{} delta {} skew {} in {sessions}",
-            cfg.symbol, cfg.delta, cfg.skew
-        )
+        format!("{} in {sessions}", cfg.symbol)
     }
 
     fn build<'a>(
         &'a self,
         cfg: &'a OndoCfg,
         ctx: &'a mut BuildCtx,
-    ) -> BoxFuture<'a, eyre::Result<StockPricer>> {
+    ) -> BoxFuture<'a, eyre::Result<StatusGuard>> {
         Box::pin(async move {
             let (settings, oracle) = cfg.check(ctx.pair())?;
             let sessions = cfg.sessions()?;
@@ -365,13 +304,13 @@ impl Factory for Ondo {
                     })
                 })),
             };
-            pricer::build(ctx, settings, adapters).await
+            status_guard::build(ctx, settings, adapters).await
         })
     }
 }
 
 impl Issuer for Ondo {
-    const PRICER_KIND: &'static str = "ondo";
+    const STATUS_GUARD_KIND: &'static str = "ondo";
     const TOKEN_GUARD_KIND: &'static str = "ondo_token";
     type TokenGuard = RestrictionGuardFactory;
 
@@ -389,11 +328,9 @@ mod tests {
     /// defaults quotes under the gates `ondo` documents, and the two lists cannot drift.
     #[test]
     fn the_cores_default_stanza_is_the_ondo_kinds() {
-        let cfg: super::OndoCfg = toml::from_str(
-            "symbol = \"AAPLon\"\napi_key = { env = \"ONDO_API_KEY\" }\ndelta = \"0.003\"",
-        )
-        .unwrap();
-        let core = super::Stanza::new("ondo", "Ondo", "AAPLon", "0.003");
+        let cfg: super::OndoCfg =
+            toml::from_str("symbol = \"AAPLon\"\napi_key = { env = \"ONDO_API_KEY\" }").unwrap();
+        let core = super::Stanza::new("ondo", "Ondo", "AAPLon");
         assert_eq!(core, cfg.stanza());
     }
 
@@ -407,14 +344,13 @@ mod tests {
     };
     use crate::{
         poll::Stamped,
-        stocks::pricer::testkit::{self, Built, read_at},
+        stocks::status::testkit::{self, Built, read_at},
     };
 
     fn cfg(extra: serde_json::Value) -> OndoCfg {
         let mut stanza = serde_json::json!({
             "symbol": "AAPLon",
             "api_key": {"env": "ONDO_API_KEY"},
-            "delta": "0.003",
         });
         for (key, value) in extra.as_object().unwrap() {
             stanza[key] = value.clone();
@@ -437,7 +373,7 @@ mod tests {
         })
     }
 
-    /// The `ondo` pricer as its build leaves it, over the status Ondo reports, for AAPLon,
+    /// The `ondo` guard as its build leaves it, over the status Ondo reports, for AAPLon,
     /// whose stock Ondo's price answer names AAPL.
     fn built(status: Arc<Status>) -> Built {
         built_with(cfg(serde_json::json!({})), status)
@@ -449,19 +385,19 @@ mod tests {
         let (settings, _) = cfg.check(&pair).unwrap();
         let sessions = cfg.sessions().unwrap();
         let reads = testkit::healthy(Some(Box::new(OndoStatus::new(status, sessions))));
-        testkit::built(pair, settings, reads, None)
+        testkit::built(pair, settings, reads)
     }
 
     #[test]
-    fn the_regular_session_with_no_event_quotes() {
-        assert!(built(ondo_reports("regular", "[]")).price().is_ok());
+    fn the_regular_session_with_no_event_is_allowed() {
+        assert!(built(ondo_reports("regular", "[]")).check().is_ok());
     }
 
     #[test]
-    fn the_regular_session_quotes_however_ondo_capitalises_it() {
+    fn the_regular_session_is_allowed_however_ondo_capitalises_it() {
         for session in ["REGULAR", "Regular"] {
             assert!(
-                built(ondo_reports(session, "[]")).price().is_ok(),
+                built(ondo_reports(session, "[]")).check().is_ok(),
                 "{session}"
             );
         }
@@ -487,15 +423,15 @@ mod tests {
                 &upcoming(true, "ASSET_PAUSED", start),
             ))
         };
-        assert!(at(Some(r#""2026-10-08T14:05:01Z""#)).price().is_ok());
+        assert!(at(Some(r#""2026-10-08T14:05:01Z""#)).check().is_ok());
         let refusal = at(Some(r#""2026-10-08T14:05:00Z""#)).refusal();
         assert_eq!(refusal.reason(), "asset_event");
         // In milliseconds, as Ondo writes its other timestamps.
-        assert!(at(Some("1791468301000")).price().is_ok());
-        assert!(at(Some("1791468300000")).price().is_err());
+        assert!(at(Some("1791468301000")).check().is_ok());
+        assert!(at(Some("1791468300000")).check().is_err());
         // No start, or one that does not read as a time: from the moment Ondo lists it.
-        assert!(at(None).price().is_err());
-        assert!(at(Some(r#""next week""#)).price().is_err());
+        assert!(at(None).check().is_err());
+        assert!(at(Some(r#""next week""#)).check().is_err());
     }
 
     #[test]
@@ -506,13 +442,13 @@ mod tests {
                 &upcoming(false, "ASSET_LIMITED", start),
             ))
         };
-        assert!(at(Some(r#""2026-10-08T14:00:01Z""#)).price().is_ok());
+        assert!(at(Some(r#""2026-10-08T14:00:01Z""#)).check().is_ok());
         assert_eq!(
             at(Some(r#""2026-10-08T14:00:00Z""#)).refusal().reason(),
             "asset_event"
         );
         // With no start there is nothing to withdraw from until Ondo says it is on.
-        assert!(at(None).price().is_ok());
+        assert!(at(None).check().is_ok());
     }
 
     /// Ondo trades its tokens outside the regular session too; a stanza lists the sessions
@@ -524,7 +460,7 @@ mod tests {
         for session in ["regular", "postmarket", "overnight", "OVERNIGHT"] {
             assert!(
                 built_with(extended(), ondo_reports(session, "[]"))
-                    .price()
+                    .check()
                     .is_ok(),
                 "{session}"
             );
@@ -542,7 +478,7 @@ mod tests {
         assert_eq!(blank.sessions().unwrap(), ["regular"]);
         assert!(
             built_with(blank, ondo_reports("postmarket", "[]"))
-                .price()
+                .check()
                 .is_err()
         );
         // A session nothing trades in, or a word Ondo does not report, fails the stanza.
@@ -588,7 +524,7 @@ mod tests {
             "regular",
             r#"[{"symbol":"TSLAon","status":"active","reason":{"code":"ASSET_PAUSED","message":"halt"}}]"#,
         );
-        assert!(built(other).price().is_ok());
+        assert!(built(other).check().is_ok());
     }
 
     #[test]
@@ -629,14 +565,7 @@ mod tests {
             "the smoke test's mock"
         );
         for (bad, why) in [
-            (serde_json::json!({"delta": "0"}), "zero delta"),
-            (serde_json::json!({"delta": "0.1"}), "10% delta"),
-            (serde_json::json!({"delta": "3bp"}), "not a number"),
             (serde_json::json!({"symbol": ""}), "no symbol"),
-            (
-                serde_json::json!({"poll_ms": 100}),
-                "polling faster than Ondo caches",
-            ),
             (
                 serde_json::json!({"status_poll_secs": 0}),
                 "status never polled",
@@ -646,18 +575,9 @@ mod tests {
                 "status always stale",
             ),
             (
-                serde_json::json!({"max_price_age_secs": 1, "poll_ms": 1000}),
-                "price always stale",
-            ),
-            (
-                serde_json::json!({"max_unchanged_secs": 1}),
-                "a price still at every poll",
-            ),
-            (
                 serde_json::json!({"max_multiplier_gap": 0.0}),
                 "no gap allowed",
             ),
-            (serde_json::json!({"skew": 0.6}), "skew over half"),
             (
                 serde_json::json!({"multiplier_oracle": "0x1234"}),
                 "short address",
@@ -675,14 +595,6 @@ mod tests {
             (
                 serde_json::json!({"pause_lead_secs": 7 * 86_400 + 1}),
                 "a lead over a week",
-            ),
-            (
-                serde_json::json!({"max_price_age_secs": u64::MAX}),
-                "a price age that overflows",
-            ),
-            (
-                serde_json::json!({"max_price_age_secs": 3_601}),
-                "a price over an hour old",
             ),
             (
                 serde_json::json!({"max_status_age_secs": u64::MAX}),
@@ -714,7 +626,7 @@ mod tests {
     #[test]
     fn the_stanza_refuses_unknown_keys() {
         testing::assert_rejects_unknown_fields::<OndoCfg>(
-            "symbol = \"AAPLon\"\napi_key = { env = \"ONDO_API_KEY\" }\ndelta = \"0.003\"",
+            "symbol = \"AAPLon\"\napi_key = { env = \"ONDO_API_KEY\" }",
         );
     }
 
@@ -734,32 +646,39 @@ mod tests {
         use crate::{
             backoffice::{field_value, kind_stanza},
             kinds::typed,
-            pricing::Factory,
+            pricing::QuoteGuardFactory,
         };
         let factory = Ondo;
         let fields = factory.fields();
         assert!(!fields.is_empty(), "the kind declares no fields");
         let posted: std::collections::HashMap<String, String> = fields
             .iter()
-            .map(|f| (format!("pricing_ondo_{}", f.name), f.placeholder.to_owned()))
+            .map(|f| (format!("guard_ondo_{}", f.name), f.placeholder.to_owned()))
             .collect();
-        let table = kind_stanza("pricing", fields, "ondo", None, &posted).unwrap();
+        let table = kind_stanza("guard", fields, "ondo", None, &posted).unwrap();
         typed::<OndoCfg>(&table).unwrap();
 
         let example: toml::Value =
             toml::from_str(include_str!("../../../../../example/config.stocks.toml")).unwrap();
-        let stanza = example["pairs"][0]["pricing"].as_table().unwrap().clone();
-        assert_eq!(stanza["kind"].as_str(), Some("ondo"));
+        let stanza = example["pairs"][0]["guards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["kind"].as_str() == Some("ondo"))
+            .expect("the example has an ondo guard")
+            .as_table()
+            .unwrap()
+            .clone();
         let posted: std::collections::HashMap<String, String> = fields
             .iter()
             .map(|f| {
                 (
-                    format!("pricing_ondo_{}", f.name),
+                    format!("guard_ondo_{}", f.name),
                     field_value(f, stanza.get(f.name)),
                 )
             })
             .collect();
-        let rebuilt = kind_stanza("pricing", fields, "ondo", Some(&stanza), &posted).unwrap();
+        let rebuilt = kind_stanza("guard", fields, "ondo", Some(&stanza), &posted).unwrap();
         assert_eq!(rebuilt, stanza);
     }
 }

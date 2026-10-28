@@ -29,9 +29,13 @@ const DOLLARS: &[&str] = &["USDC", "USDT", "USD", "FDUSD", "DAI", "USDE", "PYUSD
 /// minutes in any way this suggestion cares about, and Binance's list is megabytes.
 const CACHE_FOR: Duration = Duration::from_secs(600);
 
-/// The exchanges this asks: every venue.
+/// The exchanges this asks: every venue that lists markets. Ondo is an issuer's price for
+/// its own token, with no list to read; its row is the operator's to fill.
 fn exchanges() -> impl Iterator<Item = VenueId> {
-    VenueId::ALL.iter().copied()
+    VenueId::ALL
+        .iter()
+        .copied()
+        .filter(|venue| *venue != VenueId::Ondo)
 }
 
 /// Where each exchange's REST API is. Not the feed endpoints: those are WebSocket hosts.
@@ -320,6 +324,7 @@ async fn markets(
         VenueId::Bitget => "/api/v2/spot/public/symbols",
         VenueId::Gate => "/api/v4/spot/currency_pairs",
         VenueId::Mexc => "/api/v3/exchangeInfo",
+        VenueId::Ondo => return Err(eyre!("ondo lists no markets")),
     };
     let body = get_json(http, &format!("{host}{path}")).await?;
     let list = Arc::new(parse_markets(venue, &body)?);
@@ -444,6 +449,7 @@ fn parse_markets(venue: VenueId, body: &Value) -> Result<Vec<Market>> {
             "symbol",
             &|r| text(r, "status") == "1" && r["isSpotTradingAllowed"] != Value::Bool(false),
         ),
+        VenueId::Ondo => return Err(eyre!("ondo lists no markets")),
     })
 }
 
@@ -466,6 +472,7 @@ async fn ticker(
         VenueId::Bitget => format!("{host}/api/v2/spot/market/tickers?symbol={t}"),
         VenueId::Gate => format!("{host}/api/v4/spot/tickers?currency_pair={t}"),
         VenueId::Mexc => format!("{host}/api/v3/ticker/24hr?symbol={t}"),
+        VenueId::Ondo => return Err(eyre!("ondo lists no markets")),
     };
     parse_ticker(venue, &get_json(http, &url).await?)
 }
@@ -505,6 +512,7 @@ fn parse_ticker(venue: VenueId, body: &Value) -> Result<(f64, Option<f64>)> {
             number(&body["data"][0]["lastPr"]),
         ),
         VenueId::Gate => (number(&body[0]["quote_volume"]), number(&body[0]["last"])),
+        VenueId::Ondo => return Err(eyre!("ondo lists no markets")),
     };
     Ok((
         volume.ok_or_else(|| eyre!("no 24h volume in the answer"))?,
